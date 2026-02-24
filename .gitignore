@@ -1,0 +1,12 @@
+# 忽略 Nets 文件夹下的所有内容
+Nets/
+
+# 常见的 Python 缓存忽略
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 编译产物（如果你后续使用 CUDA/C++ 扩展）
+build/
+dist/
+*.so
