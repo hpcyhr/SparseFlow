@@ -1,6 +1,9 @@
 # 忽略 Nets 文件夹下的所有内容
 Nets/
 
+# 忽略数据集
+data/
+
 # 常见的 Python 缓存忽略
 __pycache__/
 *.py[cod]
