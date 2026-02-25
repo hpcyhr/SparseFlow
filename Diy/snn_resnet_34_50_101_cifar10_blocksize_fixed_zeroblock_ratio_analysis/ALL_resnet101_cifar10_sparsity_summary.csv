@@ -1,0 +1,3 @@
+T,B,H,W,BlockSize,AvgOverallSparsity,AvgZeroBlockRatio
+8,32,224,224,16,99.9727%,99.9321%
+8,32,224,224,32,99.9727%,99.9181%

@@ -1,0 +1,543 @@
+================================================================================
+完整模块列表 (name -> type)
+================================================================================
+                                                          SpikingResNet
+  conv1                                                   Conv2d
+  bn1                                                     BatchNorm2d
+  sn1                                                     LIFNode
+  sn1.surrogate_function                                  Sigmoid
+  maxpool                                                 MaxPool2d
+  layer1                                                  Sequential
+  layer1.0                                                BasicBlock
+  layer1.0.conv1                                          Conv2d
+  layer1.0.bn1                                            BatchNorm2d
+  layer1.0.sn1                                            LIFNode
+  layer1.0.sn1.surrogate_function                         Sigmoid
+  layer1.0.conv2                                          Conv2d
+  layer1.0.bn2                                            BatchNorm2d
+  layer1.0.sn2                                            LIFNode
+  layer1.0.sn2.surrogate_function                         Sigmoid
+  layer1.1                                                BasicBlock
+  layer1.1.conv1                                          Conv2d
+  layer1.1.bn1                                            BatchNorm2d
+  layer1.1.sn1                                            LIFNode
+  layer1.1.sn1.surrogate_function                         Sigmoid
+  layer1.1.conv2                                          Conv2d
+  layer1.1.bn2                                            BatchNorm2d
+  layer1.1.sn2                                            LIFNode
+  layer1.1.sn2.surrogate_function                         Sigmoid
+  layer1.2                                                BasicBlock
+  layer1.2.conv1                                          Conv2d
+  layer1.2.bn1                                            BatchNorm2d
+  layer1.2.sn1                                            LIFNode
+  layer1.2.sn1.surrogate_function                         Sigmoid
+  layer1.2.conv2                                          Conv2d
+  layer1.2.bn2                                            BatchNorm2d
+  layer1.2.sn2                                            LIFNode
+  layer1.2.sn2.surrogate_function                         Sigmoid
+  layer2                                                  Sequential
+  layer2.0                                                BasicBlock
+  layer2.0.conv1                                          Conv2d
+  layer2.0.bn1                                            BatchNorm2d
+  layer2.0.sn1                                            LIFNode
+  layer2.0.sn1.surrogate_function                         Sigmoid
+  layer2.0.conv2                                          Conv2d
+  layer2.0.bn2                                            BatchNorm2d
+  layer2.0.sn2                                            LIFNode
+  layer2.0.sn2.surrogate_function                         Sigmoid
+  layer2.0.downsample                                     Sequential
+  layer2.0.downsample.0                                   Conv2d
+  layer2.0.downsample.1                                   BatchNorm2d
+  layer2.1                                                BasicBlock
+  layer2.1.conv1                                          Conv2d
+  layer2.1.bn1                                            BatchNorm2d
+  layer2.1.sn1                                            LIFNode
+  layer2.1.sn1.surrogate_function                         Sigmoid
+  layer2.1.conv2                                          Conv2d
+  layer2.1.bn2                                            BatchNorm2d
+  layer2.1.sn2                                            LIFNode
+  layer2.1.sn2.surrogate_function                         Sigmoid
+  layer2.2                                                BasicBlock
+  layer2.2.conv1                                          Conv2d
+  layer2.2.bn1                                            BatchNorm2d
+  layer2.2.sn1                                            LIFNode
+  layer2.2.sn1.surrogate_function                         Sigmoid
+  layer2.2.conv2                                          Conv2d
+  layer2.2.bn2                                            BatchNorm2d
+  layer2.2.sn2                                            LIFNode
+  layer2.2.sn2.surrogate_function                         Sigmoid
+  layer2.3                                                BasicBlock
+  layer2.3.conv1                                          Conv2d
+  layer2.3.bn1                                            BatchNorm2d
+  layer2.3.sn1                                            LIFNode
+  layer2.3.sn1.surrogate_function                         Sigmoid
+  layer2.3.conv2                                          Conv2d
+  layer2.3.bn2                                            BatchNorm2d
+  layer2.3.sn2                                            LIFNode
+  layer2.3.sn2.surrogate_function                         Sigmoid
+  layer3                                                  Sequential
+  layer3.0                                                BasicBlock
+  layer3.0.conv1                                          Conv2d
+  layer3.0.bn1                                            BatchNorm2d
+  layer3.0.sn1                                            LIFNode
+  layer3.0.sn1.surrogate_function                         Sigmoid
+  layer3.0.conv2                                          Conv2d
+  layer3.0.bn2                                            BatchNorm2d
+  layer3.0.sn2                                            LIFNode
+  layer3.0.sn2.surrogate_function                         Sigmoid
+  layer3.0.downsample                                     Sequential
+  layer3.0.downsample.0                                   Conv2d
+  layer3.0.downsample.1                                   BatchNorm2d
+  layer3.1                                                BasicBlock
+  layer3.1.conv1                                          Conv2d
+  layer3.1.bn1                                            BatchNorm2d
+  layer3.1.sn1                                            LIFNode
+  layer3.1.sn1.surrogate_function                         Sigmoid
+  layer3.1.conv2                                          Conv2d
+  layer3.1.bn2                                            BatchNorm2d
+  layer3.1.sn2                                            LIFNode
+  layer3.1.sn2.surrogate_function                         Sigmoid
+  layer3.2                                                BasicBlock
+  layer3.2.conv1                                          Conv2d
+  layer3.2.bn1                                            BatchNorm2d
+  layer3.2.sn1                                            LIFNode
+  layer3.2.sn1.surrogate_function                         Sigmoid
+  layer3.2.conv2                                          Conv2d
+  layer3.2.bn2                                            BatchNorm2d
+  layer3.2.sn2                                            LIFNode
+  layer3.2.sn2.surrogate_function                         Sigmoid
+  layer3.3                                                BasicBlock
+  layer3.3.conv1                                          Conv2d
+  layer3.3.bn1                                            BatchNorm2d
+  layer3.3.sn1                                            LIFNode
+  layer3.3.sn1.surrogate_function                         Sigmoid
+  layer3.3.conv2                                          Conv2d
+  layer3.3.bn2                                            BatchNorm2d
+  layer3.3.sn2                                            LIFNode
+  layer3.3.sn2.surrogate_function                         Sigmoid
+  layer3.4                                                BasicBlock
+  layer3.4.conv1                                          Conv2d
+  layer3.4.bn1                                            BatchNorm2d
+  layer3.4.sn1                                            LIFNode
+  layer3.4.sn1.surrogate_function                         Sigmoid
+  layer3.4.conv2                                          Conv2d
+  layer3.4.bn2                                            BatchNorm2d
+  layer3.4.sn2                                            LIFNode
+  layer3.4.sn2.surrogate_function                         Sigmoid
+  layer3.5                                                BasicBlock
+  layer3.5.conv1                                          Conv2d
+  layer3.5.bn1                                            BatchNorm2d
+  layer3.5.sn1                                            LIFNode
+  layer3.5.sn1.surrogate_function                         Sigmoid
+  layer3.5.conv2                                          Conv2d
+  layer3.5.bn2                                            BatchNorm2d
+  layer3.5.sn2                                            LIFNode
+  layer3.5.sn2.surrogate_function                         Sigmoid
+  layer4                                                  Sequential
+  layer4.0                                                BasicBlock
+  layer4.0.conv1                                          Conv2d
+  layer4.0.bn1                                            BatchNorm2d
+  layer4.0.sn1                                            LIFNode
+  layer4.0.sn1.surrogate_function                         Sigmoid
+  layer4.0.conv2                                          Conv2d
+  layer4.0.bn2                                            BatchNorm2d
+  layer4.0.sn2                                            LIFNode
+  layer4.0.sn2.surrogate_function                         Sigmoid
+  layer4.0.downsample                                     Sequential
+  layer4.0.downsample.0                                   Conv2d
+  layer4.0.downsample.1                                   BatchNorm2d
+  layer4.1                                                BasicBlock
+  layer4.1.conv1                                          Conv2d
+  layer4.1.bn1                                            BatchNorm2d
+  layer4.1.sn1                                            LIFNode
+  layer4.1.sn1.surrogate_function                         Sigmoid
+  layer4.1.conv2                                          Conv2d
+  layer4.1.bn2                                            BatchNorm2d
+  layer4.1.sn2                                            LIFNode
+  layer4.1.sn2.surrogate_function                         Sigmoid
+  layer4.2                                                BasicBlock
+  layer4.2.conv1                                          Conv2d
+  layer4.2.bn1                                            BatchNorm2d
+  layer4.2.sn1                                            LIFNode
+  layer4.2.sn1.surrogate_function                         Sigmoid
+  layer4.2.conv2                                          Conv2d
+  layer4.2.bn2                                            BatchNorm2d
+  layer4.2.sn2                                            LIFNode
+  layer4.2.sn2.surrogate_function                         Sigmoid
+  avgpool                                                 AdaptiveAvgPool2d
+  fc                                                      Linear
+
+================================================================================
+LIF 层及其上下文（前后各3个模块）
+================================================================================
+
+  >>> LIF @ index 3: sn1
+  [000]                                                            SpikingResNet
+  [001]    conv1                                                   Conv2d
+  [002]    bn1                                                     BatchNorm2d
+  [003] ** sn1                                                     LIFNode
+  [004]    sn1.surrogate_function                                  Sigmoid
+  [005]    maxpool                                                 MaxPool2d
+  [006]    layer1                                                  Sequential
+
+  >>> LIF @ index 10: layer1.0.sn1
+  [007]    layer1.0                                                BasicBlock
+  [008]    layer1.0.conv1                                          Conv2d
+  [009]    layer1.0.bn1                                            BatchNorm2d
+  [010] ** layer1.0.sn1                                            LIFNode
+  [011]    layer1.0.sn1.surrogate_function                         Sigmoid
+  [012]    layer1.0.conv2                                          Conv2d
+  [013]    layer1.0.bn2                                            BatchNorm2d
+
+  >>> LIF @ index 14: layer1.0.sn2
+  [011]    layer1.0.sn1.surrogate_function                         Sigmoid
+  [012]    layer1.0.conv2                                          Conv2d
+  [013]    layer1.0.bn2                                            BatchNorm2d
+  [014] ** layer1.0.sn2                                            LIFNode
+  [015]    layer1.0.sn2.surrogate_function                         Sigmoid
+  [016]    layer1.1                                                BasicBlock
+  [017]    layer1.1.conv1                                          Conv2d
+
+  >>> LIF @ index 19: layer1.1.sn1
+  [016]    layer1.1                                                BasicBlock
+  [017]    layer1.1.conv1                                          Conv2d
+  [018]    layer1.1.bn1                                            BatchNorm2d
+  [019] ** layer1.1.sn1                                            LIFNode
+  [020]    layer1.1.sn1.surrogate_function                         Sigmoid
+  [021]    layer1.1.conv2                                          Conv2d
+  [022]    layer1.1.bn2                                            BatchNorm2d
+
+  >>> LIF @ index 23: layer1.1.sn2
+  [020]    layer1.1.sn1.surrogate_function                         Sigmoid
+  [021]    layer1.1.conv2                                          Conv2d
+  [022]    layer1.1.bn2                                            BatchNorm2d
+  [023] ** layer1.1.sn2                                            LIFNode
+  [024]    layer1.1.sn2.surrogate_function                         Sigmoid
+  [025]    layer1.2                                                BasicBlock
+  [026]    layer1.2.conv1                                          Conv2d
+
+  >>> LIF @ index 28: layer1.2.sn1
+  [025]    layer1.2                                                BasicBlock
+  [026]    layer1.2.conv1                                          Conv2d
+  [027]    layer1.2.bn1                                            BatchNorm2d
+  [028] ** layer1.2.sn1                                            LIFNode
+  [029]    layer1.2.sn1.surrogate_function                         Sigmoid
+  [030]    layer1.2.conv2                                          Conv2d
+  [031]    layer1.2.bn2                                            BatchNorm2d
+
+  >>> LIF @ index 32: layer1.2.sn2
+  [029]    layer1.2.sn1.surrogate_function                         Sigmoid
+  [030]    layer1.2.conv2                                          Conv2d
+  [031]    layer1.2.bn2                                            BatchNorm2d
+  [032] ** layer1.2.sn2                                            LIFNode
+  [033]    layer1.2.sn2.surrogate_function                         Sigmoid
+  [034]    layer2                                                  Sequential
+  [035]    layer2.0                                                BasicBlock
+
+  >>> LIF @ index 38: layer2.0.sn1
+  [035]    layer2.0                                                BasicBlock
+  [036]    layer2.0.conv1                                          Conv2d
+  [037]    layer2.0.bn1                                            BatchNorm2d
+  [038] ** layer2.0.sn1                                            LIFNode
+  [039]    layer2.0.sn1.surrogate_function                         Sigmoid
+  [040]    layer2.0.conv2                                          Conv2d
+  [041]    layer2.0.bn2                                            BatchNorm2d
+
+  >>> LIF @ index 42: layer2.0.sn2
+  [039]    layer2.0.sn1.surrogate_function                         Sigmoid
+  [040]    layer2.0.conv2                                          Conv2d
+  [041]    layer2.0.bn2                                            BatchNorm2d
+  [042] ** layer2.0.sn2                                            LIFNode
+  [043]    layer2.0.sn2.surrogate_function                         Sigmoid
+  [044]    layer2.0.downsample                                     Sequential
+  [045]    layer2.0.downsample.0                                   Conv2d
+
+  >>> LIF @ index 50: layer2.1.sn1
+  [047]    layer2.1                                                BasicBlock
+  [048]    layer2.1.conv1                                          Conv2d
+  [049]    layer2.1.bn1                                            BatchNorm2d
+  [050] ** layer2.1.sn1                                            LIFNode
+  [051]    layer2.1.sn1.surrogate_function                         Sigmoid
+  [052]    layer2.1.conv2                                          Conv2d
+  [053]    layer2.1.bn2                                            BatchNorm2d
+
+  >>> LIF @ index 54: layer2.1.sn2
+  [051]    layer2.1.sn1.surrogate_function                         Sigmoid
+  [052]    layer2.1.conv2                                          Conv2d
+  [053]    layer2.1.bn2                                            BatchNorm2d
+  [054] ** layer2.1.sn2                                            LIFNode
+  [055]    layer2.1.sn2.surrogate_function                         Sigmoid
+  [056]    layer2.2                                                BasicBlock
+  [057]    layer2.2.conv1                                          Conv2d
+
+  >>> LIF @ index 59: layer2.2.sn1
+  [056]    layer2.2                                                BasicBlock
+  [057]    layer2.2.conv1                                          Conv2d
+  [058]    layer2.2.bn1                                            BatchNorm2d
+  [059] ** layer2.2.sn1                                            LIFNode
+  [060]    layer2.2.sn1.surrogate_function                         Sigmoid
+  [061]    layer2.2.conv2                                          Conv2d
+  [062]    layer2.2.bn2                                            BatchNorm2d
+
+  >>> LIF @ index 63: layer2.2.sn2
+  [060]    layer2.2.sn1.surrogate_function                         Sigmoid
+  [061]    layer2.2.conv2                                          Conv2d
+  [062]    layer2.2.bn2                                            BatchNorm2d
+  [063] ** layer2.2.sn2                                            LIFNode
+  [064]    layer2.2.sn2.surrogate_function                         Sigmoid
+  [065]    layer2.3                                                BasicBlock
+  [066]    layer2.3.conv1                                          Conv2d
+
+  >>> LIF @ index 68: layer2.3.sn1
+  [065]    layer2.3                                                BasicBlock
+  [066]    layer2.3.conv1                                          Conv2d
+  [067]    layer2.3.bn1                                            BatchNorm2d
+  [068] ** layer2.3.sn1                                            LIFNode
+  [069]    layer2.3.sn1.surrogate_function                         Sigmoid
+  [070]    layer2.3.conv2                                          Conv2d
+  [071]    layer2.3.bn2                                            BatchNorm2d
+
+  >>> LIF @ index 72: layer2.3.sn2
+  [069]    layer2.3.sn1.surrogate_function                         Sigmoid
+  [070]    layer2.3.conv2                                          Conv2d
+  [071]    layer2.3.bn2                                            BatchNorm2d
+  [072] ** layer2.3.sn2                                            LIFNode
+  [073]    layer2.3.sn2.surrogate_function                         Sigmoid
+  [074]    layer3                                                  Sequential
+  [075]    layer3.0                                                BasicBlock
+
+  >>> LIF @ index 78: layer3.0.sn1
+  [075]    layer3.0                                                BasicBlock
+  [076]    layer3.0.conv1                                          Conv2d
+  [077]    layer3.0.bn1                                            BatchNorm2d
+  [078] ** layer3.0.sn1                                            LIFNode
+  [079]    layer3.0.sn1.surrogate_function                         Sigmoid
+  [080]    layer3.0.conv2                                          Conv2d
+  [081]    layer3.0.bn2                                            BatchNorm2d
+
+  >>> LIF @ index 82: layer3.0.sn2
+  [079]    layer3.0.sn1.surrogate_function                         Sigmoid
+  [080]    layer3.0.conv2                                          Conv2d
+  [081]    layer3.0.bn2                                            BatchNorm2d
+  [082] ** layer3.0.sn2                                            LIFNode
+  [083]    layer3.0.sn2.surrogate_function                         Sigmoid
+  [084]    layer3.0.downsample                                     Sequential
+  [085]    layer3.0.downsample.0                                   Conv2d
+
+  >>> LIF @ index 90: layer3.1.sn1
+  [087]    layer3.1                                                BasicBlock
+  [088]    layer3.1.conv1                                          Conv2d
+  [089]    layer3.1.bn1                                            BatchNorm2d
+  [090] ** layer3.1.sn1                                            LIFNode
+  [091]    layer3.1.sn1.surrogate_function                         Sigmoid
+  [092]    layer3.1.conv2                                          Conv2d
+  [093]    layer3.1.bn2                                            BatchNorm2d
+
+  >>> LIF @ index 94: layer3.1.sn2
+  [091]    layer3.1.sn1.surrogate_function                         Sigmoid
+  [092]    layer3.1.conv2                                          Conv2d
+  [093]    layer3.1.bn2                                            BatchNorm2d
+  [094] ** layer3.1.sn2                                            LIFNode
+  [095]    layer3.1.sn2.surrogate_function                         Sigmoid
+  [096]    layer3.2                                                BasicBlock
+  [097]    layer3.2.conv1                                          Conv2d
+
+  >>> LIF @ index 99: layer3.2.sn1
+  [096]    layer3.2                                                BasicBlock
+  [097]    layer3.2.conv1                                          Conv2d
+  [098]    layer3.2.bn1                                            BatchNorm2d
+  [099] ** layer3.2.sn1                                            LIFNode
+  [100]    layer3.2.sn1.surrogate_function                         Sigmoid
+  [101]    layer3.2.conv2                                          Conv2d
+  [102]    layer3.2.bn2                                            BatchNorm2d
+
+  >>> LIF @ index 103: layer3.2.sn2
+  [100]    layer3.2.sn1.surrogate_function                         Sigmoid
+  [101]    layer3.2.conv2                                          Conv2d
+  [102]    layer3.2.bn2                                            BatchNorm2d
+  [103] ** layer3.2.sn2                                            LIFNode
+  [104]    layer3.2.sn2.surrogate_function                         Sigmoid
+  [105]    layer3.3                                                BasicBlock
+  [106]    layer3.3.conv1                                          Conv2d
+
+  >>> LIF @ index 108: layer3.3.sn1
+  [105]    layer3.3                                                BasicBlock
+  [106]    layer3.3.conv1                                          Conv2d
+  [107]    layer3.3.bn1                                            BatchNorm2d
+  [108] ** layer3.3.sn1                                            LIFNode
+  [109]    layer3.3.sn1.surrogate_function                         Sigmoid
+  [110]    layer3.3.conv2                                          Conv2d
+  [111]    layer3.3.bn2                                            BatchNorm2d
+
+  >>> LIF @ index 112: layer3.3.sn2
+  [109]    layer3.3.sn1.surrogate_function                         Sigmoid
+  [110]    layer3.3.conv2                                          Conv2d
+  [111]    layer3.3.bn2                                            BatchNorm2d
+  [112] ** layer3.3.sn2                                            LIFNode
+  [113]    layer3.3.sn2.surrogate_function                         Sigmoid
+  [114]    layer3.4                                                BasicBlock
+  [115]    layer3.4.conv1                                          Conv2d
+
+  >>> LIF @ index 117: layer3.4.sn1
+  [114]    layer3.4                                                BasicBlock
+  [115]    layer3.4.conv1                                          Conv2d
+  [116]    layer3.4.bn1                                            BatchNorm2d
+  [117] ** layer3.4.sn1                                            LIFNode
+  [118]    layer3.4.sn1.surrogate_function                         Sigmoid
+  [119]    layer3.4.conv2                                          Conv2d
+  [120]    layer3.4.bn2                                            BatchNorm2d
+
+  >>> LIF @ index 121: layer3.4.sn2
+  [118]    layer3.4.sn1.surrogate_function                         Sigmoid
+  [119]    layer3.4.conv2                                          Conv2d
+  [120]    layer3.4.bn2                                            BatchNorm2d
+  [121] ** layer3.4.sn2                                            LIFNode
+  [122]    layer3.4.sn2.surrogate_function                         Sigmoid
+  [123]    layer3.5                                                BasicBlock
+  [124]    layer3.5.conv1                                          Conv2d
+
+  >>> LIF @ index 126: layer3.5.sn1
+  [123]    layer3.5                                                BasicBlock
+  [124]    layer3.5.conv1                                          Conv2d
+  [125]    layer3.5.bn1                                            BatchNorm2d
+  [126] ** layer3.5.sn1                                            LIFNode
+  [127]    layer3.5.sn1.surrogate_function                         Sigmoid
+  [128]    layer3.5.conv2                                          Conv2d
+  [129]    layer3.5.bn2                                            BatchNorm2d
+
+  >>> LIF @ index 130: layer3.5.sn2
+  [127]    layer3.5.sn1.surrogate_function                         Sigmoid
+  [128]    layer3.5.conv2                                          Conv2d
+  [129]    layer3.5.bn2                                            BatchNorm2d
+  [130] ** layer3.5.sn2                                            LIFNode
+  [131]    layer3.5.sn2.surrogate_function                         Sigmoid
+  [132]    layer4                                                  Sequential
+  [133]    layer4.0                                                BasicBlock
+
+  >>> LIF @ index 136: layer4.0.sn1
+  [133]    layer4.0                                                BasicBlock
+  [134]    layer4.0.conv1                                          Conv2d
+  [135]    layer4.0.bn1                                            BatchNorm2d
+  [136] ** layer4.0.sn1                                            LIFNode
+  [137]    layer4.0.sn1.surrogate_function                         Sigmoid
+  [138]    layer4.0.conv2                                          Conv2d
+  [139]    layer4.0.bn2                                            BatchNorm2d
+
+  >>> LIF @ index 140: layer4.0.sn2
+  [137]    layer4.0.sn1.surrogate_function                         Sigmoid
+  [138]    layer4.0.conv2                                          Conv2d
+  [139]    layer4.0.bn2                                            BatchNorm2d
+  [140] ** layer4.0.sn2                                            LIFNode
+  [141]    layer4.0.sn2.surrogate_function                         Sigmoid
+  [142]    layer4.0.downsample                                     Sequential
+  [143]    layer4.0.downsample.0                                   Conv2d
+
+  >>> LIF @ index 148: layer4.1.sn1
+  [145]    layer4.1                                                BasicBlock
+  [146]    layer4.1.conv1                                          Conv2d
+  [147]    layer4.1.bn1                                            BatchNorm2d
+  [148] ** layer4.1.sn1                                            LIFNode
+  [149]    layer4.1.sn1.surrogate_function                         Sigmoid
+  [150]    layer4.1.conv2                                          Conv2d
+  [151]    layer4.1.bn2                                            BatchNorm2d
+
+  >>> LIF @ index 152: layer4.1.sn2
+  [149]    layer4.1.sn1.surrogate_function                         Sigmoid
+  [150]    layer4.1.conv2                                          Conv2d
+  [151]    layer4.1.bn2                                            BatchNorm2d
+  [152] ** layer4.1.sn2                                            LIFNode
+  [153]    layer4.1.sn2.surrogate_function                         Sigmoid
+  [154]    layer4.2                                                BasicBlock
+  [155]    layer4.2.conv1                                          Conv2d
+
+  >>> LIF @ index 157: layer4.2.sn1
+  [154]    layer4.2                                                BasicBlock
+  [155]    layer4.2.conv1                                          Conv2d
+  [156]    layer4.2.bn1                                            BatchNorm2d
+  [157] ** layer4.2.sn1                                            LIFNode
+  [158]    layer4.2.sn1.surrogate_function                         Sigmoid
+  [159]    layer4.2.conv2                                          Conv2d
+  [160]    layer4.2.bn2                                            BatchNorm2d
+
+  >>> LIF @ index 161: layer4.2.sn2
+  [158]    layer4.2.sn1.surrogate_function                         Sigmoid
+  [159]    layer4.2.conv2                                          Conv2d
+  [160]    layer4.2.bn2                                            BatchNorm2d
+  [161] ** layer4.2.sn2                                            LIFNode
+  [162]    layer4.2.sn2.surrogate_function                         Sigmoid
+  [163]    avgpool                                                 AdaptiveAvgPool2d
+  [164]    fc                                                      Linear
+
+================================================================================
+各模块输出 shape（用4张图推一次）
+================================================================================
+Files already downloaded and verified
+  conv1                                              in=(4, 4, 3, 224, 224)  out=(4, 4, 64, 112, 112)
+  sn1                                                in=(4, 4, 64, 112, 112)  out=(4, 4, 64, 112, 112)
+  layer1.0.conv1                                     in=(4, 4, 64, 56, 56)  out=(4, 4, 64, 56, 56)
+  layer1.0.sn1                                       in=(4, 4, 64, 56, 56)  out=(4, 4, 64, 56, 56)
+  layer1.0.conv2                                     in=(4, 4, 64, 56, 56)  out=(4, 4, 64, 56, 56)
+  layer1.0.sn2                                       in=(4, 4, 64, 56, 56)  out=(4, 4, 64, 56, 56)
+  layer1.1.conv1                                     in=(4, 4, 64, 56, 56)  out=(4, 4, 64, 56, 56)
+  layer1.1.sn1                                       in=(4, 4, 64, 56, 56)  out=(4, 4, 64, 56, 56)
+  layer1.1.conv2                                     in=(4, 4, 64, 56, 56)  out=(4, 4, 64, 56, 56)
+  layer1.1.sn2                                       in=(4, 4, 64, 56, 56)  out=(4, 4, 64, 56, 56)
+  layer1.2.conv1                                     in=(4, 4, 64, 56, 56)  out=(4, 4, 64, 56, 56)
+  layer1.2.sn1                                       in=(4, 4, 64, 56, 56)  out=(4, 4, 64, 56, 56)
+  layer1.2.conv2                                     in=(4, 4, 64, 56, 56)  out=(4, 4, 64, 56, 56)
+  layer1.2.sn2                                       in=(4, 4, 64, 56, 56)  out=(4, 4, 64, 56, 56)
+  layer2.0.conv1                                     in=(4, 4, 64, 56, 56)  out=(4, 4, 128, 28, 28)
+  layer2.0.sn1                                       in=(4, 4, 128, 28, 28)  out=(4, 4, 128, 28, 28)
+  layer2.0.conv2                                     in=(4, 4, 128, 28, 28)  out=(4, 4, 128, 28, 28)
+  layer2.0.sn2                                       in=(4, 4, 128, 28, 28)  out=(4, 4, 128, 28, 28)
+  layer2.0.downsample.0                              in=(4, 4, 64, 56, 56)  out=(4, 4, 128, 28, 28)
+  layer2.1.conv1                                     in=(4, 4, 128, 28, 28)  out=(4, 4, 128, 28, 28)
+  layer2.1.sn1                                       in=(4, 4, 128, 28, 28)  out=(4, 4, 128, 28, 28)
+  layer2.1.conv2                                     in=(4, 4, 128, 28, 28)  out=(4, 4, 128, 28, 28)
+  layer2.1.sn2                                       in=(4, 4, 128, 28, 28)  out=(4, 4, 128, 28, 28)
+  layer2.2.conv1                                     in=(4, 4, 128, 28, 28)  out=(4, 4, 128, 28, 28)
+  layer2.2.sn1                                       in=(4, 4, 128, 28, 28)  out=(4, 4, 128, 28, 28)
+  layer2.2.conv2                                     in=(4, 4, 128, 28, 28)  out=(4, 4, 128, 28, 28)
+  layer2.2.sn2                                       in=(4, 4, 128, 28, 28)  out=(4, 4, 128, 28, 28)
+  layer2.3.conv1                                     in=(4, 4, 128, 28, 28)  out=(4, 4, 128, 28, 28)
+  layer2.3.sn1                                       in=(4, 4, 128, 28, 28)  out=(4, 4, 128, 28, 28)
+  layer2.3.conv2                                     in=(4, 4, 128, 28, 28)  out=(4, 4, 128, 28, 28)
+  layer2.3.sn2                                       in=(4, 4, 128, 28, 28)  out=(4, 4, 128, 28, 28)
+  layer3.0.conv1                                     in=(4, 4, 128, 28, 28)  out=(4, 4, 256, 14, 14)
+  layer3.0.sn1                                       in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.0.conv2                                     in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.0.sn2                                       in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.0.downsample.0                              in=(4, 4, 128, 28, 28)  out=(4, 4, 256, 14, 14)
+  layer3.1.conv1                                     in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.1.sn1                                       in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.1.conv2                                     in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.1.sn2                                       in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.2.conv1                                     in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.2.sn1                                       in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.2.conv2                                     in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.2.sn2                                       in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.3.conv1                                     in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.3.sn1                                       in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.3.conv2                                     in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.3.sn2                                       in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.4.conv1                                     in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.4.sn1                                       in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.4.conv2                                     in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.4.sn2                                       in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.5.conv1                                     in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.5.sn1                                       in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.5.conv2                                     in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer3.5.sn2                                       in=(4, 4, 256, 14, 14)  out=(4, 4, 256, 14, 14)
+  layer4.0.conv1                                     in=(4, 4, 256, 14, 14)  out=(4, 4, 512, 7, 7)
+  layer4.0.sn1                                       in=(4, 4, 512, 7, 7)  out=(4, 4, 512, 7, 7)
+  layer4.0.conv2                                     in=(4, 4, 512, 7, 7)  out=(4, 4, 512, 7, 7)
+  layer4.0.sn2                                       in=(4, 4, 512, 7, 7)  out=(4, 4, 512, 7, 7)
+  layer4.0.downsample.0                              in=(4, 4, 256, 14, 14)  out=(4, 4, 512, 7, 7)
+  layer4.1.conv1                                     in=(4, 4, 512, 7, 7)  out=(4, 4, 512, 7, 7)
+  layer4.1.sn1                                       in=(4, 4, 512, 7, 7)  out=(4, 4, 512, 7, 7)
+  layer4.1.conv2                                     in=(4, 4, 512, 7, 7)  out=(4, 4, 512, 7, 7)
+  layer4.1.sn2                                       in=(4, 4, 512, 7, 7)  out=(4, 4, 512, 7, 7)
+  layer4.2.conv1                                     in=(4, 4, 512, 7, 7)  out=(4, 4, 512, 7, 7)
+  layer4.2.sn1                                       in=(4, 4, 512, 7, 7)  out=(4, 4, 512, 7, 7)
+  layer4.2.conv2                                     in=(4, 4, 512, 7, 7)  out=(4, 4, 512, 7, 7)
+  layer4.2.sn2                                       in=(4, 4, 512, 7, 7)  out=(4, 4, 512, 7, 7)
