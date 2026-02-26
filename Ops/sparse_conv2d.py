@@ -5,6 +5,14 @@ SparseConv2d — 稀疏 Conv2d 的 nn.Module 封装
 当输入具有高稀疏性时（如 LIF 输出），自动跳过全零 block 获得加速。
 """
 
+import sys
+from pathlib import Path
+
+# 项目根目录（SparseFlow/）
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -65,14 +73,6 @@ class SparseConv2d(nn.Module):
                    threshold: float = 1e-6) -> "SparseConv2d":
         """
         从现有的 nn.Conv2d 创建 SparseConv2d，复制权重。
-
-        Args:
-            conv: 原始 Conv2d 模块
-            block_size: prescan block 大小
-            threshold: 零判断阈值
-
-        Returns:
-            SparseConv2d 实例，权重已复制
         """
         sparse_conv = cls(
             in_channels=conv.in_channels,
@@ -86,12 +86,11 @@ class SparseConv2d(nn.Module):
             block_size=block_size,
             threshold=threshold,
         )
-
-        # 复制权重
         sparse_conv.weight.data.copy_(conv.weight.data)
         if conv.bias is not None:
             sparse_conv.bias.data.copy_(conv.bias.data)
-
+        # 确保与原 conv 在同一设备上
+        sparse_conv = sparse_conv.to(conv.weight.device)
         return sparse_conv
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -101,19 +100,13 @@ class SparseConv2d(nn.Module):
         输入支持两种 shape：
           - [N, C, H, W]       — 标准 4D
           - [T, N, C, H, W]    — spikingjelly 多时间步格式，自动展平
-
-        自动选择执行路径：
-          1. CUDA + Triton 可用 + stride=1 + groups=1 → Triton sparse kernel
-          2. 其他情况 → fallback 到 F.conv2d
         """
-        # 处理 5D 输入 (T, N, C, H, W)
         reshaped = False
         if x.dim() == 5:
             T, B, C, H, W = x.shape
             x = x.reshape(T * B, C, H, W)
             reshaped = True
 
-        # 判断是否可以走 Triton 路径
         use_triton = (
             self._triton_available
             and x.is_cuda
@@ -128,7 +121,6 @@ class SparseConv2d(nn.Module):
         else:
             y = self._fallback_forward(x)
 
-        # 恢复 5D
         if reshaped:
             _, C_out, H_out, W_out = y.shape
             y = y.reshape(T, B, C_out, H_out, W_out)
@@ -137,7 +129,7 @@ class SparseConv2d(nn.Module):
 
     def _triton_forward(self, x: torch.Tensor) -> torch.Tensor:
         """Triton 稀疏卷积路径"""
-        from sparseflow.kernels.conv2d import sparse_conv2d_forward
+        from Kernels.conv2d import sparse_conv2d_forward
 
         k = self.kernel_size[0]  # 3 or 1
         y, sparse_ms = sparse_conv2d_forward(

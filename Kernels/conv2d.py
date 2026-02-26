@@ -289,7 +289,7 @@ def sparse_conv2d_forward(x: torch.Tensor, weight: torch.Tensor,
         BLOCK_H=BLOCK_H, BLOCK_W=BLOCK_W,
         THRESHOLD=threshold,
     )
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(x.device)
 
     nz_idx = flags.nonzero(as_tuple=False).squeeze(1).int()
     num_nz = nz_idx.numel()
@@ -329,7 +329,7 @@ def sparse_conv2d_forward(x: torch.Tensor, weight: torch.Tensor,
         )
 
     end.record()
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(x.device)
 
     # 加 bias
     if has_bias:
