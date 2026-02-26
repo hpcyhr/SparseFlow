@@ -4,6 +4,9 @@ Nets/
 # 忽略数据集
 data/
 
+# 忽略数据集
+Diy/
+
 # 常见的 Python 缓存忽略
 __pycache__/
 *.py[cod]
