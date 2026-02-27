@@ -38,11 +38,7 @@ from Kernels.conv2d import (
     prescan_kernel, sparse_conv3x3_weighted_kernel, dense_conv3x3_kernel,
     sparse_conv2d_forward,
 )
-from Kernels.linear import sparse_linear_forward
-from Kernels.batchnorm2d import sparse_batchnorm2d_forward
 from Ops.sparse_conv2d import SparseConv2d
-from Ops.sparse_linear import SparseLinear
-from Ops.sparse_batchnorm2d import SparseBatchNorm2d
 
 import triton
 
@@ -60,10 +56,12 @@ SPIKE_OUTPUT_OPS = (
 # =============================================================================
 def select_block_size(H, W):
     spatial = min(H, W)
-    if spatial >= 56:
+    if spatial >= 32:
         return 16
-    elif spatial >= 14:
+    elif spatial >= 16:
         return 8
+    elif spatial >= 8:
+        return 4
     else:
         return None
 
@@ -147,45 +145,6 @@ def run_cudnn_conv(feat, module):
     return y, start.elapsed_time(end)
 
 
-def run_sparse_linear_bench(feat_2d, module):
-    """稀疏 Linear benchmark"""
-    start, end = make_event(), make_event()
-    start.record()
-    y, _ = sparse_linear_forward(feat_2d.contiguous(), module.weight, module.bias)
-    end.record()
-    sync()
-    return start.elapsed_time(end)
-
-
-def run_dense_linear_bench(feat_2d, module):
-    """稠密 Linear benchmark"""
-    start, end = make_event(), make_event()
-    start.record()
-    with torch.no_grad():
-        y = F.linear(feat_2d, module.weight, module.bias)
-    end.record()
-    sync()
-    return start.elapsed_time(end)
-
-
-def run_sparse_bn_bench(feat_4d, module):
-    """稀疏 BN benchmark"""
-    _, ms = sparse_batchnorm2d_forward(feat_4d, module)
-    return ms
-
-
-def run_dense_bn_bench(feat_4d, module):
-    """稠密 BN benchmark"""
-    start, end = make_event(), make_event()
-    start.record()
-    with torch.no_grad():
-        y = F.batch_norm(feat_4d, module.running_mean, module.running_var,
-                         module.weight, module.bias, False, 0.0, module.eps)
-    end.record()
-    sync()
-    return start.elapsed_time(end)
-
-
 # =============================================================================
 # 网络分析
 # =============================================================================
@@ -229,20 +188,39 @@ def analyze_network(model, sample_input, device):
     layer_infos = {}
     visited = set()
 
+    # 透明层：搜索时穿透，不阻断
+    TRANSPARENT_TYPES = (nn.BatchNorm2d, nn.Dropout, nn.Dropout2d,
+                         nn.Identity, nn.Flatten,
+                         nn.AdaptiveAvgPool2d, nn.AvgPool2d, nn.MaxPool2d,
+                         nn.ReLU, nn.ReLU6, nn.LeakyReLU)
+
     for i, (name, module) in enumerate(module_list):
         if not isinstance(module, SPIKE_OUTPUT_OPS):
             continue
 
-        for j in range(i + 1, min(i + 10, len(module_list))):
+        # 从 spike_op 向后搜索，穿透透明层，找所有后继 Conv2d
+        for j in range(i + 1, min(i + 15, len(module_list))):
             next_name, next_module = module_list[j]
             if next_name in visited:
+                continue
+
+            # 遇到另一个脉冲源 → 停止搜索
+            if isinstance(next_module, SPIKE_OUTPUT_OPS):
+                break
+
+            # 透明层 → 穿透，继续向下
+            if isinstance(next_module, TRANSPARENT_TYPES):
+                continue
+
+            # 非透明非 Conv2d 的 Linear 等 → 跳过不阻断
+            if isinstance(next_module, nn.Linear):
                 continue
 
             ishape = input_shapes.get(next_name)
             if ishape is None:
                 continue
 
-            # --- Conv2d ---
+            # --- 仅匹配 Conv2d ---
             if isinstance(next_module, nn.Conv2d):
                 k = next_module.kernel_size
                 s = next_module.stride
@@ -257,34 +235,13 @@ def analyze_network(model, sample_input, device):
                     block = select_block_size(H, W)
                     if block is None:
                         visited.add(next_name)
-                        break
+                        continue  # 不 break，可能还有其他分支的 conv
                     layer_infos[next_name] = LayerInfo(
                         next_name, next_module, "conv2d", block, H, W)
                     visited.add(next_name)
                     print(f"  [CONV  ] LIF={name:<30} -> {next_name:<30} H={H} Block={block}")
-                    break
-
-            # --- BatchNorm2d ---
-            elif isinstance(next_module, nn.BatchNorm2d):
-                if len(ishape) == 5:
-                    H, W = ishape[3], ishape[4]
-                elif len(ishape) == 4:
-                    H, W = ishape[2], ishape[3]
-                else:
+                    # 不 break：支持分叉（同一脉冲源 → 多个 Conv2d）
                     continue
-                layer_infos[next_name] = LayerInfo(
-                    next_name, next_module, "batchnorm2d", None, H, W)
-                visited.add(next_name)
-                print(f"  [BN    ] LIF={name:<30} -> {next_name:<30} H={H}")
-                continue
-
-            # --- Linear ---
-            elif isinstance(next_module, nn.Linear):
-                layer_infos[next_name] = LayerInfo(
-                    next_name, next_module, "linear")
-                visited.add(next_name)
-                print(f"  [LINEAR] LIF={name:<30} -> {next_name:<30}")
-                break
 
     return layer_infos
 
@@ -407,8 +364,13 @@ def main():
             if isinstance(x, torch.Tensor):
                 x = x.detach()
                 if x.dim() == 5:
+                    # [T, B, C, H, W] → [T*B, C, H, W]
                     T, B, C, H, W = x.shape
                     x = x.reshape(T * B, C, H, W)
+                elif x.dim() == 3:
+                    # [T, B, C] → [T*B, C]  (spikingjelly multi-step Linear 输入)
+                    T, B, C = x.shape
+                    x = x.reshape(T * B, C)
                 # 确保在正确的 GPU 设备上，contiguous，独立副本
                 captured[name] = x.to(device).contiguous().clone()
         return hook
@@ -456,21 +418,6 @@ def main():
                 info.total_sparse_ms += sparse_ms
                 info.total_cudnn_ms += cudnn_ms
 
-            elif info.layer_type == "batchnorm2d":
-                info.total_zeros += (feat.abs().sum(dim=1) <= 1e-6).sum().item()
-                info.total_elems += feat.shape[0] * feat.shape[2] * feat.shape[3]
-                info.total_dense_ms += run_dense_bn_bench(feat, info.module)
-                info.total_sparse_ms += run_sparse_bn_bench(feat, info.module)
-                info.total_cudnn_ms += run_dense_bn_bench(feat, info.module)
-
-            elif info.layer_type == "linear":
-                feat_2d = feat.reshape(feat.shape[0], -1) if feat.dim() > 2 else feat
-                info.total_zeros += (feat_2d.abs().sum(dim=1) <= 1e-6).sum().item()
-                info.total_elems += feat_2d.shape[0]
-                info.total_dense_ms += run_dense_linear_bench(feat_2d, info.module)
-                info.total_sparse_ms += run_sparse_linear_bench(feat_2d, info.module)
-                info.total_cudnn_ms += run_dense_linear_bench(feat_2d, info.module)
-
         if (batch_idx + 1) % 50 == 0:
             pct = (batch_idx + 1) / len(loader) * 100
             print(f"  [{pct:5.1f}%] batch {batch_idx+1}/{len(loader)}")
@@ -494,8 +441,16 @@ def main():
         if info.total_elems == 0:
             continue
         sparsity = info.total_zeros / info.total_elems * 100
-        speedup = info.total_dense_ms / max(info.total_sparse_ms, 1e-9)
-        cudnn_speedup = info.total_cudnn_ms / max(info.total_sparse_ms, 1e-9)
+
+        # 100% 稀疏或 sparse_ms 极小时，显示 "inf" 而非天文数字
+        if info.total_sparse_ms < 0.01 or sparsity > 99.99:
+            speedup_str = "      inf"
+            cudnn_str = "     inf"
+        else:
+            speedup = info.total_dense_ms / info.total_sparse_ms
+            cudnn_speedup = info.total_cudnn_ms / info.total_sparse_ms
+            speedup_str = f"{speedup:>9.2f}x"
+            cudnn_str = f"{cudnn_speedup:>8.2f}x"
 
         ed = (info.total_dense_ms / 1000.0) * args.power
         es = (info.total_sparse_ms / 1000.0) * args.power
@@ -506,7 +461,7 @@ def main():
         blk = str(info.block_size) if info.block_size else "-"
         h = str(info.H) if info.H else "-"
         print(f"{sname:<35} {info.layer_type:<6} {blk:>4} {h:>4} "
-              f"{sparsity:>8.2f}% {speedup:>9.2f}x {cudnn_speedup:>8.2f}x")
+              f"{sparsity:>8.2f}% {speedup_str} {cudnn_str}")
 
     print("-" * 90)
     all_d = sum(i.total_dense_ms for i in layer_infos.values())
