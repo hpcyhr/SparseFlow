@@ -65,6 +65,7 @@ def select_block_size(H, W):
 # 全局 device（在 main 中设定）
 # =============================================================================
 DEVICE = None
+PRESCAN_THRESHOLD = 0.0
 
 def sync():
     torch.cuda.synchronize(DEVICE)
@@ -90,7 +91,7 @@ def run_sparse_conv_weighted(feat, conv_module, block):
         bias=conv_module.bias,
         block_size=block,
         kernel_size=k,
-        threshold=1e-6,
+        threshold=PRESCAN_THRESHOLD,
     )
     return y, sparse_ms
 
@@ -137,7 +138,7 @@ def verify_layer(feat, conv_module, block, layer_name):
         bias=conv_module.bias,
         block_size=block,
         kernel_size=k,
-        threshold=1e-6,
+        threshold=PRESCAN_THRESHOLD,
     )
 
     diff = (y_sparse - y_cudnn).float()

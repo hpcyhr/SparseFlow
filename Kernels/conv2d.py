@@ -113,7 +113,7 @@ def gather_conv3x3_kernel(
         # 对 3x3 邻域的 block 进行检查。用 clamp 确保索引合法，
         # 越界的 block 读到的是合法位置的值，但用 valid 标记过滤。
         base_flag = n * flags_stride_n + c_in * flags_stride_c
-        any_nz = 0
+        any_nz = tl.zeros([], dtype=tl.int32)
 
         # 展开 3x3 邻域 (tl.static_range 在编译时展开)
         for dh in tl.static_range(3):     # 0, 1, 2
@@ -127,8 +127,8 @@ def gather_conv3x3_kernel(
                 is_valid = is_valid_h & is_valid_w
                 # 越界时使用 gh, gw（总是合法的）作为安全索引
                 # 读到的 flag 不影响结果，因为会被 is_valid 过滤
-                safe_ngh = ngh * is_valid.to(tl.int32) + gh * (1 - is_valid.to(tl.int32))
-                safe_ngw = ngw * is_valid.to(tl.int32) + gw * (1 - is_valid.to(tl.int32))
+                safe_ngh = tl.where(is_valid, ngh, 0)
+                safe_ngw = tl.where(is_valid, ngw, 0)
 
                 flag_val = tl.load(flags_ptr + base_flag + safe_ngh * GRID_W + safe_ngw)
 
@@ -273,7 +273,7 @@ def dense_conv3x3_kernel(
 
 def sparse_conv2d_forward(x: torch.Tensor, weight: torch.Tensor,
                           bias: torch.Tensor, block_size: int,
-                          kernel_size: int = 3, threshold: float = 1e-6):
+                          kernel_size: int = 3, threshold: float = 0.0):
     """
     两阶段稀疏卷积前向传播 (Gather 模式 v2)。
 
@@ -283,7 +283,7 @@ def sparse_conv2d_forward(x: torch.Tensor, weight: torch.Tensor,
         bias: 偏置 [C_out] or None
         block_size: prescan block 大小
         kernel_size: 3 或 1
-        threshold: 零判断阈值
+        threshold: 零判断阈值,SNN 推荐设为 0.0，避免把极小非零值误判为 0
 
     Returns:
         y: 输出 [N, C_out, H, W]

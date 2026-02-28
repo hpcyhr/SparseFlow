@@ -30,7 +30,7 @@ def test_kernel(N, C_IN, C_OUT, H, W, block_size, sparsity, device="cuda"):
     # Sparse kernel
     y_sparse, _ = sparse_conv2d_forward(
         x.contiguous(), weight.contiguous(), bias,
-        block_size=block_size, kernel_size=3, threshold=1e-6
+        block_size=block_size, kernel_size=3, threshold=0.0
     )
 
     # Compare
@@ -93,7 +93,7 @@ if __name__ == "__main__":
         from Kernels.conv2d import sparse_conv2d_forward
         y_sparse, _ = sparse_conv2d_forward(
             x.contiguous(), weight.contiguous(), bias,
-            block_size=bs, kernel_size=3, threshold=1e-6
+            block_size=bs, kernel_size=3, threshold=0.0
         )
 
         diff = (y_sparse - y_ref).abs()

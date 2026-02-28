@@ -35,7 +35,7 @@ class SparseConv2d(nn.Module):
 
     def __init__(self, in_channels, out_channels, kernel_size,
                  stride=1, padding=0, dilation=1, groups=1, bias=True,
-                 block_size=16, threshold=1e-6):
+                 block_size=16, threshold=0.0):
         super().__init__()
 
         self.in_channels = in_channels
@@ -70,7 +70,7 @@ class SparseConv2d(nn.Module):
 
     @classmethod
     def from_dense(cls, conv: nn.Conv2d, block_size: int = 16,
-                   threshold: float = 1e-6) -> "SparseConv2d":
+                   threshold: float = 0.0) -> "SparseConv2d":
         """
         从现有的 nn.Conv2d 创建 SparseConv2d，复制权重。
         """
