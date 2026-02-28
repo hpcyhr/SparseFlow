@@ -1,18 +1,16 @@
 """
 SparseFlow Benchmark — Spiking-ResNet on CIFAR-10/100
 
-支持的网络：resnet34, resnet50, resnet101, resnet152
-支持的数据集：cifar10, cifar100
-比较对象：SparseFlow sparse kernel vs Triton dense kernel vs cuDNN (F.conv2d)
+比较对象：SparseFlow sparse kernel (带权重) vs cuDNN (F.conv2d)
+验证内容：
+  1. 逐层算子验证：每个替换的 Conv2d 的 Sparse 输出 vs cuDNN 输出的数值误差
+  2. 整网验证：替换后的模型 vs 原始模型在小批量数据上的推理结果一致性
 
 用法：
     cd ~/SparseFlow
     python Benchmark/bench_resnet.py --model resnet34 --dataset cifar10
     python Benchmark/bench_resnet.py --model resnet50 --dataset cifar100 --T 32
     python Benchmark/bench_resnet.py --model resnet34 --dataset cifar10 --gpu 2
-
-    # 批量跑所有组合
-    bash Benchmark/run_all.sh
 """
 
 import sys
@@ -24,6 +22,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 import argparse
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,10 +33,7 @@ from spikingjelly.activation_based.model import spiking_resnet
 from spikingjelly.activation_based import functional as sj_func
 from spikingjelly.activation_based import neuron as sj_neuron
 
-from Kernels.conv2d import (
-    prescan_kernel, sparse_conv3x3_weighted_kernel, dense_conv3x3_kernel,
-    sparse_conv2d_forward,
-)
+from Kernels.conv2d import sparse_conv2d_forward
 from Ops.sparse_conv2d import SparseConv2d
 
 import triton
@@ -71,70 +67,36 @@ def select_block_size(H, W):
 DEVICE = None
 
 def sync():
-    """同步当前设备"""
     torch.cuda.synchronize(DEVICE)
 
 def make_event():
-    """在当前设备上创建 CUDA event"""
     return torch.cuda.Event(enable_timing=True)
 
 # =============================================================================
-# Triton dense / sparse / cuDNN benchmark 函数
+# Benchmark 函数 — 使用真实权重
 # =============================================================================
 
-def run_sparse_conv(feat, block):
-    """SparseFlow 稀疏卷积 benchmark（使用 prescan + 跳零逻辑，box filter）"""
+def run_sparse_conv_weighted(feat, conv_module, block):
+    """
+    SparseFlow 稀疏卷积 benchmark — 使用真实卷积权重。
+    调用 sparse_conv2d_forward (prescan + weighted sparse kernel)
+    """
     feat = feat.contiguous()
-    N, C, H, W = feat.shape
-    GRID_H = triton.cdiv(H, block)
-    GRID_W = triton.cdiv(W, block)
-    total = N * C * GRID_H * GRID_W
+    k = conv_module.kernel_size[0]  # 3 or 1
 
-    flags = torch.empty(total, dtype=torch.int32, device=feat.device)
-    prescan_kernel[(total,)](
-        feat, flags, N, C, H, W, GRID_H, GRID_W,
-        BLOCK_H=block, BLOCK_W=block, THRESHOLD=1e-6,
+    y, sparse_ms = sparse_conv2d_forward(
+        x=feat,
+        weight=conv_module.weight.contiguous(),
+        bias=conv_module.bias,
+        block_size=block,
+        kernel_size=k,
+        threshold=1e-6,
     )
-    sync()
-
-    nz_idx = flags.nonzero(as_tuple=False).squeeze(1).int()
-    num_nz = nz_idx.numel()
-    y = torch.zeros_like(feat)
-    if num_nz == 0:
-        return y, 0.0
-
-    start, end = make_event(), make_event()
-    start.record()
-    dense_conv3x3_kernel[(num_nz,)](
-        feat, y, N, C, H, W, GRID_H, GRID_W,
-        BLOCK_H=block, BLOCK_W=block,
-    )
-    end.record()
-    sync()
-    return y, start.elapsed_time(end)
-
-
-def run_dense_conv(feat, block):
-    """稠密 Triton 卷积 benchmark (box filter)"""
-    feat = feat.contiguous()
-    N, C, H, W = feat.shape
-    GRID_H = triton.cdiv(H, block)
-    GRID_W = triton.cdiv(W, block)
-    total = N * C * GRID_H * GRID_W
-    y = torch.empty_like(feat)
-    start, end = make_event(), make_event()
-    start.record()
-    dense_conv3x3_kernel[(total,)](
-        feat, y, N, C, H, W, GRID_H, GRID_W,
-        BLOCK_H=block, BLOCK_W=block,
-    )
-    end.record()
-    sync()
-    return y, start.elapsed_time(end)
+    return y, sparse_ms
 
 
 def run_cudnn_conv(feat, module):
-    """cuDNN conv 基准"""
+    """cuDNN conv 基准（F.conv2d）"""
     start, end = make_event(), make_event()
     start.record()
     with torch.no_grad():
@@ -146,25 +108,90 @@ def run_cudnn_conv(feat, module):
 
 
 # =============================================================================
-# 网络分析
+# 逐层数值验证
+# =============================================================================
+
+def verify_layer(feat, conv_module, block, layer_name):
+    """
+    验证单层：Sparse 输出 vs cuDNN 输出的数值差异。
+
+    Returns:
+        max_abs_err: 最大绝对误差
+        mean_abs_err: 平均绝对误差
+        max_rel_err: 最大相对误差 (排除接近零的元素)
+        cosine_sim: 余弦相似度
+    """
+    feat = feat.contiguous()
+
+    # cuDNN 参考
+    with torch.no_grad():
+        y_cudnn = F.conv2d(feat, conv_module.weight, conv_module.bias,
+                           conv_module.stride, conv_module.padding,
+                           conv_module.dilation, conv_module.groups)
+
+    # Sparse 计算
+    k = conv_module.kernel_size[0]
+    y_sparse, _ = sparse_conv2d_forward(
+        x=feat,
+        weight=conv_module.weight.contiguous(),
+        bias=conv_module.bias,
+        block_size=block,
+        kernel_size=k,
+        threshold=1e-6,
+    )
+
+    diff = (y_sparse - y_cudnn).float()
+    y_ref = y_cudnn.float()
+
+    max_abs = diff.abs().max().item()
+    mean_abs = diff.abs().mean().item()
+
+    # 相对误差（使用 max(|y_ref|, 1.0) 作为分母，避免除以小值导致的巨大相对误差）
+    denom = y_ref.abs().clamp(min=1.0)
+    max_rel = (diff.abs() / denom).max().item()
+
+    # 余弦相似度（处理全零情况）
+    flat_s = y_sparse.flatten().float()
+    flat_c = y_cudnn.flatten().float()
+    norm_s = flat_s.norm()
+    norm_c = flat_c.norm()
+    if norm_s < 1e-8 and norm_c < 1e-8:
+        # 两者都接近零向量 → 完全一致
+        cos = 1.0
+    elif norm_s < 1e-8 or norm_c < 1e-8:
+        # 一个为零另一个不为零 → 完全不一致
+        cos = 0.0
+    else:
+        cos = F.cosine_similarity(flat_s.unsqueeze(0), flat_c.unsqueeze(0)).item()
+
+    return max_abs, mean_abs, max_rel, cos
+
+
+# =============================================================================
+# 网络分析 (仅 Conv2d)
 # =============================================================================
 
 class LayerInfo:
     def __init__(self, name, module, layer_type, block_size=None, H=0, W=0):
         self.name = name
         self.module = module
-        self.layer_type = layer_type  # "conv2d" | "linear" | "batchnorm2d"
+        self.layer_type = layer_type
         self.block_size = block_size
         self.H, self.W = H, W
-        self.total_dense_ms = 0.0
         self.total_sparse_ms = 0.0
         self.total_cudnn_ms = 0.0
         self.total_zeros = 0
         self.total_elems = 0
+        # 数值验证统计
+        self.verify_max_abs = 0.0
+        self.verify_mean_abs = 0.0
+        self.verify_max_rel = 0.0
+        self.verify_cos_sum = 0.0
+        self.verify_count = 0
 
 
 def analyze_network(model, sample_input, device):
-    """分析网络，识别脉冲后继的 Conv / BN / Linear 层"""
+    """分析网络，识别脉冲后继的 Conv2d 层"""
     input_shapes = {}
     hooks = []
 
@@ -198,21 +225,17 @@ def analyze_network(model, sample_input, device):
         if not isinstance(module, SPIKE_OUTPUT_OPS):
             continue
 
-        # 从 spike_op 向后搜索，穿透透明层，找所有后继 Conv2d
         for j in range(i + 1, min(i + 15, len(module_list))):
             next_name, next_module = module_list[j]
             if next_name in visited:
                 continue
 
-            # 遇到另一个脉冲源 → 停止搜索
             if isinstance(next_module, SPIKE_OUTPUT_OPS):
                 break
 
-            # 透明层 → 穿透，继续向下
             if isinstance(next_module, TRANSPARENT_TYPES):
                 continue
 
-            # 非透明非 Conv2d 的 Linear 等 → 跳过不阻断
             if isinstance(next_module, nn.Linear):
                 continue
 
@@ -220,7 +243,6 @@ def analyze_network(model, sample_input, device):
             if ishape is None:
                 continue
 
-            # --- 仅匹配 Conv2d ---
             if isinstance(next_module, nn.Conv2d):
                 k = next_module.kernel_size
                 s = next_module.stride
@@ -235,12 +257,11 @@ def analyze_network(model, sample_input, device):
                     block = select_block_size(H, W)
                     if block is None:
                         visited.add(next_name)
-                        continue  # 不 break，可能还有其他分支的 conv
+                        continue
                     layer_infos[next_name] = LayerInfo(
                         next_name, next_module, "conv2d", block, H, W)
                     visited.add(next_name)
                     print(f"  [CONV  ] LIF={name:<30} -> {next_name:<30} H={H} Block={block}")
-                    # 不 break：支持分叉（同一脉冲源 → 多个 Conv2d）
                     continue
 
     return layer_infos
@@ -289,6 +310,133 @@ def build_dataset(dataset_name, data_root):
 
 
 # =============================================================================
+# 整网推理验证
+# =============================================================================
+
+def _set_module_by_name(model, name, new_module):
+    """按 dot-separated name 替换 model 中的子模块"""
+    parts = name.split(".")
+    parent = model
+    for part in parts[:-1]:
+        if part.isdigit():
+            parent = parent[int(part)]
+        else:
+            parent = getattr(parent, part)
+    setattr(parent, parts[-1], new_module)
+
+
+def verify_end_to_end(model, layer_infos, loader, device, T, num_batches=5):
+    """
+    整网推理验证：
+      1. 深拷贝一份原始模型 (cuDNN baseline)
+      2. 在原模型上替换所有目标 Conv2d 为 SparseConv2d
+      3. 对比两个模型在相同输入上的输出 logits
+
+    Returns:
+        results: list of dict，每个 batch 的验证统计
+    """
+    print(f"\n{'='*90}")
+    print(f"{'整网推理验证 (End-to-End Correctness)':^90}")
+    print(f"{'='*90}")
+
+    # 深拷贝原始模型作为 baseline
+    model_baseline = copy.deepcopy(model)
+
+    # 在原模型上替换 Conv2d → SparseConv2d
+    model_sparse = model  # 原地替换
+    replaced = 0
+    for name, info in layer_infos.items():
+        if info.layer_type == "conv2d" and info.block_size is not None:
+            sparse_conv = SparseConv2d.from_dense(
+                info.module, block_size=info.block_size)
+            _set_module_by_name(model_sparse, name, sparse_conv)
+            replaced += 1
+
+    print(f"  替换了 {replaced} 个 Conv2d → SparseConv2d")
+    print(f"  验证 {num_batches} 个 batch ...\n")
+
+    results = []
+    batch_count = 0
+
+    for imgs, labels in loader:
+        if batch_count >= num_batches:
+            break
+
+        inp = torch.bernoulli(
+            imgs.to(device).unsqueeze(0).repeat(T, 1, 1, 1, 1).clamp(0, 1)
+        )
+
+        # Baseline (cuDNN)
+        sj_func.reset_net(model_baseline)
+        with torch.no_grad():
+            logits_baseline = model_baseline(inp)
+
+        # Sparse
+        sj_func.reset_net(model_sparse)
+        with torch.no_grad():
+            logits_sparse = model_sparse(inp)
+
+        # 比较 logits
+        diff = (logits_sparse - logits_baseline).float()
+        ref = logits_baseline.float()
+
+        max_abs = diff.abs().max().item()
+        mean_abs = diff.abs().mean().item()
+
+        # 相对误差
+        denom = ref.abs().clamp(min=1.0)
+        max_rel = (diff.abs() / denom).max().item()
+
+        # 余弦相似度
+        flat_s = logits_sparse.flatten().float()
+        flat_c = logits_baseline.flatten().float()
+        norm_s = flat_s.norm()
+        norm_c = flat_c.norm()
+        if norm_s < 1e-8 and norm_c < 1e-8:
+            cos = 1.0
+        elif norm_s < 1e-8 or norm_c < 1e-8:
+            cos = 0.0
+        else:
+            cos = F.cosine_similarity(flat_s.unsqueeze(0), flat_c.unsqueeze(0)).item()
+
+        # 分类一致性
+        pred_base = logits_baseline.argmax(dim=-1)
+        pred_sparse = logits_sparse.argmax(dim=-1)
+        agree = (pred_base == pred_sparse).float().mean().item()
+
+        r = {
+            "batch": batch_count,
+            "max_abs": max_abs,
+            "mean_abs": mean_abs,
+            "max_rel": max_rel,
+            "cosine": cos,
+            "pred_agree": agree,
+        }
+        results.append(r)
+
+        status = "✓ PASS" if max_abs < 1e-3 and cos > 0.9999 else "✗ FAIL"
+        print(f"  Batch {batch_count}: max_abs={max_abs:.6f}  mean_abs={mean_abs:.6f}  "
+              f"max_rel={max_rel:.6f}  cos={cos:.8f}  pred_agree={agree*100:.1f}%  {status}")
+
+        batch_count += 1
+
+    # 汇总
+    if results:
+        avg_max_abs = sum(r["max_abs"] for r in results) / len(results)
+        avg_cos = sum(r["cosine"] for r in results) / len(results)
+        avg_agree = sum(r["pred_agree"] for r in results) / len(results)
+        all_pass = all(r["max_abs"] < 0.01 and r["cosine"] > 0.999 for r in results)
+
+        print(f"\n  {'─'*70}")
+        print(f"  汇总: avg_max_abs={avg_max_abs:.6f}  avg_cos={avg_cos:.8f}  "
+              f"avg_pred_agree={avg_agree*100:.1f}%")
+        print(f"  整网验证结果: {'✓ 全部通过' if all_pass else '✗ 存在误差过大的 batch'}")
+    print(f"{'='*90}\n")
+
+    return results
+
+
+# =============================================================================
 # 主流程
 # =============================================================================
 
@@ -308,6 +456,8 @@ def main():
     parser.add_argument("--data_root", type=str, default="../data")
     parser.add_argument("--gpu", type=int, default=-1,
                         help="GPU device id, -1=auto select (most free memory)")
+    parser.add_argument("--verify_batches", type=int, default=5,
+                        help="整网验证使用的 batch 数")
     args = parser.parse_args()
 
     # ---- 自动选择空闲显存最多的 GPU ----
@@ -332,18 +482,18 @@ def main():
     title = f"Spiking-{args.model.upper()} on {args.dataset.upper()}"
 
     # ---- 构建模型 ----
-    print(f"[1/4] 构建 {title} (on {device}) ...")
+    print(f"[1/6] 构建 {title} (on {device}) ...")
     model = build_model(args.model, device, args.v_threshold)
 
     # ---- 数据集 ----
-    print(f"[2/4] 加载 {args.dataset} 测试集 (root={args.data_root}) ...")
+    print(f"[2/6] 加载 {args.dataset} 测试集 (root={args.data_root}) ...")
     ds = build_dataset(args.dataset, args.data_root)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
                         num_workers=8, pin_memory=True)
     print(f"  测试集共 {len(ds)} 张，{len(loader)} 个 batch")
 
     # ---- 分析网络 ----
-    print(f"[3/4] 分析网络，识别脉冲后继算子 ...")
+    print(f"[3/6] 分析网络，识别脉冲后继 Conv2d ...")
     imgs_s, _ = next(iter(loader))
     sample_input = torch.bernoulli(
         imgs_s[:4].to(device).unsqueeze(0).repeat(args.T, 1, 1, 1, 1).clamp(0, 1)
@@ -353,7 +503,7 @@ def main():
     if not layer_infos:
         print("未找到符合条件的目标层，退出。")
         return
-    print(f"\n共找到 {len(layer_infos)} 个目标层\n")
+    print(f"\n共找到 {len(layer_infos)} 个目标 Conv2d 层\n")
 
     # ---- Hook 捕获特征图 ----
     captured = {}
@@ -364,14 +514,11 @@ def main():
             if isinstance(x, torch.Tensor):
                 x = x.detach()
                 if x.dim() == 5:
-                    # [T, B, C, H, W] → [T*B, C, H, W]
                     T, B, C, H, W = x.shape
                     x = x.reshape(T * B, C, H, W)
                 elif x.dim() == 3:
-                    # [T, B, C] → [T*B, C]  (spikingjelly multi-step Linear 输入)
                     T, B, C = x.shape
                     x = x.reshape(T * B, C)
-                # 确保在正确的 GPU 设备上，contiguous，独立副本
                 captured[name] = x.to(device).contiguous().clone()
         return hook
 
@@ -380,8 +527,61 @@ def main():
         h = info.module.register_forward_hook(make_capture_hook(name))
         hook_handles.append(h)
 
+    # ---- 逐层算子验证 ----
+    print(f"[4/6] 逐层算子正确性验证 ...")
+    # 跑 3 个 batch 做验证
+    verify_batches_per_layer = 3
+    verify_count = 0
+    for imgs, _ in loader:
+        if verify_count >= verify_batches_per_layer:
+            break
+        inp = torch.bernoulli(
+            imgs.to(device).unsqueeze(0).repeat(args.T, 1, 1, 1, 1).clamp(0, 1)
+        )
+        sj_func.reset_net(model)
+        with torch.no_grad():
+            _ = model(inp)
+
+        for name, info in layer_infos.items():
+            feat = captured.get(name)
+            if feat is None or info.layer_type != "conv2d":
+                continue
+
+            max_abs, mean_abs, max_rel, cos = verify_layer(
+                feat, info.module, info.block_size, name)
+
+            info.verify_max_abs = max(info.verify_max_abs, max_abs)
+            info.verify_mean_abs += mean_abs
+            info.verify_max_rel = max(info.verify_max_rel, max_rel)
+            info.verify_cos_sum += cos
+            info.verify_count += 1
+
+        verify_count += 1
+
+    # 输出逐层验证报告
+    print(f"\n  {'Layer':<35} {'max_abs':>10} {'mean_abs':>10} {'max_rel':>10} {'cosine':>12} {'Status':>8}")
+    print(f"  {'-'*87}")
+    all_layer_pass = True
+    for name, info in layer_infos.items():
+        if info.verify_count == 0:
+            continue
+        avg_mean = info.verify_mean_abs / info.verify_count
+        avg_cos = info.verify_cos_sum / info.verify_count
+        sname = name if len(name) <= 34 else "..." + name[-31:]
+
+        # 判定标准: max_abs < 1e-3, cosine > 0.9999
+        ok = info.verify_max_abs < 1e-3 and avg_cos > 0.9999
+        status = "✓ PASS" if ok else "✗ FAIL"
+        if not ok:
+            all_layer_pass = False
+
+        print(f"  {sname:<35} {info.verify_max_abs:>10.6f} {avg_mean:>10.6f} "
+              f"{info.verify_max_rel:>10.6f} {avg_cos:>12.8f} {status:>8}")
+
+    print(f"\n  逐层验证结果: {'✓ 全部通过' if all_layer_pass else '✗ 存在不通过的层'}\n")
+
     # ---- 预热 ----
-    print(f"[4/4] 开始基准测试 (warmup={args.warmup}) ...")
+    print(f"[5/6] 性能基准测试 (warmup={args.warmup}) ...")
     for i, (imgs, _) in enumerate(loader):
         if i >= args.warmup:
             break
@@ -393,7 +593,7 @@ def main():
             _ = model(inp)
     print(f"  预热 {args.warmup} batch 完成")
 
-    # ---- 正式测试 ----
+    # ---- 正式性能测试 ----
     for batch_idx, (imgs, _) in enumerate(loader):
         inp = torch.bernoulli(
             imgs.to(device).unsqueeze(0).repeat(args.T, 1, 1, 1, 1).clamp(0, 1)
@@ -404,19 +604,20 @@ def main():
 
         for name, info in layer_infos.items():
             feat = captured.get(name)
-            if feat is None:
+            if feat is None or info.layer_type != "conv2d":
                 continue
 
-            if info.layer_type == "conv2d":
-                block = info.block_size
-                info.total_zeros += (feat.abs() <= 1e-6).sum().item()
-                info.total_elems += feat.numel()
-                _, dense_ms = run_dense_conv(feat, block)
-                _, sparse_ms = run_sparse_conv(feat, block)
-                _, cudnn_ms = run_cudnn_conv(feat, info.module)
-                info.total_dense_ms += dense_ms
-                info.total_sparse_ms += sparse_ms
-                info.total_cudnn_ms += cudnn_ms
+            block = info.block_size
+
+            # 稀疏度统计
+            info.total_zeros += (feat.abs() <= 1e-6).sum().item()
+            info.total_elems += feat.numel()
+
+            # 带权重的稀疏卷积 benchmark
+            _, sparse_ms = run_sparse_conv_weighted(feat, info.module, block)
+            _, cudnn_ms = run_cudnn_conv(feat, info.module)
+            info.total_sparse_ms += sparse_ms
+            info.total_cudnn_ms += cudnn_ms
 
         if (batch_idx + 1) % 50 == 0:
             pct = (batch_idx + 1) / len(loader) * 100
@@ -425,54 +626,60 @@ def main():
     for h in hook_handles:
         h.remove()
 
-    # ---- 输出报告 ----
-    print("\n" + "=" * 90)
+    # ---- 输出性能报告 ----
+    print(f"\n{'='*90}")
     print(f"{'SparseFlow Benchmark — ' + title:^90}")
     print(f"{'T=' + str(args.T) + '  BS=' + str(args.batch_size) + '  Power=' + str(args.power) + 'W':^90}")
-    print("=" * 90)
-    print(f"{'Layer':<35} {'Type':<6} {'Blk':>4} {'H':>4} "
-          f"{'Sparsity':>9} {'vs Triton':>10} {'vs cuDNN':>9}")
+    print(f"{'='*90}")
+    print(f"{'Layer':<35} {'Blk':>4} {'H':>4} "
+          f"{'Sparsity':>9} {'Sparse(ms)':>11} {'cuDNN(ms)':>10} {'Speedup':>9}")
     print("-" * 90)
 
-    total_d_j = 0.0
-    total_s_j = 0.0
+    total_sparse_j = 0.0
+    total_cudnn_j = 0.0
 
     for name, info in layer_infos.items():
         if info.total_elems == 0:
             continue
         sparsity = info.total_zeros / info.total_elems * 100
 
-        # 100% 稀疏或 sparse_ms 极小时，显示 "inf" 而非天文数字
-        if info.total_sparse_ms < 0.01 or sparsity > 99.99:
+        if info.total_sparse_ms < 1e-6:
             speedup_str = "      inf"
-            cudnn_str = "     inf"
         else:
-            speedup = info.total_dense_ms / info.total_sparse_ms
-            cudnn_speedup = info.total_cudnn_ms / info.total_sparse_ms
-            speedup_str = f"{speedup:>9.2f}x"
-            cudnn_str = f"{cudnn_speedup:>8.2f}x"
+            speedup = info.total_cudnn_ms / info.total_sparse_ms
+            speedup_str = f"{speedup:>8.2f}x"
 
-        ed = (info.total_dense_ms / 1000.0) * args.power
         es = (info.total_sparse_ms / 1000.0) * args.power
-        total_d_j += ed
-        total_s_j += es
+        ec = (info.total_cudnn_ms / 1000.0) * args.power
+        total_sparse_j += es
+        total_cudnn_j += ec
 
         sname = name if len(name) <= 34 else "..." + name[-31:]
         blk = str(info.block_size) if info.block_size else "-"
         h = str(info.H) if info.H else "-"
-        print(f"{sname:<35} {info.layer_type:<6} {blk:>4} {h:>4} "
-              f"{sparsity:>8.2f}% {speedup_str} {cudnn_str}")
+        print(f"{sname:<35} {blk:>4} {h:>4} "
+              f"{sparsity:>8.2f}% {info.total_sparse_ms:>10.2f} "
+              f"{info.total_cudnn_ms:>10.2f} {speedup_str}")
 
     print("-" * 90)
-    all_d = sum(i.total_dense_ms for i in layer_infos.values())
     all_s = sum(i.total_sparse_ms for i in layer_infos.values())
     all_c = sum(i.total_cudnn_ms for i in layer_infos.values())
-    print(f"{'[TOTAL]':<35} {'':>6} {'':>4} {'':>4} {'':>9} "
-          f"{all_d / max(all_s, 1e-9):>9.2f}x {all_c / max(all_s, 1e-9):>8.2f}x")
-    print(f"\n  Dense  Energy : {total_d_j:.4f} J")
-    print(f"  Sparse Energy : {total_s_j:.4f} J")
-    print(f"  Energy Saving : {(1 - total_s_j / max(total_d_j, 1e-9)) * 100:.2f}%")
-    print("=" * 90 + "\n")
+    if all_s > 1e-6:
+        print(f"{'[TOTAL]':<35} {'':>4} {'':>4} {'':>9} "
+              f"{all_s:>10.2f} {all_c:>10.2f} {all_c/all_s:>8.2f}x")
+    print(f"\n  cuDNN  Energy : {total_cudnn_j:.4f} J")
+    print(f"  Sparse Energy : {total_sparse_j:.4f} J")
+    saving = (1 - total_sparse_j / max(total_cudnn_j, 1e-9)) * 100
+    print(f"  Energy Saving : {saving:.2f}%")
+    print("=" * 90)
+
+    # ---- 整网推理验证 ----
+    print(f"\n[6/6] 整网推理一致性验证 ...")
+    # 重建原始模型用于整网验证
+    model_fresh = build_model(args.model, device, args.v_threshold)
+    layer_infos_fresh = analyze_network(model_fresh, sample_input, device)
+    verify_end_to_end(model_fresh, layer_infos_fresh, loader, device,
+                      args.T, num_batches=args.verify_batches)
 
 
 if __name__ == "__main__":

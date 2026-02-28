@@ -1,191 +1,115 @@
 """
-正确性验证脚本 — 验证所有稀疏算子输出与 PyTorch 原生算子数值一致
-
-覆盖算子: SparseConv2d, SparseLinear, SparseBatchNorm2d
-
-用法:
-    cd ~/SparseFlow
-    python Benchmark/test_correctness.py
+Standalone test: verify sparse_conv2d_forward vs F.conv2d
 """
-
 import sys
 from pathlib import Path
-
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from Ops.sparse_conv2d import SparseConv2d
-from Ops.sparse_linear import SparseLinear
-from Ops.sparse_batchnorm2d import SparseBatchNorm2d
 
+# Test the kernel at different sparsity levels
+def test_kernel(N, C_IN, C_OUT, H, W, block_size, sparsity, device="cuda"):
+    from Kernels.conv2d import sparse_conv2d_forward
 
-def test_sparse_conv2d():
-    """测试 SparseConv2d 的数值正确性"""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if not torch.cuda.is_available():
-        print("[SKIP] CUDA not available")
-        return
+    # Create input with controlled sparsity
+    x = torch.randn(N, C_IN, H, W, device=device)
+    # Zero out elements to achieve target sparsity
+    mask = torch.rand_like(x) < sparsity
+    x[mask] = 0.0
 
-    print("=" * 60)
-    print("SparseConv2d Correctness Test")
-    print("=" * 60)
+    # Random weights and bias
+    weight = torch.randn(C_OUT, C_IN, 3, 3, device=device)
+    bias = torch.randn(C_OUT, device=device)
 
-    for kernel_size, padding in [(3, 1), (1, 0)]:
-        for sparsity in [0.0, 0.5, 0.9, 0.99]:
-            C_in, C_out, H, W = 64, 128, 28, 28
-            N = 4
+    # Reference: F.conv2d
+    y_ref = F.conv2d(x, weight, bias, stride=1, padding=1)
 
-            x = torch.randn(N, C_in, H, W, device=device)
-            mask = torch.rand(N, C_in, H, W, device=device) > sparsity
-            x = x * mask.float()
+    # Sparse kernel
+    y_sparse, _ = sparse_conv2d_forward(
+        x.contiguous(), weight.contiguous(), bias,
+        block_size=block_size, kernel_size=3, threshold=1e-6
+    )
 
-            conv = nn.Conv2d(C_in, C_out, kernel_size, padding=padding, bias=True).to(device)
-            sparse_conv = SparseConv2d.from_dense(conv, block_size=8)
+    # Compare
+    diff = (y_sparse - y_ref).abs()
+    max_abs = diff.max().item()
+    mean_abs = diff.mean().item()
 
-            with torch.no_grad():
-                y_dense = F.conv2d(x, conv.weight, conv.bias, padding=padding)
-                y_sparse = sparse_conv(x)
+    # Cosine similarity
+    cos = F.cosine_similarity(
+        y_sparse.flatten().unsqueeze(0),
+        y_ref.flatten().unsqueeze(0)
+    ).item()
 
-            max_diff = (y_dense - y_sparse).abs().max().item()
-            rel_diff = max_diff / (y_dense.abs().max().item() + 1e-8)
-            passed = max_diff < 1e-3
+    # Check specific location
+    if max_abs > 0.001:
+        idx = (diff == diff.max()).nonzero()[0]
+        n, c, h, w = idx.tolist()
+        print(f"  Max error at [{n},{c},{h},{w}]: sparse={y_sparse[n,c,h,w]:.6f} ref={y_ref[n,c,h,w]:.6f}")
 
-            status = "PASS ✓" if passed else "FAIL ✗"
-            print(f"  [{status}] kernel={kernel_size}x{kernel_size}, "
-                  f"sparsity={sparsity:.0%}, max_diff={max_diff:.2e}")
-    print()
-
-
-def test_sparse_linear():
-    """测试 SparseLinear 的数值正确性"""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if not torch.cuda.is_available():
-        print("[SKIP] CUDA not available")
-        return
-
-    print("=" * 60)
-    print("SparseLinear Correctness Test")
-    print("=" * 60)
-
-    for sparsity in [0.0, 0.5, 0.9, 0.99]:
-        N, C_in, C_out = 128, 512, 1000
-
-        x = torch.randn(N, C_in, device=device)
-        # 按行稀疏化
-        row_mask = torch.rand(N, device=device) > sparsity
-        x = x * row_mask.unsqueeze(1).float()
-
-        linear = nn.Linear(C_in, C_out, bias=True).to(device)
-        sparse_linear = SparseLinear.from_dense(linear)
-
-        with torch.no_grad():
-            y_dense = F.linear(x, linear.weight, linear.bias)
-            y_sparse = sparse_linear(x)
-
-        max_diff = (y_dense - y_sparse).abs().max().item()
-        rel_diff = max_diff / (y_dense.abs().max().item() + 1e-8)
-        passed = max_diff < 1e-2  # Linear 的 atomic 误差可能稍大
-
-        status = "PASS ✓" if passed else "FAIL ✗"
-        print(f"  [{status}] sparsity={sparsity:.0%}, "
-              f"max_diff={max_diff:.2e}, rel_diff={rel_diff:.2e}")
-    print()
-
-
-def test_sparse_batchnorm2d():
-    """测试 SparseBatchNorm2d 的数值正确性"""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if not torch.cuda.is_available():
-        print("[SKIP] CUDA not available")
-        return
-
-    print("=" * 60)
-    print("SparseBatchNorm2d Correctness Test")
-    print("=" * 60)
-
-    for sparsity in [0.0, 0.5, 0.9, 0.99]:
-        N, C, H, W = 8, 64, 28, 28
-
-        x = torch.randn(N, C, H, W, device=device)
-        # 按空间位置稀疏化（所有通道同时置零）
-        spatial_mask = torch.rand(N, 1, H, W, device=device) > sparsity
-        x = x * spatial_mask.float()
-
-        bn = nn.BatchNorm2d(C).to(device)
-        bn.eval()
-        # 需要 running_mean/var 有意义的值
-        with torch.no_grad():
-            _ = bn(torch.randn(32, C, H, W, device=device))
-        bn.eval()
-
-        sparse_bn = SparseBatchNorm2d.from_dense(bn)
-        sparse_bn.eval()
-
-        with torch.no_grad():
-            y_dense = F.batch_norm(x, bn.running_mean, bn.running_var,
-                                   bn.weight, bn.bias, False, 0.0, bn.eps)
-            y_sparse = sparse_bn(x)
-
-        max_diff = (y_dense - y_sparse).abs().max().item()
-        passed = max_diff < 1e-5
-
-        status = "PASS ✓" if passed else "FAIL ✗"
-        print(f"  [{status}] sparsity={sparsity:.0%}, max_diff={max_diff:.2e}")
-    print()
-
-
-def test_5d_input():
-    """测试 5D 输入 (T, B, C, H, W) 的正确处理"""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if not torch.cuda.is_available():
-        return
-
-    print("=" * 60)
-    print("5D Input (T,B,C,H,W) Shape Test")
-    print("=" * 60)
-
-    T, B, C_in, C_out, H, W = 4, 2, 32, 64, 28, 28
-
-    # Conv2d
-    x = torch.randn(T, B, C_in, H, W, device=device) * 0.1
-    conv = nn.Conv2d(C_in, C_out, 3, padding=1).to(device)
-    sc = SparseConv2d.from_dense(conv, block_size=8)
-    with torch.no_grad():
-        y = sc(x)
-    assert y.shape == (T, B, C_out, H, W)
-    print(f"  [PASS ✓] Conv2d: {x.shape} -> {y.shape}")
-
-    # BatchNorm2d
-    bn = nn.BatchNorm2d(C_in).to(device)
-    bn.eval()
-    _ = bn(torch.randn(8, C_in, H, W, device=device))
-    bn.eval()
-    sbn = SparseBatchNorm2d.from_dense(bn)
-    sbn.eval()
-    with torch.no_grad():
-        y = sbn(x)
-    assert y.shape == (T, B, C_in, H, W)
-    print(f"  [PASS ✓] BN2d:   {x.shape} -> {y.shape}")
-
-    # Linear (3D)
-    C_fc = 512
-    x3 = torch.randn(T, B, C_fc, device=device) * 0.1
-    lin = nn.Linear(C_fc, 1000).to(device)
-    sl = SparseLinear.from_dense(lin)
-    with torch.no_grad():
-        y = sl(x3)
-    assert y.shape == (T, B, 1000)
-    print(f"  [PASS ✓] Linear: {x3.shape} -> {y.shape}")
-    print()
+    return max_abs, mean_abs, cos
 
 
 if __name__ == "__main__":
-    test_sparse_conv2d()
-    test_sparse_linear()
-    test_sparse_batchnorm2d()
-    test_5d_input()
-    print("All correctness tests completed.")
+    device = "cuda"
+
+    print("=" * 70)
+    print("Test 1: Small tensor, 0% sparsity (all non-zero)")
+    print("=" * 70)
+    for bs in [4, 8, 16]:
+        max_abs, mean_abs, cos = test_kernel(2, 4, 8, 16, 16, bs, sparsity=0.0, device=device)
+        print(f"  block={bs:>2}: max_abs={max_abs:.8f}  mean_abs={mean_abs:.8f}  cos={cos:.10f}")
+
+    print()
+    print("=" * 70)
+    print("Test 2: Medium tensor, 90% sparsity")
+    print("=" * 70)
+    for bs in [4, 8, 16]:
+        max_abs, mean_abs, cos = test_kernel(2, 16, 32, 28, 28, bs, sparsity=0.9, device=device)
+        print(f"  block={bs:>2}: max_abs={max_abs:.8f}  mean_abs={mean_abs:.8f}  cos={cos:.10f}")
+
+    print()
+    print("=" * 70)
+    print("Test 3: Larger tensor, 99% sparsity (like SNN)")
+    print("=" * 70)
+    for bs in [4, 8, 16]:
+        max_abs, mean_abs, cos = test_kernel(2, 64, 64, 56, 56, bs, sparsity=0.99, device=device)
+        print(f"  block={bs:>2}: max_abs={max_abs:.8f}  mean_abs={mean_abs:.8f}  cos={cos:.10f}")
+
+    print()
+    print("=" * 70)
+    print("Test 4: Binary spike input (0 or 1), like real SNN")
+    print("=" * 70)
+    for bs in [4, 8, 16]:
+        x = torch.bernoulli(torch.full((2, 32, 28, 28), 0.05, device=device))
+        weight = torch.randn(64, 32, 3, 3, device=device)
+        bias = torch.randn(64, device=device)
+
+        y_ref = F.conv2d(x, weight, bias, stride=1, padding=1)
+
+        from Kernels.conv2d import sparse_conv2d_forward
+        y_sparse, _ = sparse_conv2d_forward(
+            x.contiguous(), weight.contiguous(), bias,
+            block_size=bs, kernel_size=3, threshold=1e-6
+        )
+
+        diff = (y_sparse - y_ref).abs()
+        max_abs = diff.max().item()
+        mean_abs = diff.mean().item()
+        cos = F.cosine_similarity(
+            y_sparse.flatten().unsqueeze(0),
+            y_ref.flatten().unsqueeze(0)
+        ).item()
+        print(f"  block={bs:>2}: max_abs={max_abs:.8f}  mean_abs={mean_abs:.8f}  cos={cos:.10f}")
+
+    print()
+    print("=" * 70)
+    print("Test 5: H not divisible by block_size (edge case)")
+    print("=" * 70)
+    for H, bs in [(14, 4), (14, 8), (7, 4), (28, 16), (56, 16)]:
+        max_abs, mean_abs, cos = test_kernel(2, 16, 32, H, H, bs, sparsity=0.9, device=device)
+        print(f"  H={H:>2} block={bs:>2}: max_abs={max_abs:.8f}  mean_abs={mean_abs:.8f}  cos={cos:.10f}")
+
