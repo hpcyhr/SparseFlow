@@ -490,7 +490,7 @@ def main():
     print(f"[2/6] 加载 {args.dataset} 测试集 (root={args.data_root}) ...")
     ds = build_dataset(args.dataset, args.data_root)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
-                        num_workers=8, pin_memory=True)
+                        num_workers=0, pin_memory=True)
     print(f"  测试集共 {len(ds)} 张，{len(loader)} 个 batch")
 
     # ---- 分析网络 ----
