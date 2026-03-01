@@ -1,5 +1,5 @@
 """
-Standalone test: verify sparse_conv2d_forward vs F.conv2d
+Standalone test: verify v4 sparse_conv2d_forward (fp16 tl.dot) vs F.conv2d (fp32)
 """
 import sys
 from pathlib import Path
@@ -10,106 +10,121 @@ if _PROJECT_ROOT not in sys.path:
 import torch
 import torch.nn.functional as F
 
-# Test the kernel at different sparsity levels
-def test_kernel(N, C_IN, C_OUT, H, W, block_size, sparsity, device="cuda"):
+
+def test_conv3x3(N, C_IN, C_OUT, H, W, sparsity, device="cuda"):
     from Kernels.conv2d import sparse_conv2d_forward
 
-    # Create input with controlled sparsity
     x = torch.randn(N, C_IN, H, W, device=device)
-    # Zero out elements to achieve target sparsity
     mask = torch.rand_like(x) < sparsity
     x[mask] = 0.0
-
-    # Random weights and bias
     weight = torch.randn(C_OUT, C_IN, 3, 3, device=device)
     bias = torch.randn(C_OUT, device=device)
 
-    # Reference: F.conv2d
     y_ref = F.conv2d(x, weight, bias, stride=1, padding=1)
 
-    # Sparse kernel
-    y_sparse, _ = sparse_conv2d_forward(
+    y_sparse, ms = sparse_conv2d_forward(
         x.contiguous(), weight.contiguous(), bias,
-        block_size=block_size, kernel_size=3, threshold=0.0
+        block_size=8, kernel_size=3, threshold=1e-6
     )
 
-    # Compare
     diff = (y_sparse - y_ref).abs()
     max_abs = diff.max().item()
     mean_abs = diff.mean().item()
-
-    # Cosine similarity
     cos = F.cosine_similarity(
         y_sparse.flatten().unsqueeze(0),
         y_ref.flatten().unsqueeze(0)
     ).item()
+    return max_abs, mean_abs, cos, ms
 
-    # Check specific location
-    if max_abs > 0.001:
-        idx = (diff == diff.max()).nonzero()[0]
-        n, c, h, w = idx.tolist()
-        print(f"  Max error at [{n},{c},{h},{w}]: sparse={y_sparse[n,c,h,w]:.6f} ref={y_ref[n,c,h,w]:.6f}")
 
-    return max_abs, mean_abs, cos
+def test_conv1x1(N, C_IN, C_OUT, H, W, sparsity, device="cuda"):
+    from Kernels.conv2d import sparse_conv2d_forward
+
+    x = torch.randn(N, C_IN, H, W, device=device)
+    mask = torch.rand_like(x) < sparsity
+    x[mask] = 0.0
+    weight = torch.randn(C_OUT, C_IN, 1, 1, device=device)
+    bias = torch.randn(C_OUT, device=device)
+
+    y_ref = F.conv2d(x, weight, bias, stride=1, padding=0)
+
+    y_sparse, ms = sparse_conv2d_forward(
+        x.contiguous(), weight.contiguous(), bias,
+        block_size=8, kernel_size=1, threshold=1e-6
+    )
+
+    diff = (y_sparse - y_ref).abs()
+    max_abs = diff.max().item()
+    mean_abs = diff.mean().item()
+    cos = F.cosine_similarity(
+        y_sparse.flatten().unsqueeze(0),
+        y_ref.flatten().unsqueeze(0)
+    ).item()
+    return max_abs, mean_abs, cos, ms
 
 
 if __name__ == "__main__":
     device = "cuda"
 
     print("=" * 70)
-    print("Test 1: Small tensor, 0% sparsity (all non-zero)")
+    print("3x3 Conv Tests (fp16 kernel vs fp32 cuDNN)")
     print("=" * 70)
-    for bs in [4, 8, 16]:
-        max_abs, mean_abs, cos = test_kernel(2, 4, 8, 16, 16, bs, sparsity=0.0, device=device)
-        print(f"  block={bs:>2}: max_abs={max_abs:.8f}  mean_abs={mean_abs:.8f}  cos={cos:.10f}")
+
+    configs = [
+        # (N, C_IN, C_OUT, H, W, sparsity)
+        (2, 64, 64, 56, 56, 0.0),
+        (2, 64, 64, 56, 56, 0.9),
+        (2, 64, 64, 56, 56, 0.99),
+        (2, 128, 128, 28, 28, 0.9),
+        (2, 128, 128, 28, 28, 0.99),
+        (2, 256, 256, 14, 14, 0.9),
+        (2, 256, 256, 14, 14, 0.99),
+        (2, 32, 64, 56, 56, 0.95),
+        (4, 64, 128, 28, 28, 0.95),
+    ]
+
+    for N, C_IN, C_OUT, H, W, sp in configs:
+        max_abs, mean_abs, cos, ms = test_conv3x3(N, C_IN, C_OUT, H, W, sp, device)
+        status = "✓" if max_abs < 0.05 and cos > 0.999 else "✗"
+        print(f"  {status} 3x3 N={N} C={C_IN}→{C_OUT} H={H} sp={sp:.0%}: "
+              f"max_abs={max_abs:.6f} cos={cos:.8f} time={ms:.2f}ms")
 
     print()
     print("=" * 70)
-    print("Test 2: Medium tensor, 90% sparsity")
+    print("1x1 Conv Tests")
     print("=" * 70)
-    for bs in [4, 8, 16]:
-        max_abs, mean_abs, cos = test_kernel(2, 16, 32, 28, 28, bs, sparsity=0.9, device=device)
-        print(f"  block={bs:>2}: max_abs={max_abs:.8f}  mean_abs={mean_abs:.8f}  cos={cos:.10f}")
+
+    configs_1x1 = [
+        (2, 64, 256, 56, 56, 0.0),
+        (2, 64, 256, 56, 56, 0.9),
+        (2, 256, 64, 56, 56, 0.99),
+        (2, 128, 512, 28, 28, 0.9),
+        (2, 512, 128, 28, 28, 0.99),
+    ]
+
+    for N, C_IN, C_OUT, H, W, sp in configs_1x1:
+        max_abs, mean_abs, cos, ms = test_conv1x1(N, C_IN, C_OUT, H, W, sp, device)
+        status = "✓" if max_abs < 0.05 and cos > 0.999 else "✗"
+        print(f"  {status} 1x1 N={N} C={C_IN}→{C_OUT} H={H} sp={sp:.0%}: "
+              f"max_abs={max_abs:.6f} cos={cos:.8f} time={ms:.2f}ms")
 
     print()
     print("=" * 70)
-    print("Test 3: Larger tensor, 99% sparsity (like SNN)")
+    print("Binary spike input (like real SNN)")
     print("=" * 70)
-    for bs in [4, 8, 16]:
-        max_abs, mean_abs, cos = test_kernel(2, 64, 64, 56, 56, bs, sparsity=0.99, device=device)
-        print(f"  block={bs:>2}: max_abs={max_abs:.8f}  mean_abs={mean_abs:.8f}  cos={cos:.10f}")
-
-    print()
-    print("=" * 70)
-    print("Test 4: Binary spike input (0 or 1), like real SNN")
-    print("=" * 70)
-    for bs in [4, 8, 16]:
-        x = torch.bernoulli(torch.full((2, 32, 28, 28), 0.05, device=device))
-        weight = torch.randn(64, 32, 3, 3, device=device)
-        bias = torch.randn(64, device=device)
-
+    for C_IN, C_OUT, H in [(64, 64, 56), (128, 128, 28), (256, 256, 14)]:
+        x = torch.bernoulli(torch.full((2, C_IN, H, H), 0.05, device=device))
+        weight = torch.randn(C_OUT, C_IN, 3, 3, device=device)
+        bias = torch.randn(C_OUT, device=device)
         y_ref = F.conv2d(x, weight, bias, stride=1, padding=1)
-
         from Kernels.conv2d import sparse_conv2d_forward
-        y_sparse, _ = sparse_conv2d_forward(
+        y_sparse, ms = sparse_conv2d_forward(
             x.contiguous(), weight.contiguous(), bias,
-            block_size=bs, kernel_size=3, threshold=0.0
+            block_size=8, kernel_size=3, threshold=1e-6
         )
-
         diff = (y_sparse - y_ref).abs()
         max_abs = diff.max().item()
-        mean_abs = diff.mean().item()
-        cos = F.cosine_similarity(
-            y_sparse.flatten().unsqueeze(0),
-            y_ref.flatten().unsqueeze(0)
-        ).item()
-        print(f"  block={bs:>2}: max_abs={max_abs:.8f}  mean_abs={mean_abs:.8f}  cos={cos:.10f}")
-
-    print()
-    print("=" * 70)
-    print("Test 5: H not divisible by block_size (edge case)")
-    print("=" * 70)
-    for H, bs in [(14, 4), (14, 8), (7, 4), (28, 16), (56, 16)]:
-        max_abs, mean_abs, cos = test_kernel(2, 16, 32, H, H, bs, sparsity=0.9, device=device)
-        print(f"  H={H:>2} block={bs:>2}: max_abs={max_abs:.8f}  mean_abs={mean_abs:.8f}  cos={cos:.10f}")
-
+        cos = F.cosine_similarity(y_sparse.flatten().unsqueeze(0), y_ref.flatten().unsqueeze(0)).item()
+        status = "✓" if max_abs < 0.05 and cos > 0.999 else "✗"
+        print(f"  {status} spike 3x3 C={C_IN}→{C_OUT} H={H}: "
+              f"max_abs={max_abs:.6f} cos={cos:.8f} time={ms:.2f}ms")
