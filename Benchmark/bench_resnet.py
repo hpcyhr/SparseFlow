@@ -684,3 +684,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# python bench_resnet.py --model resnet50 --dataset cifar100 --T 16
