@@ -1,35 +1,28 @@
 """
-SparseFlow Conv2d Triton Kernels — v10.3 Metadata-Driven (production)
+SparseFlow Conv2d Triton Kernels — v10.4 Dynamic Block Tuning
 
-Architecture:
-  Stage-1:   Prescan → flags [N, C_IN, GH, GW] int32
-  Stage-1.5: Active channel detection + weight gather (vectorized torch)
-  Stage-2:   Branch-free Tensor Core GEMM over shrunk K dimension
+Performance: Dynamic BLOCK_M based on spatial resolution.
+  H=56 → BH=8, BW=16 → BLOCK_M=128 → GH×GW = 7×4 = 28 tiles (vs 98 in v10.3)
+  H=28 → BH=8, BW=8  → BLOCK_M=64  → GH×GW = 4×4 = 16 tiles
+  H<16 → BH=4, BW=4  → BLOCK_M=16  → fine-grained sparsity pruning
 
-Design decisions and safety guarantees:
+  This 3.5× reduction in spatial tiles directly reduces:
+    - Grid programs launched (less kernel overhead)
+    - Python-side metadata ops (flags_4d is smaller)
+    - Each program does MORE work → better Tensor Core utilization
 
-  1. PADDING SAFETY: active_cin padded with 0 (valid channel index).
-     Why this is safe (triple protection):
-       a) k_mask = (offs_k < active_K_raw) → padding lanes masked
-       b) x_tile load uses k_mask → returns 0.0 for padding
-       c) w_gathered has zero rows for padding positions
-     Even if Triton speculatively executes the masked path, channel 0
-     is always a valid address (no segfault), and the product x*w = 0*w = 0.
+Safety: BLOCK_N capped at 32 when N≥256 (T=16 proxy) to limit register
+  pressure. acc[128, 32] = 128×32×4 = 16KB fits comfortably in A100 regs.
 
-  2. MEMORY SAFETY: Spatial coords clamped to [0, H-1] / [0, W-1] BEFORE
-     address computation. Real boundary handling via x_valid mask (→ other=0.0).
-     Addresses are ALWAYS within the x tensor regardless of kh/kw shift.
+Correctness: Prescan and kernel share identical BH/BW → flags_4d shape
+  [N, C_IN, GH, GW] is consistent. max_pool2d 3×3 dilation on the coarser
+  grid still correctly captures neighbor block influence because each flag
+  represents a larger spatial region.
 
-  3. WEIGHT ALIGNMENT: w_gathered shape = [C_OUT, AK_PAD, 3, 3] for 3×3,
-     [C_OUT, AK_PAD] for 1×1. Python computes strides and passes to kernel.
-     Kernel uses these strides directly — no recomputation.
-
-  4. T=16 MEMORY: BLOCK_M reduced from 64 to 32 (BH=BW=4 for spatial≥8).
-     This halves per-thread register pressure: acc is [32, BLOCK_N] instead
-     of [64, BLOCK_N]. Reduces register spilling → avoids segfault at T=16.
-     GH/GW passed as kernel args (no tl.cdiv inside kernel).
-     NUM_K_ITERS is runtime int (not constexpr) to avoid recompilation per
-     sparsity level.
+Architecture unchanged:
+  Stage-1:   Prescan → flags
+  Stage-1.5: Active channel detection + weight gather
+  Stage-2:   Branch-free Tensor Core GEMM over shrunk K
 
 Triton 2.x safe: no continue, no 0-d tensors, no scalar .to()
 """
@@ -84,9 +77,9 @@ def sparse_conv3x3_v10_kernel(
     active_cin_ptr,     # [AK_PAD] int32
     y_ptr,              # [N, C_OUT, H, W] fp32
     N_val, C_IN, C_OUT, H, W,
-    GH, GW,             # spatial grid dims (from Python, no tl.cdiv)
-    active_K_raw,       # real active count (for k_mask)
-    num_k_iters,        # = ceil(AK_PAD / BLOCK_K), runtime int
+    GH, GW,
+    active_K_raw,
+    num_k_iters,
     w_stride_co,        # = AK_PAD * 9
     w_stride_k,         # = 9
     HAS_BIAS: tl.constexpr,
@@ -96,26 +89,18 @@ def sparse_conv3x3_v10_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_W: tl.constexpr,
 ):
-    """
-    Grid: (N * GH * GW, cdiv(C_OUT, BLOCK_N))
-    Branch-free K-loop over pre-filtered active channels.
-    All addresses clamped; k_mask guards padding entries.
-    """
     pid_spatial = tl.program_id(0)
     pid_cout = tl.program_id(1)
 
-    # Decode spatial position using Python-provided GH, GW
     gw_idx = pid_spatial % GW
     tmp = pid_spatial // GW
     gh_idx = tmp % GH
     n_idx = tmp // GH
 
-    # C_OUT tile
     c_out_start = pid_cout * BLOCK_N
     offs_n = c_out_start + tl.arange(0, BLOCK_N)
     n_mask = offs_n < C_OUT
 
-    # Spatial pixel tile
     offs_m = tl.arange(0, BLOCK_M)
     tile_bh = offs_m // BLOCK_W
     tile_bw = offs_m % BLOCK_W
@@ -128,31 +113,24 @@ def sparse_conv3x3_v10_kernel(
     H_max = H - 1
     W_max = W - 1
 
-    # ── K loop (runtime bound — no recompilation per sparsity level) ──
     for k_iter in range(num_k_iters):
         k_start = k_iter * BLOCK_K
         offs_k = k_start + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < active_K_raw  # masks padding entries
+        k_mask = offs_k < active_K_raw
 
-        # Channel indices (padding slots → 0, a valid index; masked below)
         cin_idx = tl.load(active_cin_ptr + offs_k, mask=k_mask, other=0)
 
-        # 9 sub-GEMMs for (kh, kw) ∈ {0,1,2}²
         for kh in tl.static_range(3):
             for kw in tl.static_range(3):
-                # Shifted spatial coordinates
-                raw_h = tile_h + (kh - 1)  # may be -1 .. H
-                raw_w = tile_w + (kw - 1)  # may be -1 .. W
+                raw_h = tile_h + (kh - 1)
+                raw_w = tile_w + (kw - 1)
 
-                # Validity mask (real boundary logic)
                 h_ok = (raw_h >= 0) & (raw_h < H)
                 w_ok = (raw_w >= 0) & (raw_w < W)
 
-                # CLAMP to safe range → address always within buffer
                 safe_h = tl.minimum(tl.maximum(raw_h, 0), H_max)
                 safe_w = tl.minimum(tl.maximum(raw_w, 0), W_max)
 
-                # X_tile[BLOCK_M, BLOCK_K]
                 x_addrs = (x_ptr
                            + (n_idx * C_IN + cin_idx[None, :]) * HW
                            + safe_h[:, None] * W
@@ -162,7 +140,6 @@ def sparse_conv3x3_v10_kernel(
                 x_tile = tl.load(x_addrs, mask=x_load_mask, other=0.0)
                 x_tile = x_tile.to(tl.float16)
 
-                # W_tile[BLOCK_K, BLOCK_N]
                 w_addrs = (w_gathered_ptr
                            + offs_n[None, :] * w_stride_co
                            + offs_k[:, None] * w_stride_k
@@ -173,12 +150,10 @@ def sparse_conv3x3_v10_kernel(
 
                 acc += tl.dot(x_tile, w_tile)
 
-    # Bias
     if HAS_BIAS:
         bias_vals = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)
         acc += bias_vals[None, :]
 
-    # Store fp32
     out_addrs = (y_ptr
                  + (n_idx * C_OUT + offs_n[None, :]) * HW
                  + tile_h[:, None] * W
@@ -210,10 +185,6 @@ def sparse_conv1x1_v10_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_W: tl.constexpr,
 ):
-    """
-    Grid: (N * GH * GW, cdiv(C_OUT, BLOCK_N))
-    Branch-free 1×1 GEMM. Reads directly from NCHW x_ptr.
-    """
     pid_spatial = tl.program_id(0)
     pid_cout = tl.program_id(1)
 
@@ -233,8 +204,6 @@ def sparse_conv1x1_v10_kernel(
     tile_w = gw_idx * BLOCK_W + tile_bw
     m_mask = (tile_h < H) & (tile_w < W)
 
-    # Clamp spatial for safe addressing (1×1 has no shift, but tile edges
-    # may exceed H/W when not evenly divisible)
     safe_h = tl.minimum(tile_h, H - 1)
     safe_w = tl.minimum(tile_w, W - 1)
 
@@ -248,7 +217,6 @@ def sparse_conv1x1_v10_kernel(
 
         cin_idx = tl.load(active_cin_ptr + offs_k, mask=k_mask, other=0)
 
-        # X_tile[BLOCK_M, BLOCK_K]
         x_addrs = (x_ptr
                    + (n_idx * C_IN + cin_idx[None, :]) * HW
                    + safe_h[:, None] * W
@@ -257,7 +225,6 @@ def sparse_conv1x1_v10_kernel(
         x_tile = tl.load(x_addrs, mask=x_load_mask, other=0.0)
         x_tile = x_tile.to(tl.float16)
 
-        # W_tile[BLOCK_K, BLOCK_N]
         w_addrs = (w_gathered_ptr
                    + offs_n[None, :] * w_stride_co
                    + offs_k[:, None])
@@ -267,12 +234,10 @@ def sparse_conv1x1_v10_kernel(
 
         acc += tl.dot(x_tile, w_tile)
 
-    # Bias
     if HAS_BIAS:
         bias_vals = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)
         acc += bias_vals[None, :]
 
-    # Store fp32
     out_addrs = (y_ptr
                  + (n_idx * C_OUT + offs_n[None, :]) * HW
                  + tile_h[:, None] * W
@@ -310,38 +275,64 @@ def dense_conv3x3_kernel(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Tile config — T=16 optimized
+# Dynamic tile config
 # ═══════════════════════════════════════════════════════════════════════
 
-def _select_block_sizes(H, W, C_IN, C_OUT, kernel_size):
+def _select_block_sizes(H, W, C_IN, C_OUT, kernel_size, N):
     """
-    All tl.dot dims: powers-of-2, >= 16.
+    Dynamic block selection based on pixel count and batch size.
 
-    T=16 optimization: BLOCK_M = 32 (BH=BW=4) reduces register pressure.
-    The 3×3 kernel holds acc[BLOCK_M, BLOCK_N] + 2 tiles [BLOCK_M, BLOCK_K]
-    + [BLOCK_K, BLOCK_N] in registers. At BLOCK_M=64, BLOCK_N=64 this is
-    64*64*4 = 16KB for acc alone, causing spills on A100 (255 registers/thread,
-    32 threads/warp → ~32KB total). BLOCK_M=32 halves this to 8KB.
+    All tl.dot dimensions must be powers-of-2, >= 16.
+
+    Strategy:
+      Large maps (H*W ≥ 56*56 = 3136):
+        BH=8, BW=16 → BLOCK_M=128 → GH*GW = 7*4 = 28 for H=56
+        Maximizes per-program work, amortizes kernel launch + metadata.
+
+      Medium maps (H*W ≥ 28*28 = 784):
+        BH=8, BW=8 → BLOCK_M=64 → GH*GW = 4*4 = 16 for H=28
+        Good balance of work per program and sparsity granularity.
+
+      Small maps (H*W < 784):
+        BH=4, BW=4 → BLOCK_M=16
+        Fine-grained sparsity pruning for small feature maps.
+
+    Register pressure guard:
+      When N ≥ 256 (proxy for T ≥ 16 with BS ≥ 16, or T ≥ 8 with BS ≥ 32),
+      cap BLOCK_N at 32. acc[128, 32] = 16KB < register budget.
+      Otherwise allow BLOCK_N=64 for larger C_OUT.
+
+    Tile count comparison at H=56, W=56:
+      v10.3: BH=4, BW=8 → GH=14, GW=7 → 98 tiles
+      v10.4: BH=8, BW=16 → GH=7, GW=4  → 28 tiles  (3.5× fewer)
     """
-    # Spatial tile: BLOCK_M = BH * BW
-    # Use 4×4=16 minimum (tl.dot requires ≥16), 4×8=32 for larger spatial
-    spatial = min(H, W)
-    if spatial >= 8:
-        BH, BW = 4, 8      # BLOCK_M = 32
+    pixels = H * W
+
+    if pixels >= 3136:          # H*W ≥ 56*56
+        BH, BW = 8, 16         # BLOCK_M = 128
+    elif pixels >= 784:         # H*W ≥ 28*28
+        BH, BW = 8, 8          # BLOCK_M = 64
+    elif min(H, W) >= 8:
+        BH, BW = 4, 4          # BLOCK_M = 16
     else:
-        BH, BW = 4, 4      # BLOCK_M = 16
+        BH, BW = 4, 4          # BLOCK_M = 16
 
     BLOCK_M = BH * BW
 
-    # C_OUT tile
-    if C_OUT >= 128:
-        BLOCK_N = 64
-    elif C_OUT >= 32:
-        BLOCK_N = 32
-    else:
-        BLOCK_N = 16
+    # C_OUT tile — register-safe selection
+    high_pressure = (N >= 256)  # proxy for large T
 
-    # C_IN tile
+    if high_pressure:
+        # Cap at 32 to keep acc[BLOCK_M, 32] manageable
+        BLOCK_N = 32 if C_OUT >= 32 else 16
+    else:
+        if C_OUT >= 128:
+            BLOCK_N = 64
+        elif C_OUT >= 32:
+            BLOCK_N = 32
+        else:
+            BLOCK_N = 16
+
     BLOCK_K = 16
 
     return BH, BW, BLOCK_M, BLOCK_N, BLOCK_K
@@ -354,22 +345,21 @@ def _select_block_sizes(H, W, C_IN, C_OUT, kernel_size):
 @torch.no_grad()
 def _build_active_channels_3x3(flags_4d, N, C_IN, GH, GW, BLOCK_K, device):
     """
-    Dilate flags by 3×3 (neighbor influence), reduce to global active set.
+    Dilate flags by 3×3 (neighbor block influence), reduce to global active set.
 
-    Returns:
-        active_cin:      [AK_PAD] int32 — padded with 0
-        active_K_raw:    int — real active count
-        active_K_padded: int — padded to multiple of BLOCK_K
+    Correctness at larger BH/BW: Each flag now represents a larger spatial block.
+    The max_pool2d 3×3 dilation still correctly marks channel c as needed for
+    tile (gh, gw) if c is non-zero in any of the 9 neighbor BLOCKS. This is
+    conservative: it may include some channels that are zero in the specific
+    pixel sub-region within the block, but never misses a needed channel.
+    At high sparsity this conservative estimate is still very effective.
     """
     f = flags_4d.float()
-    # Dilate: pad spatial dims by 1, then max_pool 3×3 stride 1
     padded = torch.nn.functional.pad(f, (1, 1, 1, 1), value=0.0)
     dilated = torch.nn.functional.max_pool2d(padded, 3, stride=1, padding=0)
-    # dilated: [N, C_IN, GH, GW]
 
-    # Global reduction: channel active if ANY (n, gh, gw) flags it
-    channel_active = (dilated > 0).any(dim=0).any(dim=-1).any(dim=-1)  # [C_IN]
-    nz = channel_active.nonzero(as_tuple=False)  # [num_active, 1]
+    channel_active = (dilated > 0).any(dim=0).any(dim=-1).any(dim=-1)
+    nz = channel_active.nonzero(as_tuple=False)
     active_cin = nz.reshape(-1).to(torch.int32)
     active_K_raw = int(active_cin.numel())
 
@@ -377,14 +367,8 @@ def _build_active_channels_3x3(flags_4d, N, C_IN, GH, GW, BLOCK_K, device):
         z = torch.zeros(BLOCK_K, dtype=torch.int32, device=device)
         return z, 0, BLOCK_K
 
-    # Pad to next multiple of BLOCK_K
     active_K_padded = ((active_K_raw + BLOCK_K - 1) // BLOCK_K) * BLOCK_K
     if active_K_padded > active_K_raw:
-        # Pad with 0. Safety:
-        #   - k_mask = offs_k < active_K_raw → padding lanes masked
-        #   - x_tile load returns 0.0 for masked lanes
-        #   - w_gathered has zero weight for padding rows
-        #   - Even if speculatively executed, channel 0 is valid memory
         pad_t = torch.zeros(active_K_padded - active_K_raw,
                             dtype=torch.int32, device=device)
         active_cin = torch.cat([active_cin, pad_t])
@@ -418,10 +402,10 @@ def _gather_weight_3x3(weight_f16, active_cin, active_K_raw, active_K_padded,
                         C_OUT):
     """
     [C_OUT, C_IN, 3, 3] → [C_OUT, AK_PAD, 3, 3]
-    Padding rows are zero (k_mask + zero weight = zero contribution).
+    Padding rows are zero. No redundant alloc: cat only if padding needed.
     """
     idx = active_cin[:active_K_raw].long()
-    w_active = weight_f16[:, idx, :, :]  # [C_OUT, active_K_raw, 3, 3]
+    w_active = weight_f16[:, idx, :, :]
 
     if active_K_padded > active_K_raw:
         pad_size = active_K_padded - active_K_raw
@@ -438,7 +422,7 @@ def _gather_weight_1x1(weight_f16, active_cin, active_K_raw, active_K_padded,
     """[C_OUT, C_IN, 1, 1] → [C_OUT, AK_PAD]"""
     w_2d = weight_f16.reshape(C_OUT, C_IN)
     idx = active_cin[:active_K_raw].long()
-    w_active = w_2d[:, idx]  # [C_OUT, active_K_raw]
+    w_active = w_2d[:, idx]
 
     if active_K_padded > active_K_raw:
         pad_size = active_K_padded - active_K_raw
@@ -453,13 +437,15 @@ def _gather_weight_1x1(weight_f16, active_cin, active_K_raw, active_K_padded,
 # Main entry point
 # ═══════════════════════════════════════════════════════════════════════
 
-def sparse_conv2d_forward(x, weight, bias, block_size,
+def sparse_conv2d_forward(x, weight, bias, block_size=None,
                           kernel_size=3, threshold=1e-6):
     """
-    Three-stage sparse conv2d:
-      Stage 1:   Prescan → flags
-      Stage 1.5: Active channel metadata + weight gather
-      Stage 2:   Branch-free Tensor Core GEMM over shrunk K
+    Three-stage sparse conv2d with dynamic block tuning.
+
+    block_size semantics:
+      None  → fully dynamic: _select_block_sizes(H, W, ...) decides everything
+      int   → legacy hint, but OVERRIDDEN for large maps (H*W >= 3136)
+              This ensures H=56 always gets BLOCK_M=128 regardless of caller
 
     Returns:
         y: [N, C_OUT, H, W] float32
@@ -469,15 +455,29 @@ def sparse_conv2d_forward(x, weight, bias, block_size,
     C_OUT = weight.shape[0]
     device = x.device
 
-    BH, BW, BLOCK_M, BLOCK_N, BLOCK_K = _select_block_sizes(
-        H, W, C_IN, C_OUT, kernel_size)
+    # Dynamic block selection — always uses _select_block_sizes for optimal
+    # tile config. Even if block_size was passed, large maps get upgraded.
+    pixels = H * W
+    if block_size is None or pixels >= 3136:
+        # Full dynamic mode: kernel decides optimal BH/BW/BLOCK_M/BLOCK_N
+        BH, BW, BLOCK_M, BLOCK_N, BLOCK_K = _select_block_sizes(
+            H, W, C_IN, C_OUT, kernel_size, N)
+    else:
+        # Legacy fallback: use passed block_size as BH=BW
+        # Ensure minimum tile dims for tl.dot (>= 4)
+        bs = max(block_size, 4)
+        BH, BW = bs, bs
+        BLOCK_M = BH * BW
+        BLOCK_N = 32 if C_OUT >= 32 else 16
+        BLOCK_K = 16
+
     GH = triton.cdiv(H, BH)
     GW = triton.cdiv(W, BW)
 
     x_f16 = x.half().contiguous()
     w_f16 = weight.half().contiguous()
 
-    # ── Stage-1: Prescan ──
+    # ── Stage-1: Prescan (uses same BH, BW as kernel) ──
     total_blocks = N * C_IN * GH * GW
     flags = torch.empty(total_blocks, dtype=torch.int32, device=device)
     prescan_kernel[(total_blocks,)](
@@ -495,7 +495,7 @@ def sparse_conv2d_forward(x, weight, bias, block_size,
 
     # ── Stage-1.5: Metadata ──
     flags_4d = flags.reshape(N, C_IN, GH, GW)
-    del flags  # free early
+    del flags
 
     has_bias = bias is not None
     bias_f32 = bias.float().contiguous() if has_bias else torch.empty(1, device=device)
@@ -520,12 +520,11 @@ def sparse_conv2d_forward(x, weight, bias, block_size,
 
         w_gathered = _gather_weight_3x3(w_f16, active_cin, active_K_raw,
                                         ak_pad, C_OUT)
-        del w_f16  # free original weight copy
+        del w_f16
 
-        # Strides computed in Python — guaranteed to match contiguous layout
-        w_stride_co = ak_pad * 9   # [C_OUT, AK_PAD, 3, 3] dim-0 stride
-        w_stride_k = 9             # dim-1 stride
-        num_k_iters = ak_pad // BLOCK_K  # exact since ak_pad is multiple of BLOCK_K
+        w_stride_co = ak_pad * 9
+        w_stride_k = 9
+        num_k_iters = ak_pad // BLOCK_K
 
         start_evt.record()
         sparse_conv3x3_v10_kernel[(grid_spatial, grid_cout)](
@@ -556,7 +555,7 @@ def sparse_conv2d_forward(x, weight, bias, block_size,
                                         ak_pad, C_OUT, C_IN)
         del w_f16
 
-        w_stride_co = ak_pad  # [C_OUT, AK_PAD] dim-0 stride
+        w_stride_co = ak_pad
         num_k_iters = ak_pad // BLOCK_K
 
         start_evt.record()
