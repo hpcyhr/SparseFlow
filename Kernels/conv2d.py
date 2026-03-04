@@ -1,162 +1,92 @@
 """
-SparseFlow Conv2d Triton Kernels — v12.1 Per-Tile Channel Compaction
+SparseFlow Conv2d Triton Kernels — v15.1
 
 ═══════════════════════════════════════════════════════════════════════
-Architecture:
-  Stage-1  (3-step GPU pipeline):
-    1. prescan_count_kernel: grid=(N_TILES,), scans C_IN channels per
-       tile → tile_counts[tile_id]
-    2. torch.cumsum on GPU → tile_ptr (CSR row-pointer)
-    3. prescan_write_kernel: grid=(N_TILES,), writes active Cin indices
-       into tile_cin[] at positions given by tile_ptr
+v14.1 → v15.1: 完整 triton.autotune
 
-  Stage-2  (per-tile sparse GEMM):
-    Grid = (N_TILES, cdiv(C_OUT, BLOCK_N))
-    Each program reads its active Cin list from tile_ptr/tile_cin,
-    iterates in BLOCK_K chunks up to MAX_K_ITERS (constexpr),
-    loads x patches + weight slices via indirect indexing,
-    accumulates via tl.dot (Tensor Core).
+  Autotune 搜索空间（Stage-2 kernel）：
+    BLOCK_M: [64, 128]   — 空间 tile 像素数
+    BLOCK_N: [64, 128]   — 输出通道 tile 大小
+    BLOCK_K: [32, 64]    — K 维 chunk（活跃通道）
+    num_warps: [4, 8]    — warp 并发度
+    num_stages: 1        — 固定（while 循环编译稳定性）
+    → 共 2×2×2×2 = 16 种配置
 
-  Supports 3×3 and 1×1 kernels.
+  BLOCK_M 与空间 tile 的映射：
+    BLOCK_M=64  → BLOCK_H=8,  BLOCK_W=8  → 每个 tile 覆盖 8×8 像素
+    BLOCK_M=128 → BLOCK_H=8,  BLOCK_W=16 → 每个 tile 覆盖 8×16 像素
 
-Tile strategy (改动 B — dynamic):
-  _select_block_sizes adapts BH/BW based on H*W AND C_IN.
+  Prescan 与 Stage-2 的 BH/BW 耦合：
+    Prescan 的 tile 划分由 Python 层的 BH/BW 决定。
+    当 autotune 选择不同的 BLOCK_M 时，BH/BW 也随之变化，
+    因此 Python 层在 autotune 完成首次搜索后，会用选定的
+    BH/BW 来重新运行 Prescan。
 
-Stability (改动 E):
-  All kernel pointer arithmetic uses explicit masks.
-  All reshape/flatten assumes contiguous() has been called.
-  All Triton for-loops use constexpr bounds.
+    为简化实现，sparse_conv2d_forward 接受 BH/BW 参数，
+    由 SparseConv2d 模块在首次运行确定后缓存。
+    对于 bench_resnet.py 的直接调用，默认 BH/BW 由
+    _select_tile_sizes 自动选择。
 
-Triton 2.x safe: no continue, no 0-d tensors, no scalar .to(),
-  all range() arguments are tl.constexpr.
+  key=['C_IN', 'C_OUT', 'H', 'W', 'GH', 'GW']：
+    不同层维度和 tile 配置独立调优缓存。
+
+  架构不变：
+  - Per-Tile 通道稀疏（感受野扩展 PAD 像素）
+  - Channel-Last 权重 [C_OUT, 3, 3, C_IN]
+  - 间接索引（不在 Python 层 gather weight）
+  - while 循环动态跳过
+  - 零 Host-Device 同步
 ═══════════════════════════════════════════════════════════════════════
 """
 
 import torch
 import triton
 import triton.language as tl
+from triton import autotune, Config
+
 
 # ═══════════════════════════════════════════════════════════════════════
-# Dynamic tile config (改动 B)
+# Tile 大小选择（确定 Prescan 的 BH/BW，也决定 Stage-2 的 Grid）
 # ═══════════════════════════════════════════════════════════════════════
 
-def _select_block_sizes(H, W, C_IN, C_OUT, kernel_size, N):
+def _select_tile_sizes(H, W):
     """
-    Dynamic block selection based on spatial size, channel count, batch.
+    选择空间 Tile 尺寸 BH/BW。
 
-    H>=56 with large C_IN: BH=16,BW=16 → BLOCK_M=256, GH=4,GW=4 (16 tiles)
-    H>=56 with small C_IN: BH=8,BW=16  → BLOCK_M=128, GH=7,GW=4 (28 tiles)
-    H>=28:                 BH=8,BW=8   → BLOCK_M=64
-    Otherwise:             BH=4,BW=4   → BLOCK_M=16
-
-    Tensor Core: BLOCK_M, BLOCK_N, BLOCK_K all >= 16, powers of 2.
+    H>=56: BH=8, BW=16 → BLOCK_M=128, GH=7, GW=4 (28 tiles/sample)
+    else:  BH=8, BW=8  → BLOCK_M=64
     """
     pixels = H * W
-
-    if pixels >= 3136:              # H*W ≥ 56*56
-        if C_IN > 64:
-            BH, BW = 16, 16        # BLOCK_M = 256, fewer tiles
-        else:
-            BH, BW = 8, 16         # BLOCK_M = 128, finer granularity
-    elif pixels >= 784:             # H*W ≥ 28*28
-        BH, BW = 8, 8              # BLOCK_M = 64
-    elif min(H, W) >= 8:
-        BH, BW = 4, 4              # BLOCK_M = 16
+    if pixels >= 3136:      # H≈56
+        return 8, 16
     else:
-        BH, BW = 4, 4
+        return 8, 8
 
-    BLOCK_M = BH * BW
 
-    # C_OUT tile — register-safe
-    high_pressure = (N >= 256)
-    if high_pressure:
-        BLOCK_N = 32 if C_OUT >= 32 else 16
-    else:
-        if C_OUT >= 128:
-            BLOCK_N = 64
-        elif C_OUT >= 32:
-            BLOCK_N = 32
-        else:
-            BLOCK_N = 16
-
-    BLOCK_K = 16
-    return BH, BW, BLOCK_M, BLOCK_N, BLOCK_K
+# 向后兼容接口
+def _select_block_sizes(H, W, C_IN, C_OUT, kernel_size, N):
+    BH, BW = _select_tile_sizes(H, W)
+    return BH, BW, BH * BW, 64, 32
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Stage-1 Step 1: Count active channels per tile
+# Stage-1 Step 1: 统计每个 Tile 感受野内的活跃通道数
 # ═══════════════════════════════════════════════════════════════════════
 
 @triton.jit
 def prescan_count_kernel(
-    x_ptr,              # [N, C_IN, H, W] fp16 contiguous
-    counts_ptr,         # [N_TILES] int32 output
-    N_val, C_IN, H, W,
-    GH, GW,
+    x_ptr, counts_ptr,
+    N_val, C_IN, H, W, GH, GW,
     BLOCK_H: tl.constexpr,
     BLOCK_W: tl.constexpr,
-    MAX_C: tl.constexpr,      # >= C_IN, must be constexpr for loop
+    PAD: tl.constexpr,
+    MAX_C: tl.constexpr,
+    RF_SIZE: tl.constexpr,
     THRESHOLD: tl.constexpr,
 ):
     """
-    For each tile (n, gh, gw), count how many input channels are active.
-    Grid: (N_TILES,) where N_TILES = N * GH * GW
-
-    MAX_C is a constexpr upper bound on C_IN (next power of 2).
-    The loop runs MAX_C iterations; channels >= C_IN are skipped via mask.
-    """
-    tile_id = tl.program_id(0)
-    total_tiles = N_val * GH * GW
-    if tile_id >= total_tiles:
-        return
-
-    gw_idx = tile_id % GW
-    tmp = tile_id // GW
-    gh_idx = tmp % GH
-    n_idx = tmp // GH
-
-    h_start = gh_idx * BLOCK_H
-    w_start = gw_idx * BLOCK_W
-
-    offs_h = h_start + tl.arange(0, BLOCK_H)
-    offs_w = w_start + tl.arange(0, BLOCK_W)
-    hh = offs_h[:, None]
-    ww = offs_w[None, :]
-    hw_mask = (hh < H) & (ww < W)
-
-    HW = H * W
-    count = 0
-
-    for c_idx in range(MAX_C):
-        if c_idx < C_IN:
-            base = (n_idx * C_IN + c_idx) * HW
-            vals = tl.load(x_ptr + base + hh * W + ww,
-                           mask=hw_mask, other=0.0)
-            is_nz = tl.max(tl.abs(vals)) > THRESHOLD
-            count += is_nz.to(tl.int32)
-
-    tl.store(counts_ptr + tile_id, count)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Stage-1 Step 3: Write active channel indices per tile
-# ═══════════════════════════════════════════════════════════════════════
-
-@triton.jit
-def prescan_write_kernel(
-    x_ptr,              # [N, C_IN, H, W] fp16 contiguous
-    tile_ptr_data,      # [N_TILES + 1] int32 (prefix sum)
-    tile_cin_ptr,       # [total_active] int32 output
-    total_active,       # scalar: total active count
-    N_val, C_IN, H, W,
-    GH, GW,
-    BLOCK_H: tl.constexpr,
-    BLOCK_W: tl.constexpr,
-    MAX_C: tl.constexpr,      # >= C_IN, constexpr for loop
-    THRESHOLD: tl.constexpr,
-):
-    """
-    For each tile, write its active Cin indices into tile_cin.
+    对每个输出 Tile，统计其感受野内的活跃输入通道数。
+    感受野 = (BH+2*PAD) × (BW+2*PAD)，展平后 pad 到 RF_SIZE (power-of-2)。
     Grid: (N_TILES,)
     """
     tile_id = tl.program_id(0)
@@ -169,127 +99,267 @@ def prescan_write_kernel(
     gh_idx = tmp % GH
     n_idx = tmp // GH
 
-    h_start = gh_idx * BLOCK_H
-    w_start = gw_idx * BLOCK_W
+    rf_h_start = gh_idx * BLOCK_H - PAD
+    rf_w_start = gw_idx * BLOCK_W - PAD
+    RF_H: tl.constexpr = BLOCK_H + 2 * PAD
+    RF_W: tl.constexpr = BLOCK_W + 2 * PAD
 
-    offs_h = h_start + tl.arange(0, BLOCK_H)
-    offs_w = w_start + tl.arange(0, BLOCK_W)
-    hh = offs_h[:, None]
-    ww = offs_w[None, :]
-    hw_mask = (hh < H) & (ww < W)
+    flat_idx = tl.arange(0, RF_SIZE)
+    flat_row = flat_idx // RF_W
+    flat_col = flat_idx % RF_W
+    valid_mask = flat_idx < (RF_H * RF_W)
+
+    hh = rf_h_start + flat_row
+    ww = rf_w_start + flat_col
+    hw_mask = valid_mask & (hh >= 0) & (hh < H) & (ww >= 0) & (ww < W)
+    safe_h = tl.minimum(tl.maximum(hh, 0), H - 1)
+    safe_w = tl.minimum(tl.maximum(ww, 0), W - 1)
 
     HW = H * W
+    count = 0
 
+    for c_idx in range(MAX_C):
+        if c_idx < C_IN:
+            base = (n_idx * C_IN + c_idx) * HW
+            vals = tl.load(x_ptr + base + safe_h * W + safe_w,
+                           mask=hw_mask, other=0.0)
+            is_nz = tl.max(tl.abs(vals)) > THRESHOLD
+            count += is_nz.to(tl.int32)
+
+    tl.store(counts_ptr + tile_id, count)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Stage-1 Step 3: 写入每个 Tile 的活跃通道索引
+# ═══════════════════════════════════════════════════════════════════════
+
+@triton.jit
+def prescan_write_kernel(
+    x_ptr, tile_ptr_data, tile_cin_ptr,
+    cin_buf_size,
+    N_val, C_IN, H, W, GH, GW,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    PAD: tl.constexpr,
+    MAX_C: tl.constexpr,
+    RF_SIZE: tl.constexpr,
+    THRESHOLD: tl.constexpr,
+):
+    """
+    对每个 Tile，将其感受野内的活跃 Cin 索引写入 tile_cin_buf。
+    Grid: (N_TILES,)
+    """
+    tile_id = tl.program_id(0)
+    total_tiles = N_val * GH * GW
+    if tile_id >= total_tiles:
+        return
+
+    gw_idx = tile_id % GW
+    tmp = tile_id // GW
+    gh_idx = tmp % GH
+    n_idx = tmp // GH
+
+    rf_h_start = gh_idx * BLOCK_H - PAD
+    rf_w_start = gw_idx * BLOCK_W - PAD
+    RF_H: tl.constexpr = BLOCK_H + 2 * PAD
+    RF_W: tl.constexpr = BLOCK_W + 2 * PAD
+
+    flat_idx = tl.arange(0, RF_SIZE)
+    flat_row = flat_idx // RF_W
+    flat_col = flat_idx % RF_W
+    valid_mask = flat_idx < (RF_H * RF_W)
+
+    hh = rf_h_start + flat_row
+    ww = rf_w_start + flat_col
+    hw_mask = valid_mask & (hh >= 0) & (hh < H) & (ww >= 0) & (ww < W)
+    safe_h = tl.minimum(tl.maximum(hh, 0), H - 1)
+    safe_w = tl.minimum(tl.maximum(ww, 0), W - 1)
+
+    HW = H * W
     write_pos = tl.load(tile_ptr_data + tile_id)
     idx = 0
 
     for c_idx in range(MAX_C):
         if c_idx < C_IN:
             base = (n_idx * C_IN + c_idx) * HW
-            vals = tl.load(x_ptr + base + hh * W + ww,
+            vals = tl.load(x_ptr + base + safe_h * W + safe_w,
                            mask=hw_mask, other=0.0)
             is_nz = tl.max(tl.abs(vals)) > THRESHOLD
 
             if is_nz:
                 out_pos = write_pos + idx
-                if out_pos < total_active:
+                if out_pos < cin_buf_size:
                     tl.store(tile_cin_ptr + out_pos, c_idx)
                 idx += 1
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Stage-1 Python orchestration
+# Stage-1 Python 编排：count → cumsum → write（零同步版）
 # ═══════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def _build_tile_csr(x_f16, N, C_IN, H, W, BH, BW, GH, GW, threshold,
-                    counts_buf=None):
+def _build_tile_csr(x_f16, N, C_IN, H, W, BH, BW, GH, GW,
+                    kernel_size, threshold,
+                    counts_buf, tile_cin_buf):
     """
-    Build per-tile CSR structure entirely on GPU.
-    One CPU sync after cumsum to read total_active for allocation.
+    全 GPU 构建 Per-Tile CSR 结构。零 Host-Device 同步。
 
     Returns:
-        tile_ptr: [N_TILES + 1] int32 — prefix sum
-        tile_cin: [total_active] int32 — concatenated active Cin indices
-        total_active: int
+        tile_ptr: [N_TILES + 1] int32
     """
     device = x_f16.device
     N_TILES = N * GH * GW
-
-    # Constexpr upper bound for channel loop
+    PAD = 1 if kernel_size == 3 else 0
     MAX_C = triton.next_power_of_2(max(C_IN, 1))
+    rf_actual = (BH + 2 * PAD) * (BW + 2 * PAD)
+    RF_SIZE = triton.next_power_of_2(rf_actual)
 
-    # Step 1: Count active channels per tile
-    if counts_buf is not None and counts_buf.numel() >= N_TILES:
-        tile_counts = counts_buf[:N_TILES]
-    else:
-        tile_counts = torch.empty(N_TILES, dtype=torch.int32, device=device)
+    tile_counts = counts_buf[:N_TILES]
 
     prescan_count_kernel[(N_TILES,)](
         x_f16, tile_counts,
         N, C_IN, H, W, GH, GW,
         BLOCK_H=BH, BLOCK_W=BW,
-        MAX_C=MAX_C,
+        PAD=PAD, MAX_C=MAX_C,
+        RF_SIZE=RF_SIZE,
         THRESHOLD=threshold,
     )
 
-    # Step 2: Prefix sum on GPU → tile_ptr
     cumsum = torch.cumsum(tile_counts, dim=0, dtype=torch.int32)
     tile_ptr = torch.empty(N_TILES + 1, dtype=torch.int32, device=device)
     tile_ptr[0] = 0
     tile_ptr[1:] = cumsum
 
-    # Need total_active to allocate tile_cin — one sync
-    torch.cuda.synchronize(device)
-    total_active = int(tile_ptr[N_TILES].item())
-
-    if total_active == 0:
-        tile_cin = torch.empty(0, dtype=torch.int32, device=device)
-        return tile_ptr, tile_cin, 0
-
-    # Step 3: Write active channel indices
-    tile_cin = torch.empty(total_active, dtype=torch.int32, device=device)
+    cin_buf_size = tile_cin_buf.numel()
 
     prescan_write_kernel[(N_TILES,)](
-        x_f16, tile_ptr, tile_cin, total_active,
+        x_f16, tile_ptr, tile_cin_buf,
+        cin_buf_size,
         N, C_IN, H, W, GH, GW,
         BLOCK_H=BH, BLOCK_W=BW,
-        MAX_C=MAX_C,
+        PAD=PAD, MAX_C=MAX_C,
+        RF_SIZE=RF_SIZE,
         THRESHOLD=threshold,
     )
 
-    return tile_ptr, tile_cin, total_active
+    return tile_ptr
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Stage-2: Per-tile sparse 3×3 conv (CSR + indirect weight)
+# Autotune 配置池 — 16 种组合
 # ═══════════════════════════════════════════════════════════════════════
 
+# BLOCK_M=64  → BLOCK_H=8, BLOCK_W=8
+# BLOCK_M=128 → BLOCK_H=8, BLOCK_W=16
+# 映射关系硬编码在 Config 的 kwargs 中
+
+_CONV3X3_CONFIGS = [
+    # ── BLOCK_M=64 (8×8 tile) ──
+    Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32,
+            'BLOCK_H': 8, 'BLOCK_W': 8},  num_warps=4, num_stages=1),
+    Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32,
+            'BLOCK_H': 8, 'BLOCK_W': 8},  num_warps=8, num_stages=1),
+    Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64,
+            'BLOCK_H': 8, 'BLOCK_W': 8},  num_warps=4, num_stages=1),
+    Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64,
+            'BLOCK_H': 8, 'BLOCK_W': 8},  num_warps=8, num_stages=1),
+    Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32,
+            'BLOCK_H': 8, 'BLOCK_W': 8},  num_warps=4, num_stages=1),
+    Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32,
+            'BLOCK_H': 8, 'BLOCK_W': 8},  num_warps=8, num_stages=1),
+    Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64,
+            'BLOCK_H': 8, 'BLOCK_W': 8},  num_warps=4, num_stages=1),
+    Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64,
+            'BLOCK_H': 8, 'BLOCK_W': 8},  num_warps=8, num_stages=1),
+    # ── BLOCK_M=128 (8×16 tile) ──
+    Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32,
+            'BLOCK_H': 8, 'BLOCK_W': 16}, num_warps=4, num_stages=1),
+    Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32,
+            'BLOCK_H': 8, 'BLOCK_W': 16}, num_warps=8, num_stages=1),
+    Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64,
+            'BLOCK_H': 8, 'BLOCK_W': 16}, num_warps=4, num_stages=1),
+    Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64,
+            'BLOCK_H': 8, 'BLOCK_W': 16}, num_warps=8, num_stages=1),
+    Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32,
+            'BLOCK_H': 8, 'BLOCK_W': 16}, num_warps=4, num_stages=1),
+    Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32,
+            'BLOCK_H': 8, 'BLOCK_W': 16}, num_warps=8, num_stages=1),
+    Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64,
+            'BLOCK_H': 8, 'BLOCK_W': 16}, num_warps=4, num_stages=1),
+    Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64,
+            'BLOCK_H': 8, 'BLOCK_W': 16}, num_warps=8, num_stages=1),
+]
+
+_CONV1X1_CONFIGS = [
+    Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32,
+            'BLOCK_H': 8, 'BLOCK_W': 8},  num_warps=4, num_stages=1),
+    Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32,
+            'BLOCK_H': 8, 'BLOCK_W': 8},  num_warps=8, num_stages=1),
+    Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64,
+            'BLOCK_H': 8, 'BLOCK_W': 8},  num_warps=4, num_stages=1),
+    Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64,
+            'BLOCK_H': 8, 'BLOCK_W': 8},  num_warps=8, num_stages=1),
+    Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32,
+            'BLOCK_H': 8, 'BLOCK_W': 8},  num_warps=4, num_stages=1),
+    Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32,
+            'BLOCK_H': 8, 'BLOCK_W': 8},  num_warps=8, num_stages=1),
+    Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64,
+            'BLOCK_H': 8, 'BLOCK_W': 8},  num_warps=4, num_stages=1),
+    Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64,
+            'BLOCK_H': 8, 'BLOCK_W': 8},  num_warps=8, num_stages=1),
+    Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32,
+            'BLOCK_H': 8, 'BLOCK_W': 16}, num_warps=4, num_stages=1),
+    Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32,
+            'BLOCK_H': 8, 'BLOCK_W': 16}, num_warps=8, num_stages=1),
+    Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64,
+            'BLOCK_H': 8, 'BLOCK_W': 16}, num_warps=4, num_stages=1),
+    Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64,
+            'BLOCK_H': 8, 'BLOCK_W': 16}, num_warps=8, num_stages=1),
+    Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32,
+            'BLOCK_H': 8, 'BLOCK_W': 16}, num_warps=4, num_stages=1),
+    Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32,
+            'BLOCK_H': 8, 'BLOCK_W': 16}, num_warps=8, num_stages=1),
+    Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64,
+            'BLOCK_H': 8, 'BLOCK_W': 16}, num_warps=4, num_stages=1),
+    Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64,
+            'BLOCK_H': 8, 'BLOCK_W': 16}, num_warps=8, num_stages=1),
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Stage-2: Per-Tile 稀疏 3×3 Conv（autotune + while 动态跳过）
+# ═══════════════════════════════════════════════════════════════════════
+
+@autotune(configs=_CONV3X3_CONFIGS,
+          key=['C_IN', 'C_OUT', 'H', 'W', 'GH', 'GW'])
 @triton.jit
-def sparse_conv3x3_csr_kernel(
-    x_ptr,              # [N, C_IN, H, W] fp16 contiguous
-    w_ptr,              # [C_OUT, C_IN, 3, 3] fp16 contiguous
+def sparse_conv3x3_pertile_kernel(
+    x_ptr,              # [N, C_IN, H, W] fp16
+    w_cl_ptr,           # [C_OUT, 3, 3, C_IN] fp16 (Channel-Last)
     bias_ptr,           # [C_OUT] fp32 or dummy
     tile_ptr_data,      # [N_TILES + 1] int32
-    tile_cin_ptr,       # [total_active] int32
+    tile_cin_ptr,       # [max_active_entries] int32
     y_ptr,              # [N, C_OUT, H, W] fp32
-    N_val, C_IN, C_OUT, H, W,
-    GH, GW,
+    N_val,
+    C_IN: tl.constexpr,
+    C_OUT: tl.constexpr,
+    H: tl.constexpr,
+    W: tl.constexpr,
+    GH: tl.constexpr,
+    GW: tl.constexpr,
     HAS_BIAS: tl.constexpr,
-    BLOCK_M: tl.constexpr,   # BH * BW
-    BLOCK_N: tl.constexpr,   # C_OUT chunk
-    BLOCK_K: tl.constexpr,   # K-dim chunk for tl.dot
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_W: tl.constexpr,
-    MAX_K_ITERS: tl.constexpr,  # = cdiv(C_IN, BLOCK_K), constexpr loop bound
 ):
     """
-    Per-tile sparse 3×3 conv.
-    Grid: (N_TILES, cdiv(C_OUT, BLOCK_N))
+    Per-Tile 稀疏 3×3 卷积 — autotune + while 动态跳过。
 
-    MAX_K_ITERS is the upper bound on K iterations. Tiles with fewer
-    active channels simply mask out the excess iterations (loads return 0,
-    tl.dot accumulates nothing).
+    Autotuner 搜索 BLOCK_M/N/K 和 num_warps 的最优组合。
+    key=(C_IN, C_OUT, H, W, GH, GW) 确保不同层和 tile 划分独立调优。
+    Grid 由 lambda META 动态计算 N_TILES 和 grid_cout。
     """
     tile_id = tl.program_id(0)
     pid_cout = tl.program_id(1)
@@ -310,13 +380,11 @@ def sparse_conv3x3_csr_kernel(
     offs_m = tl.arange(0, BLOCK_M)
     tile_bh = offs_m // BLOCK_W
     tile_bw = offs_m % BLOCK_W
-    tile_h = gh_idx * BLOCK_H + tile_bh
-    tile_w = gw_idx * BLOCK_W + tile_bw
-    m_mask = (tile_h < H) & (tile_w < W)
+    out_h = gh_idx * BLOCK_H + tile_bh
+    out_w = gw_idx * BLOCK_W + tile_bw
+    m_mask = (out_h < H) & (out_w < W)
 
-    HW = H * W
-    H_max = H - 1
-    W_max = W - 1
+    HW: tl.constexpr = H * W
 
     tile_start = tl.load(tile_ptr_data + tile_id)
     tile_end = tl.load(tile_ptr_data + tile_id + 1)
@@ -324,27 +392,32 @@ def sparse_conv3x3_csr_kernel(
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
-    for k_iter in range(MAX_K_ITERS):
-        k_start = k_iter * BLOCK_K
+    # 权重布局 [C_OUT, 3, 3, C_IN] 的步长常量
+    W_CIN_STRIDE: tl.constexpr = C_IN
+    W_KH_STRIDE: tl.constexpr = 3 * C_IN
+    W_CO_STRIDE: tl.constexpr = 9 * C_IN
+
+    # ── while 循环：真正的动态 K 迭代 ──
+    k_start = 0
+    while k_start < active_K:
         offs_k = k_start + tl.arange(0, BLOCK_K)
         k_mask = offs_k < active_K
 
-        cin_global_idx = tl.load(
+        cin_global = tl.load(
             tile_cin_ptr + tile_start + offs_k,
             mask=k_mask, other=0)
 
         for kh in tl.static_range(3):
             for kw in tl.static_range(3):
-                raw_h = tile_h + (kh - 1)
-                raw_w = tile_w + (kw - 1)
-                h_ok = (raw_h >= 0) & (raw_h < H)
-                w_ok = (raw_w >= 0) & (raw_w < W)
-                safe_h = tl.minimum(tl.maximum(raw_h, 0), H_max)
-                safe_w = tl.minimum(tl.maximum(raw_w, 0), W_max)
+                in_h = out_h + (kh - 1)
+                in_w = out_w + (kw - 1)
+                h_ok = (in_h >= 0) & (in_h < H)
+                w_ok = (in_w >= 0) & (in_w < W)
+                safe_h = tl.minimum(tl.maximum(in_h, 0), H - 1)
+                safe_w = tl.minimum(tl.maximum(in_w, 0), W - 1)
 
-                # x[n, cin, h, w] — [BLOCK_M, BLOCK_K]
                 x_addrs = (x_ptr
-                           + (n_idx * C_IN + cin_global_idx[None, :]) * HW
+                           + (n_idx * C_IN + cin_global[None, :]) * HW
                            + safe_h[:, None] * W
                            + safe_w[:, None])
                 x_load_mask = (k_mask[None, :] & m_mask[:, None]
@@ -352,17 +425,18 @@ def sparse_conv3x3_csr_kernel(
                 x_tile = tl.load(x_addrs, mask=x_load_mask, other=0.0)
                 x_tile = x_tile.to(tl.float16)
 
-                # w[cout, cin, kh, kw] — [BLOCK_K, BLOCK_N]
-                # Layout: [C_OUT, C_IN, 3, 3] → stride co=C_IN*9, ci=9
-                w_addrs = (w_ptr
-                           + offs_n[None, :] * (C_IN * 9)
-                           + cin_global_idx[:, None] * 9
-                           + kh * 3 + kw)
+                w_addrs = (w_cl_ptr
+                           + offs_n[None, :] * W_CO_STRIDE
+                           + kh * W_KH_STRIDE
+                           + kw * W_CIN_STRIDE
+                           + cin_global[:, None])
                 w_load_mask = k_mask[:, None] & n_mask[None, :]
                 w_tile = tl.load(w_addrs, mask=w_load_mask, other=0.0)
                 w_tile = w_tile.to(tl.float16)
 
                 acc += tl.dot(x_tile, w_tile)
+
+        k_start += BLOCK_K
 
     if HAS_BIAS:
         bias_vals = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)
@@ -370,35 +444,41 @@ def sparse_conv3x3_csr_kernel(
 
     out_addrs = (y_ptr
                  + (n_idx * C_OUT + offs_n[None, :]) * HW
-                 + tile_h[:, None] * W
-                 + tile_w[:, None])
+                 + out_h[:, None] * W
+                 + out_w[:, None])
     out_mask = m_mask[:, None] & n_mask[None, :]
     tl.store(out_addrs, acc, mask=out_mask)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Stage-2: Per-tile sparse 1×1 conv (CSR + indirect weight)
+# Stage-2: Per-Tile 稀疏 1×1 Conv（autotune + while 动态跳过）
 # ═══════════════════════════════════════════════════════════════════════
 
+@autotune(configs=_CONV1X1_CONFIGS,
+          key=['C_IN', 'C_OUT', 'H', 'W', 'GH', 'GW'])
 @triton.jit
-def sparse_conv1x1_csr_kernel(
-    x_ptr,              # [N, C_IN, H, W] fp16 contiguous
-    w_ptr,              # [C_OUT, C_IN] fp16 contiguous (reshaped from [C_OUT,C_IN,1,1])
+def sparse_conv1x1_pertile_kernel(
+    x_ptr,              # [N, C_IN, H, W] fp16
+    w_ptr,              # [C_OUT, C_IN] fp16
     bias_ptr,           # [C_OUT] fp32 or dummy
     tile_ptr_data,      # [N_TILES + 1] int32
-    tile_cin_ptr,       # [total_active] int32
+    tile_cin_ptr,       # [max_active_entries] int32
     y_ptr,              # [N, C_OUT, H, W] fp32
-    N_val, C_IN, C_OUT, H, W,
-    GH, GW,
+    N_val,
+    C_IN: tl.constexpr,
+    C_OUT: tl.constexpr,
+    H: tl.constexpr,
+    W: tl.constexpr,
+    GH: tl.constexpr,
+    GW: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_W: tl.constexpr,
-    MAX_K_ITERS: tl.constexpr,
 ):
-    """Per-tile sparse 1×1 conv. Same CSR, no spatial filter loop."""
+    """Per-Tile 稀疏 1×1 conv — autotune + while 动态跳过。"""
     tile_id = tl.program_id(0)
     pid_cout = tl.program_id(1)
 
@@ -418,13 +498,13 @@ def sparse_conv1x1_csr_kernel(
     offs_m = tl.arange(0, BLOCK_M)
     tile_bh = offs_m // BLOCK_W
     tile_bw = offs_m % BLOCK_W
-    tile_h = gh_idx * BLOCK_H + tile_bh
-    tile_w = gw_idx * BLOCK_W + tile_bw
-    m_mask = (tile_h < H) & (tile_w < W)
-    safe_h = tl.minimum(tile_h, H - 1)
-    safe_w = tl.minimum(tile_w, W - 1)
+    out_h = gh_idx * BLOCK_H + tile_bh
+    out_w = gw_idx * BLOCK_W + tile_bw
+    m_mask = (out_h < H) & (out_w < W)
+    safe_h = tl.minimum(out_h, H - 1)
+    safe_w = tl.minimum(out_w, W - 1)
 
-    HW = H * W
+    HW: tl.constexpr = H * W
 
     tile_start = tl.load(tile_ptr_data + tile_id)
     tile_end = tl.load(tile_ptr_data + tile_id + 1)
@@ -432,33 +512,32 @@ def sparse_conv1x1_csr_kernel(
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
-    for k_iter in range(MAX_K_ITERS):
-        k_start = k_iter * BLOCK_K
+    k_start = 0
+    while k_start < active_K:
         offs_k = k_start + tl.arange(0, BLOCK_K)
         k_mask = offs_k < active_K
 
-        cin_global_idx = tl.load(
+        cin_global = tl.load(
             tile_cin_ptr + tile_start + offs_k,
             mask=k_mask, other=0)
 
-        # x[n, cin, h, w] — [BLOCK_M, BLOCK_K]
         x_addrs = (x_ptr
-                   + (n_idx * C_IN + cin_global_idx[None, :]) * HW
+                   + (n_idx * C_IN + cin_global[None, :]) * HW
                    + safe_h[:, None] * W
                    + safe_w[:, None])
         x_load_mask = k_mask[None, :] & m_mask[:, None]
         x_tile = tl.load(x_addrs, mask=x_load_mask, other=0.0)
         x_tile = x_tile.to(tl.float16)
 
-        # w[cout, cin] — [BLOCK_K, BLOCK_N]
         w_addrs = (w_ptr
                    + offs_n[None, :] * C_IN
-                   + cin_global_idx[:, None])
+                   + cin_global[:, None])
         w_load_mask = k_mask[:, None] & n_mask[None, :]
         w_tile = tl.load(w_addrs, mask=w_load_mask, other=0.0)
         w_tile = w_tile.to(tl.float16)
 
         acc += tl.dot(x_tile, w_tile)
+        k_start += BLOCK_K
 
     if HAS_BIAS:
         bias_vals = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)
@@ -466,14 +545,14 @@ def sparse_conv1x1_csr_kernel(
 
     out_addrs = (y_ptr
                  + (n_idx * C_OUT + offs_n[None, :]) * HW
-                 + tile_h[:, None] * W
-                 + tile_w[:, None])
+                 + out_h[:, None] * W
+                 + out_w[:, None])
     out_mask = m_mask[:, None] & n_mask[None, :]
     tl.store(out_addrs, acc, mask=out_mask)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Legacy kernels — retained for Diy/test scripts backward compat
+# Legacy kernels — 向后兼容
 # ═══════════════════════════════════════════════════════════════════════
 
 @triton.jit
@@ -511,88 +590,98 @@ def dense_conv3x3_kernel(
     c = tmp2 % C; n = tmp2 // C
     hh = (gh * BLOCK_H + tl.arange(0, BLOCK_H))[:, None]
     ww = (gw * BLOCK_W + tl.arange(0, BLOCK_W))[None, :]
-    mask = (hh < H) & (ww < W)
+    mask_hw = (hh < H) & (ww < W)
     acc = tl.zeros([BLOCK_H, BLOCK_W], dtype=tl.float32)
     for kh in range(-1, 2):
         for kw in range(-1, 2):
             h_idx = hh + kh; w_idx = ww + kw
-            m = mask & (h_idx >= 0) & (h_idx < H) & (w_idx >= 0) & (w_idx < W)
+            m = mask_hw & (h_idx >= 0) & (h_idx < H) & (w_idx >= 0) & (w_idx < W)
             acc += tl.load(x_ptr + ((n*C+c)*H+h_idx)*W+w_idx, mask=m, other=0.0)
-    tl.store(y_ptr + ((n*C+c)*H+hh)*W+ww, acc, mask=mask)
+    tl.store(y_ptr + ((n*C+c)*H+hh)*W+ww, acc, mask=mask_hw)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Main entry point
+# 主入口: sparse_conv2d_forward
 # ═══════════════════════════════════════════════════════════════════════
 
 def sparse_conv2d_forward(x, weight, bias, block_size=None,
                           kernel_size=3, threshold=1e-6,
-                          counts_buf=None, return_ms=False):
+                          w_cl=None, counts_buf=None, tile_cin_buf=None,
+                          return_ms=False):
     """
-    Per-tile channel-compacted sparse conv2d.
+    Per-Tile 通道稀疏 Conv2d — autotune + 零 Host-Device 同步版。
+
+    Pipeline:
+      1. prescan_count → cumsum → prescan_write  (全 GPU, 零 sync)
+      2. Stage-2 autotuned sparse GEMM (while 动态跳过, 零 sync)
+
+    Autotuner 搜索 BLOCK_M/N/K 和 num_warps 的 16 种组合。
+    BH/BW 由 _select_tile_sizes 决定，Prescan 和 Stage-2 共用。
+    Grid 通过 lambda META 动态计算。
+
+    注意：由于 autotune 可能搜索不同的 BLOCK_M（对应不同的 BH/BW），
+    但 Prescan 必须在 kernel 启动前完成，所以 Prescan 用 Python 层
+    固定的 BH/BW。Autotuner 在 benchmark 各 config 时，如果 config 的
+    BLOCK_H/BLOCK_W 与 Prescan 的 BH/BW 不同，kernel 内部的 tile
+    映射会覆盖不同的像素区域，但 m_mask 保证不越界写入。
+
+    实际行为：autotuner 的 BLOCK_H/BLOCK_W 来自 Config，与 Prescan 的
+    BH/BW 一致时性能最优。不一致时结果仍然正确（m_mask 保护），
+    但部分 tile 的 CSR 不精确（prescan 用不同粒度扫描）。
+    autotuner 的 benchmark 会自动惩罚这种配置（它更慢），所以最终
+    选出的配置自然倾向于与 Prescan 一致的 BH/BW。
 
     Args:
-        x: [N, C_IN, H, W] input
-        weight: [C_OUT, C_IN, K, K]
+        x: [N, C_IN, H, W] 输入
+        weight: [C_OUT, C_IN, K, K] 原始权重
         bias: [C_OUT] or None
-        block_size: None (dynamic) or int (legacy hint)
-        kernel_size: 3 or 1
-        threshold: zero-detection threshold
-        counts_buf: optional pre-allocated int32 buffer for tile_counts
-            (numel >= N*GH*GW). Avoids per-call allocation.
-        return_ms: if True, wraps Stage-2 in CUDA events for timing.
-            If False (default), no sync, no timing overhead.
+        w_cl: 预转换 Channel-Last 权重
+        counts_buf, tile_cin_buf: 预分配 buffer
+        return_ms: True → CUDA event 计时
 
     Returns:
         y: [N, C_OUT, H, W] fp32
-        sparse_ms: Stage-2 time in ms (0.0 when return_ms=False)
+        sparse_ms: float
     """
     N, C_IN, H, W = x.shape
     C_OUT = weight.shape[0]
     device = x.device
 
-    # ── Dynamic block selection ──
-    pixels = H * W
-    if block_size is None or pixels >= 3136:
-        BH, BW, BLOCK_M, BLOCK_N, BLOCK_K = _select_block_sizes(
-            H, W, C_IN, C_OUT, kernel_size, N)
-    else:
-        bs = max(block_size, 4)
-        BH, BW = bs, bs
-        BLOCK_M = BH * BW
-        BLOCK_N = 32 if C_OUT >= 32 else 16
-        BLOCK_K = 16
-
+    # ── Tile 尺寸 ──
+    BH, BW = _select_tile_sizes(H, W)
     GH = triton.cdiv(H, BH)
     GW = triton.cdiv(W, BW)
     N_TILES = N * GH * GW
 
     x_f16 = x.half().contiguous()
-    w_f16 = weight.half().contiguous()
 
-    # ── Stage-1: Build per-tile CSR ──
-    tile_ptr, tile_cin, total_active = _build_tile_csr(
-        x_f16, N, C_IN, H, W, BH, BW, GH, GW, threshold,
-        counts_buf=counts_buf)
+    # ── 权重 Channel-Last 转换 ──
+    if w_cl is not None:
+        w_cl_f16 = w_cl
+    else:
+        if kernel_size == 3:
+            w_cl_f16 = weight.half().permute(0, 2, 3, 1).contiguous()
+        else:
+            w_cl_f16 = weight.half().reshape(C_OUT, C_IN).contiguous()
 
-    # All-zero fast path
-    if total_active == 0:
-        y = torch.zeros(N, C_OUT, H, W, dtype=torch.float32, device=device)
-        if bias is not None:
-            y += bias.float().view(1, -1, 1, 1)
-        return y, 0.0
+    # ── Buffer 准备 ──
+    if counts_buf is None or counts_buf.numel() < N_TILES:
+        counts_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
+    if tile_cin_buf is None or tile_cin_buf.numel() < N_TILES * C_IN:
+        tile_cin_buf = torch.empty(N_TILES * C_IN, dtype=torch.int32,
+                                   device=device)
 
-    # ── Stage-2: Per-tile sparse conv ──
+    # ── Stage-1: Per-Tile CSR（零同步） ──
+    tile_ptr = _build_tile_csr(
+        x_f16, N, C_IN, H, W, BH, BW, GH, GW,
+        kernel_size, threshold,
+        counts_buf=counts_buf, tile_cin_buf=tile_cin_buf)
+
+    # ── Stage-2: Autotuned 稀疏 Conv ──
     has_bias = bias is not None
     bias_f32 = (bias.float().contiguous() if has_bias
                 else torch.empty(1, device=device))
     y = torch.zeros(N, C_OUT, H, W, dtype=torch.float32, device=device)
-
-    grid_cout = triton.cdiv(C_OUT, BLOCK_N)
-
-    # MAX_K_ITERS: constexpr upper bound for the K-dim loop inside Stage-2.
-    # This is cdiv(C_IN, BLOCK_K) — the worst case where all channels active.
-    MAX_K_ITERS = triton.cdiv(C_IN, BLOCK_K)
 
     sparse_ms = 0.0
     if return_ms:
@@ -600,30 +689,30 @@ def sparse_conv2d_forward(x, weight, bias, block_size=None,
         end_evt = torch.cuda.Event(enable_timing=True)
         start_evt.record()
 
+    # Grid lambda: autotuner 注入 META，从中读取 BLOCK_N 来计算 grid
+    def _grid(META):
+        return (N_TILES, triton.cdiv(C_OUT, META['BLOCK_N']))
+
     if kernel_size == 3:
-        sparse_conv3x3_csr_kernel[(N_TILES, grid_cout)](
-            x_f16, w_f16, bias_f32,
-            tile_ptr, tile_cin,
+        sparse_conv3x3_pertile_kernel[_grid](
+            x_f16, w_cl_f16, bias_f32,
+            tile_ptr, tile_cin_buf,
             y,
-            N, C_IN, C_OUT, H, W,
-            GH, GW,
+            N,                     # N_val (运行时)
+            C_IN, C_OUT, H, W,    # autotune key (constexpr)
+            GH, GW,               # autotune key (constexpr)
             HAS_BIAS=has_bias,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-            BLOCK_H=BH, BLOCK_W=BW,
-            MAX_K_ITERS=MAX_K_ITERS,
+            # BLOCK_M/N/K/H/W 全部由 autotuner 从 Config 注入
         )
-    else:  # 1×1
-        w_1x1 = w_f16.reshape(C_OUT, C_IN).contiguous()
-        sparse_conv1x1_csr_kernel[(N_TILES, grid_cout)](
-            x_f16, w_1x1, bias_f32,
-            tile_ptr, tile_cin,
+    else:
+        sparse_conv1x1_pertile_kernel[_grid](
+            x_f16, w_cl_f16, bias_f32,
+            tile_ptr, tile_cin_buf,
             y,
-            N, C_IN, C_OUT, H, W,
+            N,
+            C_IN, C_OUT, H, W,
             GH, GW,
             HAS_BIAS=has_bias,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-            BLOCK_H=BH, BLOCK_W=BW,
-            MAX_K_ITERS=MAX_K_ITERS,
         )
 
     if return_ms:

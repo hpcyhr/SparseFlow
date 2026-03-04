@@ -1,16 +1,11 @@
 """
-SparseConv2d — v12.1 Per-Tile CSR Compaction + Buffer Caching
+SparseConv2d — v14.1 Per-Tile + 零同步 + 预分配 Buffer
 
-Changes from v10.4:
-  1. Stage-1 now builds a per-tile CSR structure (tile_ptr + tile_cin)
-     instead of a global flags array + global active channel set.
-  2. self._counts_buf: cached int32 buffer for prescan tile_counts.
-     Allocated once, reused across forward calls. Grows if input
-     produces more tiles, never shrinks.
-  3. return_ms (default False): only creates CUDA events and
-     synchronizes when True.
-  4. _ensure_counts_buf(x): computes tile config and returns a
-     reusable counts buffer + tile parameters.
+改动：
+  1. _ensure_buffers() 同时预分配 counts_buf 和 tile_cin_buf
+     tile_cin_buf 容量 = N_TILES * C_IN（最坏情况上界）
+  2. 缓存 Channel-Last 权重 (self._w_cl)
+  3. 全部 buffer 传递给 sparse_conv2d_forward，零 Host-Device 同步
 """
 
 import sys
@@ -27,15 +22,10 @@ import torch.nn.functional as F
 
 class SparseConv2d(nn.Module):
     """
-    稀疏加速版 Conv2d with per-tile channel compaction.
+    Per-Tile 稀疏加速版 Conv2d。
 
-    block_size 语义：
-      None  → kernel 根据 (H, W, C_IN, N) 完全动态决策 BH/BW/BLOCK_M
-      int   → 传递给 kernel，但大图 (H*W >= 3136) 会被覆盖
-
-    return_ms: bool, default False.
-      True → Stage-2 kernel timing via CUDA events.
-      False → no sync, no timing overhead.
+    block_size: None → kernel 动态决策
+    return_ms: True → Stage-2 CUDA event 计时
     """
 
     def __init__(self, in_channels, out_channels, kernel_size,
@@ -61,8 +51,7 @@ class SparseConv2d(nn.Module):
 
         self.weight = nn.Parameter(
             torch.empty(out_channels, in_channels // groups,
-                        *self.kernel_size)
-        )
+                        *self.kernel_size))
         if bias:
             self.bias = nn.Parameter(torch.empty(out_channels))
         else:
@@ -70,8 +59,10 @@ class SparseConv2d(nn.Module):
 
         self._last_sparse_ms = 0.0
 
-        # Cached buffer for prescan tile_counts (改动 4)
-        self._counts_buf = None
+        # 缓存
+        self._w_cl = None           # Channel-Last 权重 fp16
+        self._counts_buf = None     # prescan count 缓冲区
+        self._tile_cin_buf = None   # prescan write 缓冲区（最大容量）
 
         self._triton_available = False
         try:
@@ -80,16 +71,34 @@ class SparseConv2d(nn.Module):
         except ImportError:
             pass
 
-    def _ensure_counts_buf(self, x):
+    def _get_w_cl(self):
+        """获取 Channel-Last 格式权重，首次转换并缓存。"""
+        if self._w_cl is not None:
+            return self._w_cl
+
+        k = self.kernel_size[0]
+        w = self.weight.data
+        if k == 3:
+            # [C_OUT, C_IN, 3, 3] → [C_OUT, 3, 3, C_IN]
+            self._w_cl = w.half().permute(0, 2, 3, 1).contiguous()
+        else:
+            # [C_OUT, C_IN, 1, 1] → [C_OUT, C_IN]
+            self._w_cl = w.half().reshape(
+                self.out_channels, self.in_channels).contiguous()
+        return self._w_cl
+
+    def _invalidate_w_cl(self):
+        """权重更新后清除缓存。"""
+        self._w_cl = None
+
+    def _ensure_buffers(self, x):
         """
-        Compute tile config from input shape. Return a reusable counts
-        buffer sized for prescan_count_kernel output.
+        确保 counts_buf 和 tile_cin_buf 已分配且足够大。
 
-        The buffer grows if needed, never shrinks. Device-aware.
+        counts_buf:   [N_TILES] int32
+        tile_cin_buf: [N_TILES * C_IN] int32  (最坏情况上界)
 
-        Returns:
-            counts_buf: torch.Tensor [>= N_TILES], dtype=int32
-            BH, BW, GH, GW: tile config (for info / debugging)
+        这两个 buffer 只分配一次，后续复用（自动增长，不收缩）。
         """
         import triton
         from Kernels.conv2d import _select_block_sizes
@@ -98,25 +107,27 @@ class SparseConv2d(nn.Module):
         C_OUT = self.out_channels
         k = self.kernel_size[0]
 
-        pixels = H * W
-        if self.block_size is None or pixels >= 3136:
-            BH, BW, _, _, _ = _select_block_sizes(
-                H, W, C_IN, C_OUT, k, N)
-        else:
-            bs = max(self.block_size, 4)
-            BH, BW = bs, bs
-
+        BH, BW, _, _, _ = _select_block_sizes(H, W, C_IN, C_OUT, k, N)
         GH = triton.cdiv(H, BH)
         GW = triton.cdiv(W, BW)
         N_TILES = N * GH * GW
 
+        # counts_buf: [N_TILES]
         if (self._counts_buf is None
                 or self._counts_buf.numel() < N_TILES
                 or self._counts_buf.device != x.device):
             self._counts_buf = torch.empty(
                 N_TILES, dtype=torch.int32, device=x.device)
 
-        return self._counts_buf, BH, BW, GH, GW
+        # tile_cin_buf: [N_TILES * C_IN] — 最坏情况每个 tile 所有通道都活跃
+        max_cin_entries = N_TILES * C_IN
+        if (self._tile_cin_buf is None
+                or self._tile_cin_buf.numel() < max_cin_entries
+                or self._tile_cin_buf.device != x.device):
+            self._tile_cin_buf = torch.empty(
+                max_cin_entries, dtype=torch.int32, device=x.device)
+
+        return self._counts_buf, self._tile_cin_buf
 
     @classmethod
     def from_dense(cls, conv: nn.Conv2d, block_size=None,
@@ -172,18 +183,20 @@ class SparseConv2d(nn.Module):
     def _triton_forward(self, x: torch.Tensor) -> torch.Tensor:
         from Kernels.conv2d import sparse_conv2d_forward
 
-        # Get cached counts buffer
-        counts_buf, _, _, _, _ = self._ensure_counts_buf(x)
-
+        w_cl = self._get_w_cl()
+        counts_buf, tile_cin_buf = self._ensure_buffers(x)
         k = self.kernel_size[0]
+
         y, sparse_ms = sparse_conv2d_forward(
             x=x.contiguous(),
-            weight=self.weight.contiguous(),
+            weight=self.weight,
             bias=self.bias,
             block_size=self.block_size,
             kernel_size=k,
             threshold=self.threshold,
+            w_cl=w_cl,
             counts_buf=counts_buf,
+            tile_cin_buf=tile_cin_buf,
             return_ms=self.return_ms,
         )
         self._last_sparse_ms = sparse_ms
@@ -193,8 +206,7 @@ class SparseConv2d(nn.Module):
         self._last_sparse_ms = 0.0
         return F.conv2d(
             x, self.weight, self.bias,
-            self.stride, self.padding, self.dilation, self.groups
-        )
+            self.stride, self.padding, self.dilation, self.groups)
 
     def extra_repr(self) -> str:
         bs = self.block_size if self.block_size is not None else "auto"
@@ -202,5 +214,4 @@ class SparseConv2d(nn.Module):
             f"{self.in_channels}, {self.out_channels}, "
             f"kernel_size={self.kernel_size}, stride={self.stride}, "
             f"padding={self.padding}, block_size={bs}, "
-            f"return_ms={self.return_ms}, sparse=True"
-        )
+            f"return_ms={self.return_ms}, sparse=True")
