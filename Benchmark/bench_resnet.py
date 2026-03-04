@@ -93,6 +93,7 @@ def run_sparse_conv_weighted(feat, conv_module, block):
         block_size=block,
         kernel_size=k,
         threshold=1e-6,
+        return_ms=True
     )
     return y, sparse_ms
 
