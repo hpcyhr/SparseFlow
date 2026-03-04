@@ -1,19 +1,16 @@
 """
-SparseConv2d — v11.0 Channel-First Prescan + Flags Caching
+SparseConv2d — v12.1 Per-Tile CSR Compaction + Buffer Caching
 
 Changes from v10.4:
-  1. self._flags: cached prescan flags buffer, allocated once, reused across
-     forward calls. Grows if input produces more blocks, never shrinks.
-  2. _ensure_flags(x): computes tile config from input shape and returns
-     (flags, BH, BW, BLOCK_M, BLOCK_K, GH, GW). Reuses / expands the
-     cached self._flags tensor as needed. When merge_time_steps > 0 and
-     5D input is detected, sizes the buffer for the compressed B (not T*B).
-  3. _triton_forward passes flags + return_ms + merge_time_steps to
-     sparse_conv2d_forward.
-  4. return_ms attribute (default False) controls whether Stage-2 timing
-     is performed. Set to True for benchmarking.
-  5. merge_time_steps attribute (default 0) controls time-union prescan.
-     Set to T (number of time steps) to enable OR-compression.
+  1. Stage-1 now builds a per-tile CSR structure (tile_ptr + tile_cin)
+     instead of a global flags array + global active channel set.
+  2. self._counts_buf: cached int32 buffer for prescan tile_counts.
+     Allocated once, reused across forward calls. Grows if input
+     produces more tiles, never shrinks.
+  3. return_ms (default False): only creates CUDA events and
+     synchronizes when True.
+  4. _ensure_counts_buf(x): computes tile config and returns a
+     reusable counts buffer + tile parameters.
 """
 
 import sys
@@ -30,41 +27,41 @@ import torch.nn.functional as F
 
 class SparseConv2d(nn.Module):
     """
-    稀疏加速版 Conv2d。
+    稀疏加速版 Conv2d with per-tile channel compaction.
 
     block_size 语义：
-      None  → kernel 根据 (H, W, N) 完全动态决策 BH/BW/BLOCK_M
-      int   → 传递给 kernel，但 kernel 可能覆盖（大图自动升级）
+      None  → kernel 根据 (H, W, C_IN, N) 完全动态决策 BH/BW/BLOCK_M
+      int   → 传递给 kernel，但大图 (H*W >= 3136) 会被覆盖
 
     return_ms: bool, default False.
-      If True, Stage-2 kernel timing is measured via CUDA events.
-      If False, no sync, no timing overhead.
-
-    merge_time_steps: int, default 0.
-      If > 0, prescan runs on OR-compressed time dimension.
-      Set to T when input is shaped as [T*B, C, H, W] from SNN.
+      True → Stage-2 kernel timing via CUDA events.
+      False → no sync, no timing overhead.
     """
 
     def __init__(self, in_channels, out_channels, kernel_size,
                  stride=1, padding=0, dilation=1, groups=1, bias=True,
                  block_size=None, threshold=1e-6,
-                 return_ms=False, merge_time_steps=0):
+                 return_ms=False):
         super().__init__()
 
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size)
-        self.stride = stride if isinstance(stride, tuple) else (stride, stride)
-        self.padding = padding if isinstance(padding, tuple) else (padding, padding)
-        self.dilation = dilation if isinstance(dilation, tuple) else (dilation, dilation)
+        self.kernel_size = (kernel_size if isinstance(kernel_size, tuple)
+                            else (kernel_size, kernel_size))
+        self.stride = (stride if isinstance(stride, tuple)
+                       else (stride, stride))
+        self.padding = (padding if isinstance(padding, tuple)
+                        else (padding, padding))
+        self.dilation = (dilation if isinstance(dilation, tuple)
+                         else (dilation, dilation))
         self.groups = groups
-        self.block_size = block_size    # None = 延迟决策
+        self.block_size = block_size
         self.threshold = threshold
         self.return_ms = return_ms
-        self.merge_time_steps = merge_time_steps
 
         self.weight = nn.Parameter(
-            torch.empty(out_channels, in_channels // groups, *self.kernel_size)
+            torch.empty(out_channels, in_channels // groups,
+                        *self.kernel_size)
         )
         if bias:
             self.bias = nn.Parameter(torch.empty(out_channels))
@@ -73,8 +70,8 @@ class SparseConv2d(nn.Module):
 
         self._last_sparse_ms = 0.0
 
-        # ── Cached flags buffer (改动 4) ──
-        self._flags = None
+        # Cached buffer for prescan tile_counts (改动 4)
+        self._counts_buf = None
 
         self._triton_available = False
         try:
@@ -83,20 +80,16 @@ class SparseConv2d(nn.Module):
         except ImportError:
             pass
 
-    def _ensure_flags(self, x):
+    def _ensure_counts_buf(self, x):
         """
-        Compute tile config from input shape and return a reusable flags buffer.
+        Compute tile config from input shape. Return a reusable counts
+        buffer sized for prescan_count_kernel output.
 
-        The flags tensor is allocated once and reused across forward calls.
-        If the current buffer is too small, it is re-allocated. Never shrinks.
-
-        When merge_time_steps > 0, the prescan runs on B samples (not T*B),
-        so flags are sized accordingly.
+        The buffer grows if needed, never shrinks. Device-aware.
 
         Returns:
-            flags: torch.Tensor [>= total_flags], dtype=int32
-            BH, BW, BLOCK_M, BLOCK_K: tile config scalars
-            GH, GW: grid dimensions
+            counts_buf: torch.Tensor [>= N_TILES], dtype=int32
+            BH, BW, GH, GW: tile config (for info / debugging)
         """
         import triton
         from Kernels.conv2d import _select_block_sizes
@@ -105,44 +98,30 @@ class SparseConv2d(nn.Module):
         C_OUT = self.out_channels
         k = self.kernel_size[0]
 
-        # Compute tile config (same logic as sparse_conv2d_forward)
         pixels = H * W
         if self.block_size is None or pixels >= 3136:
-            BH, BW, BLOCK_M, BLOCK_N, BLOCK_K = _select_block_sizes(
+            BH, BW, _, _, _ = _select_block_sizes(
                 H, W, C_IN, C_OUT, k, N)
         else:
             bs = max(self.block_size, 4)
             BH, BW = bs, bs
-            BLOCK_M = BH * BW
-            BLOCK_N = 32 if C_OUT >= 32 else 16
-            BLOCK_K = 16
 
         GH = triton.cdiv(H, BH)
         GW = triton.cdiv(W, BW)
+        N_TILES = N * GH * GW
 
-        # Prescan N may be smaller when time-union is enabled
-        T = self.merge_time_steps
-        if T > 0 and N > T:
-            prescan_N = N // T  # B
-        else:
-            prescan_N = N
+        if (self._counts_buf is None
+                or self._counts_buf.numel() < N_TILES
+                or self._counts_buf.device != x.device):
+            self._counts_buf = torch.empty(
+                N_TILES, dtype=torch.int32, device=x.device)
 
-        total_flags = prescan_N * C_IN * GH * GW
-
-        # Reuse / expand cached buffer
-        if (self._flags is None
-                or self._flags.numel() < total_flags
-                or self._flags.device != x.device):
-            self._flags = torch.empty(total_flags, dtype=torch.int32,
-                                      device=x.device)
-
-        return self._flags, BH, BW, BLOCK_M, BLOCK_K, GH, GW
+        return self._counts_buf, BH, BW, GH, GW
 
     @classmethod
     def from_dense(cls, conv: nn.Conv2d, block_size=None,
                    threshold: float = 1e-6,
-                   return_ms: bool = False,
-                   merge_time_steps: int = 0) -> "SparseConv2d":
+                   return_ms: bool = False) -> "SparseConv2d":
         """从现有 nn.Conv2d 创建 SparseConv2d，复制权重。"""
         sparse_conv = cls(
             in_channels=conv.in_channels,
@@ -156,7 +135,6 @@ class SparseConv2d(nn.Module):
             block_size=block_size,
             threshold=threshold,
             return_ms=return_ms,
-            merge_time_steps=merge_time_steps,
         )
         sparse_conv.weight.data.copy_(conv.weight.data)
         if conv.bias is not None:
@@ -194,8 +172,8 @@ class SparseConv2d(nn.Module):
     def _triton_forward(self, x: torch.Tensor) -> torch.Tensor:
         from Kernels.conv2d import sparse_conv2d_forward
 
-        # Get cached flags buffer
-        flags, BH, BW, BLOCK_M, BLOCK_K, GH, GW = self._ensure_flags(x)
+        # Get cached counts buffer
+        counts_buf, _, _, _, _ = self._ensure_counts_buf(x)
 
         k = self.kernel_size[0]
         y, sparse_ms = sparse_conv2d_forward(
@@ -205,9 +183,8 @@ class SparseConv2d(nn.Module):
             block_size=self.block_size,
             kernel_size=k,
             threshold=self.threshold,
-            flags=flags,
+            counts_buf=counts_buf,
             return_ms=self.return_ms,
-            merge_time_steps=self.merge_time_steps,
         )
         self._last_sparse_ms = sparse_ms
         return y
@@ -225,6 +202,5 @@ class SparseConv2d(nn.Module):
             f"{self.in_channels}, {self.out_channels}, "
             f"kernel_size={self.kernel_size}, stride={self.stride}, "
             f"padding={self.padding}, block_size={bs}, "
-            f"return_ms={self.return_ms}, "
-            f"merge_time={self.merge_time_steps}, sparse=True"
+            f"return_ms={self.return_ms}, sparse=True"
         )
