@@ -2,5 +2,5 @@
 cd ~/SparseFlow
 find . -name '__pycache__' -type d -exec rm -rf {} +   
 
-python bench_resnet.py --model resnet50 --dataset cifar100 --T 16
+python bench_resnet.py --model resnet50 --dataset cifar100 --batch_size 8 --T 16
 nsys profile -o profile_h56 --trace=cuda,nvtx,osrt --force-overwrite true python bench_resnet.py --model resnet50 --dataset cifar100 --T 16

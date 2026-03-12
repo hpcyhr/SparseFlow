@@ -1,10 +1,10 @@
 """
-自动算子替换 — v10.4 透传模式
+自动算子替换
 
-核心改动：block_size=None 表示"由 kernel 动态决策"，不再表示"跳过"。
-  - Gatekeeper（是否跳过）完全由 Analyzer 负责（min(H,W)<7 → 不生成 target）。
-  - Replacer 对所有 target 无条件执行替换。
-  - block_size=None 透传给 SparseConv2d → sparse_conv2d_forward → _select_block_sizes。
+  - Fused replacement: Conv2d (fused target) → FusedSparseConvLIF,
+    downstream LIFNode → nn.Identity (avoid double-activation)
+  - Linear replacement: nn.Linear → SparseLinear (tile-level Dynamic-K)
+  - All Conv2d standalone replacement preserved
 """
 
 import sys
@@ -22,6 +22,7 @@ from Ops.sparse_conv2d import SparseConv2d
 
 
 def _set_module_by_name(model: nn.Module, name: str, new_module: nn.Module):
+    """Replace a submodule by dot-separated name."""
     parts = name.split(".")
     parent = model
     for part in parts[:-1]:
@@ -33,27 +34,21 @@ def _set_module_by_name(model: nn.Module, name: str, new_module: nn.Module):
 
 
 class ModuleReplacer:
-    """将分析器识别的目标 Conv2d 替换为稀疏加速版本"""
+    """
+    replacer supporting:
+      1. Standalone Conv2d → SparseConv2d
+      2. Fused Conv2d+LIF → FusedSparseConvLIF + Identity
+      3. Linear → SparseLinear
+    """
 
     def __init__(self, verbose: bool = True):
         self.verbose = verbose
 
     def replace(self, model: nn.Module, targets: List[ReplacementTarget],
                 block_sizes: Optional[Dict[str, int]] = None) -> int:
-        """
-        执行替换，返回成功替换数。
-
-        block_size 流向：
-          target.block_size (通常 None)
-            → block_sizes 手动覆盖（如有）
-            → SparseConv2d.from_dense(block_size=...)
-            → sparse_conv2d_forward(block_size=...)
-            → _select_block_sizes(H, W, ...) 动态决策
-        """
         replaced = 0
 
         for target in targets:
-            # 手动覆盖优先，否则使用 target 的值（通常 None）
             block = target.block_size
             if block_sizes and target.conv_name in block_sizes:
                 block = block_sizes[target.conv_name]
@@ -65,22 +60,64 @@ class ModuleReplacer:
             _set_module_by_name(model, target.conv_name, new_module)
             replaced += 1
 
+            # ── For fused targets: replace downstream LIFNode with Identity ──
+            if target.op_type in ("fused_conv3x3_lif", "fused_conv1x1_lif"):
+                if target.lif_name is not None:
+                    _set_module_by_name(model, target.lif_name, nn.Identity())
+                    if self.verbose:
+                        print(f"  [FUSE-ID] {target.lif_name} → nn.Identity "
+                              f"(fused into {target.conv_name})")
+
             if self.verbose:
-                info = display_block_info(target)
-                print(f"  [REPLACE] {target.conv_name} ({target.op_type}) "
-                      f"<- {target.spike_name}, {info}")
+                self._log_replacement(target)
 
         return replaced
 
     def _create_sparse_module(self, target: ReplacementTarget,
                               block: Optional[int]) -> Optional[nn.Module]:
-        conv = target.conv_module
+        op = target.op_type
 
-        if target.op_type in ("conv2d_3x3", "conv2d_1x1"):
-            # block=None → SparseConv2d 存储 None → kernel 动态决策
-            sparse = SparseConv2d.from_dense(conv, block_size=block)
-            device = conv.weight.device
-            sparse = sparse.to(device)
-            return sparse
+        # ── Standalone Conv2d ──
+        if op in ("conv2d_3x3", "conv2d_1x1"):
+            sparse = SparseConv2d.from_dense(target.conv_module, block_size=block)
+            return sparse.to(target.conv_module.weight.device)
+
+        # ── Fused Conv2d + LIF ──
+        if op in ("fused_conv3x3_lif", "fused_conv1x1_lif"):
+            from Ops.fused_sparse_conv_lif import FusedSparseConvLIF
+            if target.lif_module is None:
+                # Fallback to standalone if LIF not found
+                sparse = SparseConv2d.from_dense(target.conv_module, block_size=block)
+                return sparse.to(target.conv_module.weight.device)
+            fused = FusedSparseConvLIF.from_conv_and_lif(
+                target.conv_module, target.lif_module,
+                block_size=block)
+            return fused.to(target.conv_module.weight.device)
+
+        # ── Linear ──
+        if op == "linear":
+            from Ops.sparse_linear import SparseLinear
+            if not isinstance(target.conv_module, nn.Linear):
+                return None
+            sparse = SparseLinear.from_dense(target.conv_module)
+            return sparse.to(target.conv_module.weight.device)
 
         return None
+
+    def _log_replacement(self, target: ReplacementTarget):
+        op = target.op_type
+
+        if op == "linear":
+            in_f = target.conv_module.in_features
+            out_f = target.conv_module.out_features
+            print(f"  [REPLACE] {target.conv_name} (linear {in_f}→{out_f}) "
+                  f"<- {target.spike_name}")
+        elif "fused" in op:
+            info = display_block_info(target)
+            fused_with = target.lif_name or "?"
+            print(f"  [FUSE   ] {target.conv_name} ({op}) + {fused_with} "
+                  f"<- {target.spike_name}, {info}")
+        else:
+            info = display_block_info(target)
+            print(f"  [REPLACE] {target.conv_name} ({op}) "
+                  f"<- {target.spike_name}, {info}")

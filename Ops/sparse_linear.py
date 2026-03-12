@@ -1,14 +1,17 @@
 """
-SparseLinear — 稀疏 Linear 的 nn.Module 封装
+SparseLinear  — Tile-level Dynamic-K sparse Linear nn.Module
 
-可直接替换 torch.nn.Linear，接口完全兼容。
-当输入具有高稀疏性时（如 LIF 输出展平后），自动跳过全零行获得加速。
+Mirrors SparseCond architecture:
+  - from_dense() class method for one-line conversion
+  - 5D/3D/2D input handling
+  - Cached transposed weight (W_T) for coalesced access
+  - Pre-allocated buffers (counts_buf, tile_cin_buf)
+  - Triton fallback to F.linear
 """
 
 import sys
 from pathlib import Path
 
-# 项目根目录（SparseFlow/）
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
@@ -20,20 +23,19 @@ import torch.nn.functional as F
 
 class SparseLinear(nn.Module):
     """
-    稀疏加速版 Linear。
+    Tile-level Dynamic-K sparse Linear. Drop-in replacement for nn.Linear.
 
-    工作模式：
-      1. 输入按行 prescan，标记全零行
-      2. 仅对非零行执行 Triton sparse matmul
-      3. Triton 不可用时 fallback 到 F.linear
+    Groups batch rows into tiles, prescans which C_IN channels are active
+    per tile, then only multiplies active channels (Dynamic-K while loop).
     """
 
     def __init__(self, in_features, out_features, bias=True,
-                 threshold=1e-6):
+                 threshold=1e-6, return_ms=False):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.threshold = threshold
+        self.return_ms = return_ms
 
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         if bias:
@@ -49,30 +51,59 @@ class SparseLinear(nn.Module):
         except ImportError:
             pass
 
+        # Cached buffers
+        self._w_t = None           # [C_IN, C_OUT] transposed weight fp16
+        self._w_t_version = -1     # track weight updates
+        self._counts_buf = None
+        self._tile_cin_buf = None
+
+    def _get_w_t(self):
+        """Get or recompute transposed weight cache."""
+        ver = self.weight._version
+        if self._w_t is None or self._w_t_version != ver:
+            self._w_t = self.weight.data.half().t().contiguous()
+            self._w_t_version = ver
+        return self._w_t
+
+    def _ensure_buffers(self, x):
+        """Pre-allocate prescan buffers based on input shape."""
+        N = x.shape[0]
+        from Kernels.linear import _select_linear_block_m
+        import triton
+        BLOCK_M = _select_linear_block_m(N)
+        N_TILES = triton.cdiv(N, BLOCK_M)
+        C_IN = self.in_features
+
+        if (self._counts_buf is None
+                or self._counts_buf.numel() < N_TILES
+                or self._counts_buf.device != x.device):
+            self._counts_buf = torch.empty(N_TILES, dtype=torch.int32, device=x.device)
+
+        max_cin = N_TILES * C_IN
+        if (self._tile_cin_buf is None
+                or self._tile_cin_buf.numel() < max_cin
+                or self._tile_cin_buf.device != x.device):
+            self._tile_cin_buf = torch.empty(max_cin, dtype=torch.int32, device=x.device)
+
+        return self._counts_buf, self._tile_cin_buf
+
     @classmethod
-    def from_dense(cls, linear: nn.Linear, threshold: float = 1e-6) -> "SparseLinear":
-        """从现有 nn.Linear 创建 SparseLinear，复制权重。"""
+    def from_dense(cls, linear: nn.Linear, threshold: float = 1e-6,
+                   return_ms: bool = False) -> "SparseLinear":
+        """Create SparseLinear from existing nn.Linear, copying weights."""
         sparse = cls(
             in_features=linear.in_features,
             out_features=linear.out_features,
             bias=linear.bias is not None,
             threshold=threshold,
+            return_ms=return_ms,
         )
         sparse.weight.data.copy_(linear.weight.data)
         if linear.bias is not None:
             sparse.bias.data.copy_(linear.bias.data)
-        sparse = sparse.to(linear.weight.device)
-        return sparse
+        return sparse.to(linear.weight.device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        前向传播。
-
-        输入支持：
-          - [N, C_in]          — 标准 2D
-          - [T, N, C_in]       — spikingjelly 多时间步 3D
-          - [T, N, C, H, W]    — 5D（自动 flatten）
-        """
         orig_shape = x.shape
         reshaped = False
 
@@ -85,11 +116,7 @@ class SparseLinear(nn.Module):
             x = x.reshape(T * B, Cin)
             reshaped = True
 
-        use_triton = (
-            self._triton_available
-            and x.is_cuda
-            and x.dim() == 2
-        )
+        use_triton = (self._triton_available and x.is_cuda and x.dim() == 2)
 
         if use_triton:
             y = self._triton_forward(x)
@@ -98,19 +125,29 @@ class SparseLinear(nn.Module):
 
         if reshaped:
             if len(orig_shape) == 5:
+                T, B = orig_shape[0], orig_shape[1]
                 y = y.reshape(T, B, self.out_features)
             elif len(orig_shape) == 3:
+                T, B = orig_shape[0], orig_shape[1]
                 y = y.reshape(T, B, self.out_features)
 
         return y
 
     def _triton_forward(self, x: torch.Tensor) -> torch.Tensor:
         from Kernels.linear import sparse_linear_forward
+
+        w_t = self._get_w_t()
+        counts_buf, tile_cin_buf = self._ensure_buffers(x)
+
         y, sparse_ms = sparse_linear_forward(
             x=x.contiguous(),
-            weight=self.weight.contiguous(),
+            weight=self.weight,
             bias=self.bias,
             threshold=self.threshold,
+            w_t=w_t,
+            counts_buf=counts_buf,
+            tile_cin_buf=tile_cin_buf,
+            return_ms=self.return_ms,
         )
         self._last_sparse_ms = sparse_ms
         return y
@@ -120,7 +157,5 @@ class SparseLinear(nn.Module):
         return F.linear(x, self.weight, self.bias)
 
     def extra_repr(self) -> str:
-        return (
-            f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"bias={self.bias is not None}, sparse=True"
-        )
+        return (f"{self.in_features}, {self.out_features}, "
+                f"bias={self.bias is not None}, sparse=True")
