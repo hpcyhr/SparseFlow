@@ -11,6 +11,9 @@ The replaced LIFNode should be swapped with nn.Identity by the replacer.
 
 Handles 5D (T, B, C, H, W) multi-step input by iterating over T,
 since LIF state (V) depends on previous time step.
+
+v15.2 fix: 继承 spikingjelly MemoryModule，使 sj_func.reset_net() 能
+正确重置膜电位 self.v，消除跨 batch 状态泄漏和 WARNING。
 """
 
 import sys
@@ -24,11 +27,17 @@ if _PROJECT_ROOT not in sys.path:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from spikingjelly.activation_based import base as sj_base
 
 
-class FusedSparseConvLIF(nn.Module):
+class FusedSparseConvLIF(sj_base.MemoryModule):
     """
     Fused sparse Conv2d + LIF neuron.
+
+    继承 sj_base.MemoryModule 而非 nn.Module，使得：
+      - sj_func.reset_net(model) 能自动重置 self.v
+      - sj_func.set_step_mode(model, 'm') 能正确传播
+      - 不再产生 "not MemoryModule" WARNING
 
     LIF parameters:
       - tau: membrane time constant (decay = exp(-dt/tau) ≈ 1 - 1/tau)
@@ -74,8 +83,9 @@ class FusedSparseConvLIF(nn.Module):
         self.v_threshold = v_threshold
         self.decay = math.exp(-1.0 / tau)  # exp(-dt/tau) with dt=1
 
-        # Membrane potential state (managed per forward call)
-        self.v = None  # [B, C_OUT, H_out, W_out], set during forward
+        # 通过 MemoryModule.register_memory 注册膜电位，
+        # sj_func.reset_net() 会自动将其重置为初始值 (None)
+        self.register_memory('v', None)
 
         self._last_sparse_ms = 0.0
         self._triton_available = False
@@ -96,7 +106,8 @@ class FusedSparseConvLIF(nn.Module):
         if self._w_cl is None or self._w_cl_version != ver:
             k = self.kernel_size[0]
             if k == 3:
-                self._w_cl = self.weight.data.half().permute(0, 2, 3, 1).contiguous()
+                self._w_cl = self.weight.data.half().permute(
+                    0, 2, 3, 1).contiguous()
             else:
                 self._w_cl = self.weight.data.half().reshape(
                     self.out_channels, self.in_channels).contiguous()
@@ -129,9 +140,9 @@ class FusedSparseConvLIF(nn.Module):
 
         return self._counts_buf, self._tile_cin_buf
 
-    def reset(self):
-        """Reset membrane potential. Called by sj_func.reset_net()."""
-        self.v = None
+    # 注意：不再需要手动 def reset(self)，
+    # MemoryModule 的 reset() 会自动将 register_memory 注册的
+    # self.v 重置为初始值 None。
 
     @classmethod
     def from_conv_and_lif(cls, conv: nn.Conv2d, lif_node,
@@ -183,14 +194,16 @@ class FusedSparseConvLIF(nn.Module):
         elif x.dim() == 4:
             return self._forward_singlestep(x)
         else:
-            raise ValueError(f"FusedSparseConvLIF expects 4D or 5D input, got {x.dim()}D")
+            raise ValueError(
+                f"FusedSparseConvLIF expects 4D or 5D input, "
+                f"got {x.dim()}D")
 
     def _forward_multistep(self, x: torch.Tensor) -> torch.Tensor:
         T, B, C_IN, H, W = x.shape
         spikes_list = []
 
         for t in range(T):
-            spike_t = self._forward_singlestep(x[t])  # [B, C_OUT, H_out, W_out]
+            spike_t = self._forward_singlestep(x[t])
             spikes_list.append(spike_t.unsqueeze(0))
 
         return torch.cat(spikes_list, dim=0)  # [T, B, C_OUT, H_out, W_out]
