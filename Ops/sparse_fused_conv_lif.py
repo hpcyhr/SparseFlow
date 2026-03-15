@@ -1,24 +1,6 @@
-"""
-FusedSparseConvLIF — Fused Sparse Conv2d + LIF Neuron nn.Module
-
-Replaces the pattern: Conv2d → [optional BN] → LIFNode
-with a single module that:
-  1. Runs sparse conv (reusing conv2d.py prescan infrastructure)
-  2. Applies LIF dynamics in-register (no intermediate VRAM write)
-  3. Outputs spike tensor and updates membrane potential
-
-The replaced LIFNode should be swapped with nn.Identity by the replacer.
-
-Handles 5D (T, B, C, H, W) multi-step input by iterating over T,
-since LIF state (V) depends on previous time step.
-
-v15.2 fix: 继承 spikingjelly MemoryModule，使 sj_func.reset_net() 能
-正确重置膜电位 self.v，消除跨 batch 状态泄漏和 WARNING。
-"""
-
 import sys
 from pathlib import Path
-import math
+from typing import Optional
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
@@ -31,133 +13,65 @@ from spikingjelly.activation_based import base as sj_base
 
 
 class FusedSparseConvLIF(sj_base.MemoryModule):
-    """
-    Fused sparse Conv2d + LIF neuron.
-
-    继承 sj_base.MemoryModule 而非 nn.Module，使得：
-      - sj_func.reset_net(model) 能自动重置 self.v
-      - sj_func.set_step_mode(model, 'm') 能正确传播
-      - 不再产生 "not MemoryModule" WARNING
-
-    LIF parameters:
-      - tau: membrane time constant (decay = exp(-dt/tau) ≈ 1 - 1/tau)
-      - v_threshold: firing threshold
-      - v_reset: soft reset (V_next = V_temp * (1 - spike))
-
-    Conv parameters: inherited from the original Conv2d.
-    """
-
     def __init__(self, in_channels, out_channels, kernel_size,
                  stride=1, padding=0, dilation=1, groups=1, bias=True,
-                 block_size=None, threshold=1e-6,
-                 tau=2.0, v_threshold=1.0,
-                 return_ms=False):
+                 tau: float = 2.0, v_threshold: float = 1.0,
+                 v_reset: Optional[float] = 0.0,
+                 detach_reset: bool = False, decay_input: bool = True,
+                 backend: str = "torch", threshold: float = 1e-6,
+                 block_size=None, return_ms: bool = False):
         super().__init__()
 
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.kernel_size = (kernel_size if isinstance(kernel_size, tuple)
                             else (kernel_size, kernel_size))
-        self.stride = (stride if isinstance(stride, tuple)
-                       else (stride, stride))
-        self.padding = (padding if isinstance(padding, tuple)
-                        else (padding, padding))
-        self.dilation = (dilation if isinstance(dilation, tuple)
-                         else (dilation, dilation))
+        self.stride = stride if isinstance(stride, tuple) else (stride, stride)
+        self.padding = padding if isinstance(padding, tuple) else (padding, padding)
+        self.dilation = dilation if isinstance(dilation, tuple) else (dilation, dilation)
         self.groups = groups
-        self.block_size = block_size
-        self.threshold = threshold
-        self.return_ms = return_ms
 
-        # Conv weights
+        self.tau = float(tau)
+        self.v_threshold = float(v_threshold)
+        self.v_reset = v_reset
+        self.detach_reset = detach_reset
+        self.decay_input = bool(decay_input)
+        self.backend = backend
+
+        self.threshold = float(threshold)
+        self.block_size = block_size
+        self.return_ms = bool(return_ms)
+
         self.weight = nn.Parameter(
-            torch.empty(out_channels, in_channels // groups,
-                        *self.kernel_size))
+            torch.empty(out_channels, in_channels // groups, *self.kernel_size)
+        )
         if bias:
             self.bias = nn.Parameter(torch.empty(out_channels))
         else:
-            self.register_parameter('bias', None)
+            self.register_parameter("bias", None)
 
-        # LIF parameters
-        self.tau = tau
-        self.v_threshold = v_threshold
-        self.decay = math.exp(-1.0 / tau)  # exp(-dt/tau) with dt=1
-
-        # 通过 MemoryModule.register_memory 注册膜电位，
-        # sj_func.reset_net() 会自动将其重置为初始值 (None)
-        self.register_memory('v', None)
-
-        self._last_sparse_ms = 0.0
         self._triton_available = False
         try:
-            import triton
+            import triton  # noqa: F401
             self._triton_available = True
-        except ImportError:
+        except Exception:
             pass
 
-        # Cached buffers (same as SparseConv2d)
+        self._last_sparse_ms = 0.0
         self._w_cl = None
-        self._w_cl_version = -1
-        self._counts_buf = None
-        self._tile_cin_buf = None
+        self._ag_count_buf = None
+        self._ag_list_buf = None
 
-    def _get_w_cl(self):
-        ver = self.weight._version
-        if self._w_cl is None or self._w_cl_version != ver:
-            k = self.kernel_size[0]
-            if k == 3:
-                self._w_cl = self.weight.data.half().permute(
-                    0, 2, 3, 1).contiguous()
-            else:
-                self._w_cl = self.weight.data.half().reshape(
-                    self.out_channels, self.in_channels).contiguous()
-            self._w_cl_version = ver
-        return self._w_cl
+        self._force_dense = None
+        self._fallback_warmup_left = 4
 
-    def _ensure_buffers(self, x_single):
-        """Pre-allocate buffers based on single-step input shape [B, C, H, W]."""
-        from Kernels.conv2d import _select_tile_sizes
-        import triton
-
-        B, C_IN, H, W = x_single.shape
-        BH, BW = _select_tile_sizes(H, W)
-        GH = triton.cdiv(H, BH)
-        GW = triton.cdiv(W, BW)
-        N_TILES = B * GH * GW
-
-        if (self._counts_buf is None
-                or self._counts_buf.numel() < N_TILES
-                or self._counts_buf.device != x_single.device):
-            self._counts_buf = torch.empty(N_TILES, dtype=torch.int32,
-                                           device=x_single.device)
-
-        max_cin = N_TILES * C_IN
-        if (self._tile_cin_buf is None
-                or self._tile_cin_buf.numel() < max_cin
-                or self._tile_cin_buf.device != x_single.device):
-            self._tile_cin_buf = torch.empty(max_cin, dtype=torch.int32,
-                                             device=x_single.device)
-
-        return self._counts_buf, self._tile_cin_buf
-
-    # 注意：不再需要手动 def reset(self)，
-    # MemoryModule 的 reset() 会自动将 register_memory 注册的
-    # self.v 重置为初始值 None。
+        self.register_memory("v", None)
 
     @classmethod
     def from_conv_and_lif(cls, conv: nn.Conv2d, lif_node,
-                          block_size=None, threshold=1e-6,
-                          return_ms=False) -> "FusedSparseConvLIF":
-        """
-        Create FusedSparseConvLIF from an existing Conv2d and LIFNode.
-
-        Extracts tau and v_threshold from the LIFNode.
-        """
-        # Extract LIF parameters
-        tau = getattr(lif_node, 'tau', 2.0)
-        v_th = getattr(lif_node, 'v_threshold', 1.0)
-
-        fused = cls(
+                          block_size=None, threshold: float = 1e-6,
+                          return_ms: bool = False):
+        mod = cls(
             in_channels=conv.in_channels,
             out_channels=conv.out_channels,
             kernel_size=conv.kernel_size,
@@ -165,71 +79,91 @@ class FusedSparseConvLIF(sj_base.MemoryModule):
             padding=conv.padding,
             dilation=conv.dilation,
             groups=conv.groups,
-            bias=conv.bias is not None,
-            block_size=block_size,
+            bias=(conv.bias is not None),
+            tau=float(getattr(lif_node, "tau", 2.0)),
+            v_threshold=float(getattr(lif_node, "v_threshold", 1.0)),
+            v_reset=getattr(lif_node, "v_reset", 0.0),
+            detach_reset=bool(getattr(lif_node, "detach_reset", False)),
+            decay_input=bool(getattr(lif_node, "decay_input", True)),
+            backend=str(getattr(lif_node, "backend", "torch")),
             threshold=threshold,
-            tau=tau,
-            v_threshold=v_th,
+            block_size=block_size,
             return_ms=return_ms,
         )
-
-        fused.weight.data.copy_(conv.weight.data)
+        mod.weight.data.copy_(conv.weight.data)
         if conv.bias is not None:
-            fused.bias.data.copy_(conv.bias.data)
+            mod.bias.data.copy_(conv.bias.data)
+        return mod.to(conv.weight.device)
 
-        return fused.to(conv.weight.device)
+    def _get_w_cl(self):
+        ver = self.weight._version
+        if self._w_cl is None or getattr(self, "_w_cl_version", -1) != ver:
+            k = self.kernel_size[0]
+            if k == 3:
+                self._w_cl = self.weight.data.half().permute(0, 2, 3, 1).contiguous()
+            else:
+                self._w_cl = self.weight.data.half().reshape(
+                    self.out_channels, self.in_channels
+                ).contiguous()
+            self._w_cl_version = ver
+        return self._w_cl
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass.
+    def _ensure_buffers(self, x_single):
+        from Kernels.conv2d import _select_tile_sizes, GROUP_SIZE
+        import triton
 
-        Input:
-          - [T, B, C_IN, H, W]  (multi-step) → loop over T, update V
-          - [B, C_IN, H, W]     (single-step) → single fused call
+        B, C_IN, H, W = x_single.shape
+        BH, BW = _select_tile_sizes(H, W)
+        GH = triton.cdiv(H, BH)
+        GW = triton.cdiv(W, BW)
+        N_TILES = B * GH * GW
+        NUM_GROUPS = triton.cdiv(C_IN, GROUP_SIZE)
+        MAX_AG = NUM_GROUPS
 
-        Output: spike tensor, same shape as input.
-        """
+        if (self._ag_count_buf is None
+                or self._ag_count_buf.numel() < N_TILES
+                or self._ag_count_buf.device != x_single.device):
+            self._ag_count_buf = torch.empty(
+                N_TILES, dtype=torch.int32, device=x_single.device
+            )
+
+        needed = N_TILES * MAX_AG
+        if (self._ag_list_buf is None
+                or self._ag_list_buf.numel() < needed
+                or self._ag_list_buf.device != x_single.device):
+            self._ag_list_buf = torch.empty(
+                needed, dtype=torch.int32, device=x_single.device
+            )
+
+        return self._ag_count_buf, self._ag_list_buf
+
+    def forward(self, x):
         if x.dim() == 5:
             return self._forward_multistep(x)
         elif x.dim() == 4:
             return self._forward_singlestep(x)
         else:
-            raise ValueError(
-                f"FusedSparseConvLIF expects 4D or 5D input, "
-                f"got {x.dim()}D")
+            raise ValueError(f"Expected 4D or 5D, got {x.dim()}D")
 
-    def _forward_multistep(self, x: torch.Tensor) -> torch.Tensor:
-        T, B, C_IN, H, W = x.shape
-        spikes_list = []
-
+    def _forward_multistep(self, x):
+        T, B, C, H, W = x.shape
+        out = torch.empty(
+            T, B, self.out_channels, H, W,
+            dtype=torch.float32, device=x.device
+        )
         for t in range(T):
-            spike_t = self._forward_singlestep(x[t])
-            spikes_list.append(spike_t.unsqueeze(0))
+            out[t] = self._forward_singlestep(x[t])
+        return out
 
-        return torch.cat(spikes_list, dim=0)  # [T, B, C_OUT, H_out, W_out]
-
-    def _forward_singlestep(self, x: torch.Tensor) -> torch.Tensor:
-        """Single time-step forward with LIF state update."""
-        B, C_IN, H, W = x.shape
-
-        # Compute output spatial dims (stride=1 for supported cases)
-        H_out, W_out = H, W
-
-        # Initialize V if needed
-        if self.v is None:
-            self.v = torch.zeros(B, self.out_channels, H_out, W_out,
-                                 dtype=torch.float32, device=x.device)
-
-        # Check if V shape matches (batch size may change)
-        if self.v.shape[0] != B:
-            self.v = torch.zeros(B, self.out_channels, H_out, W_out,
+    def _forward_singlestep(self, x):
+        B, C, H, W = x.shape
+        if self.v is None or self.v.shape != (B, self.out_channels, H, W) or self.v.device != x.device:
+            self.v = torch.zeros(B, self.out_channels, H, W,
                                  dtype=torch.float32, device=x.device)
 
         use_triton = (
-            self._triton_available
-            and x.is_cuda
-            and self.stride == (1, 1)
-            and self.dilation == (1, 1)
+            self._triton_available and x.is_cuda
+            and self.stride == (1, 1) and self.dilation == (1, 1)
             and self.groups == 1
             and self.kernel_size in [(3, 3), (1, 1)]
         )
@@ -243,47 +177,91 @@ class FusedSparseConvLIF(sj_base.MemoryModule):
         return spike
 
     def _triton_forward(self, x):
-        from Kernels.fused_conv_lif import fused_sparse_conv_lif_forward
+        from Kernels.fused_conv_lif import sparse_fused_conv_lif_forward
 
         w_cl = self._get_w_cl()
-        counts_buf, tile_cin_buf = self._ensure_buffers(x)
-        k = self.kernel_size[0]
+        ag_count_buf, ag_list_buf = self._ensure_buffers(x)
 
-        spike, v_next, sparse_ms = fused_sparse_conv_lif_forward(
+        if self._force_dense is None or self._fallback_warmup_left > 0:
+            spike, v_next, ms, avg_active_ratio = sparse_fused_conv_lif_forward(
+                x=x.contiguous(),
+                v_prev=self.v,
+                weight=self.weight,
+                bias=self.bias,
+                tau=self.tau,
+                v_threshold=self.v_threshold,
+                v_reset=self.v_reset,
+                decay_input=self.decay_input,
+                kernel_size=self.kernel_size[0],
+                threshold=self.threshold,
+                w_cl=w_cl,
+                ag_count_buf=ag_count_buf,
+                ag_list_buf=ag_list_buf,
+                return_ms=self.return_ms,
+                return_avg_active_ratio=True,
+            )
+            self._last_sparse_ms = ms
+            if self._fallback_warmup_left > 0:
+                self._force_dense = (avg_active_ratio > 0.85)
+                self._fallback_warmup_left -= 1
+            if self._force_dense:
+                return self._fallback_forward(x)
+            return spike, v_next
+
+        if self._force_dense:
+            return self._fallback_forward(x)
+
+        spike, v_next, ms = sparse_fused_conv_lif_forward(
             x=x.contiguous(),
+            v_prev=self.v,
             weight=self.weight,
             bias=self.bias,
-            v_prev=self.v,
-            kernel_size=k,
-            decay=self.decay,
+            tau=self.tau,
             v_threshold=self.v_threshold,
+            v_reset=self.v_reset,
+            decay_input=self.decay_input,
+            kernel_size=self.kernel_size[0],
             threshold=self.threshold,
             w_cl=w_cl,
-            counts_buf=counts_buf,
-            tile_cin_buf=tile_cin_buf,
+            ag_count_buf=ag_count_buf,
+            ag_list_buf=ag_list_buf,
             return_ms=self.return_ms,
+            return_avg_active_ratio=False,
         )
-        self._last_sparse_ms = sparse_ms
+        self._last_sparse_ms = ms
         return spike, v_next
 
     def _fallback_forward(self, x):
-        """Dense fallback: Conv2d → LIF dynamics in Python."""
         self._last_sparse_ms = 0.0
 
-        # Standard conv
-        y = F.conv2d(x, self.weight, self.bias,
-                     self.stride, self.padding, self.dilation, self.groups)
+        conv = F.conv2d(
+            x, self.weight, self.bias,
+            stride=self.stride, padding=self.padding,
+            dilation=self.dilation, groups=self.groups
+        ).float()
 
-        # LIF dynamics
-        v_temp = self.v * self.decay + y.float()
-        spike = (v_temp > self.v_threshold).float()
-        v_next = v_temp * (1.0 - spike)
+        v_prev = self.v
+        if self.decay_input:
+            v_tmp = v_prev + (conv - (v_prev - (0.0 if self.v_reset is None else self.v_reset))) / self.tau
+        else:
+            v_tmp = v_prev - (v_prev - (0.0 if self.v_reset is None else self.v_reset)) / self.tau + conv
 
+        spike = (v_tmp >= self.v_threshold).to(v_tmp.dtype)
+
+        if self.v_reset is None:
+            v_next = v_tmp - spike * self.v_threshold
+        else:
+            v_next = torch.where(
+                spike.bool(),
+                torch.full_like(v_tmp, float(self.v_reset)),
+                v_tmp,
+            )
         return spike, v_next
 
-    def extra_repr(self) -> str:
+    def extra_repr(self):
         bs = self.block_size if self.block_size is not None else "auto"
         return (f"{self.in_channels}, {self.out_channels}, "
                 f"kernel_size={self.kernel_size}, stride={self.stride}, "
                 f"padding={self.padding}, tau={self.tau}, "
-                f"v_th={self.v_threshold}, fused=True")
+                f"v_threshold={self.v_threshold}, v_reset={self.v_reset}, "
+                f"block_size={bs}, fused=True")

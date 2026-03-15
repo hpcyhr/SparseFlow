@@ -1,0 +1,11 @@
+# 普通 e2e benchmark（只替换 3x3，跳过 1x1 和 H<8 的层）
+python Benchmark/bench_e2e.py --model resnet18 --dataset cifar10 --T 4
+
+# Fused 模式
+python Benchmark/bench_e2e.py --model resnet34 --dataset cifar10 --T 8 --fused
+
+# 开启逐层 timing 对比（找到是哪些层拖后腿）
+python Benchmark/bench_e2e.py --model resnet18 --dataset cifar10 --T 4 --layer_profile
+
+# Fused + 逐层 profiling + 自定义 profile batch 数
+python Benchmark/bench_e2e.py --model resnet50 --dataset cifar100 --T 16 --fused --layer_profile --profile_batches 50

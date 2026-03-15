@@ -1,21 +1,11 @@
 """
-SparseFlow Fused Sparse Conv + LIF Triton Kernels
+SparseFlow Fused Sparse Conv + LIF — v16.4 Compact Active-Group
 
-Eliminates intermediate VRAM write for conv output by fusing LIF neuron
-dynamics directly into the sparse conv kernel epilogue.
-
-In-register flow (after conv accumulation):
-  1. I = acc + bias
-  2. V_temp = V_prev * decay + I
-  3. Spike = 1.0 if V_temp > V_th else 0.0
-  4. V_next = V_temp * (1.0 - Spike)   (soft reset)
-
-Memory IO per output element:
-  Read:  x (sparse), w, bias, V_prev
-  Write: Spike_out, V_next
-  Skip:  intermediate conv result (never touches VRAM)
-
-Reuses conv2d.py v15.1 prescan infrastructure (_build_tile_csr, _select_tile_sizes).
+改动：
+1. 与 conv2d.py 统一使用 active_group_count + active_group_list
+2. 与 Ops 层接口对齐，入口函数名统一为 `sparse_fused_conv_lif_forward`
+3. 去掉 tl.full_like，兼容较老 Triton 版本
+4. 新增 `return_avg_active_ratio`，仅在需要时才同步读取
 """
 
 import torch
@@ -23,54 +13,78 @@ import triton
 import triton.language as tl
 from triton import autotune, Config
 
+from Kernels.conv2d import (
+    GROUP_SIZE,
+    FALLBACK_RATIO,
+    _select_tile_sizes,
+    _build_active_group_metadata,
+    _check_dense_fallback,
+)
 
-# ═══════════════════════════════════════════════════════════════════════
-# Autotune configs
-# ═══════════════════════════════════════════════════════════════════════
 
-def _make_fused_configs(block_h, block_w):
-    block_m = block_h * block_w
-    configs = []
+def _select_block_sizes(H, W, C_IN, C_OUT, kernel_size, N):
+    BH, BW = _select_tile_sizes(H, W)
+    return BH, BW, BH * BW, 64, GROUP_SIZE
+
+
+def _make_fused_configs(bh, bw):
+    bm = bh * bw
+    cfgs = []
     for bn in [64, 128]:
-        for bk in [32, 64]:
-            for nw in [4, 8]:
-                configs.append(Config(
-                    {'BLOCK_M': block_m, 'BLOCK_N': bn, 'BLOCK_K': bk,
-                     'BLOCK_H': block_h, 'BLOCK_W': block_w},
-                    num_warps=nw, num_stages=1))
-    return configs
-
-_FUSED_3X3_CONFIGS_8x8  = _make_fused_configs(8, 8)
-_FUSED_3X3_CONFIGS_8x16 = _make_fused_configs(8, 16)
-_FUSED_1X1_CONFIGS_8x8  = _make_fused_configs(8, 8)
-_FUSED_1X1_CONFIGS_8x16 = _make_fused_configs(8, 16)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Shared LIF epilogue macro (called at end of each kernel)
-# ═══════════════════════════════════════════════════════════════════════
-# Not a separate function due to Triton JIT constraints — inlined below.
+        for nw in [4, 8]:
+            cfgs.append(
+                Config(
+                    {
+                        "BLOCK_M": bm,
+                        "BLOCK_N": bn,
+                        "BLOCK_H": bh,
+                        "BLOCK_W": bw,
+                    },
+                    num_warps=nw,
+                    num_stages=1,
+                )
+            )
+    return cfgs
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Fused Sparse 3x3 Conv + LIF — 8x8
-# ═══════════════════════════════════════════════════════════════════════
+_FC_8x8 = _make_fused_configs(8, 8)
+_FC_8x16 = _make_fused_configs(8, 16)
 
-@autotune(configs=_FUSED_3X3_CONFIGS_8x8,
-          key=['C_IN', 'C_OUT', 'H', 'W', 'GH', 'GW'])
+
+@autotune(configs=_FC_8x8, key=["C_IN", "C_OUT", "H", "W", "GH", "GW"])
 @triton.jit
-def fused_conv3x3_lif_kernel_8x8(
-    x_ptr, w_cl_ptr, bias_ptr, tile_ptr_data, tile_cin_ptr,
-    v_prev_ptr, spike_ptr, v_next_ptr, N_val,
-    C_IN: tl.constexpr, C_OUT: tl.constexpr,
-    H: tl.constexpr, W: tl.constexpr,
-    GH: tl.constexpr, GW: tl.constexpr,
-    HAS_BIAS: tl.constexpr, DECAY: tl.constexpr, V_TH: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr,
+def fused_ag_conv3x3_lif_8x8(
+    x_ptr,
+    w_cl_ptr,
+    bias_ptr,
+    ag_count_ptr,
+    ag_list_ptr,
+    v_prev_ptr,
+    spike_ptr,
+    v_next_ptr,
+    N_val,
+    C_IN: tl.constexpr,
+    C_OUT: tl.constexpr,
+    H: tl.constexpr,
+    W: tl.constexpr,
+    GH: tl.constexpr,
+    GW: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    DECAY: tl.constexpr,
+    RECIP_TAU: tl.constexpr,
+    V_TH: tl.constexpr,
+    HAS_V_RESET: tl.constexpr,
+    V_RESET: tl.constexpr,
+    GROUP_SIZE_C: tl.constexpr,
+    MAX_AG: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
 ):
     tile_id = tl.program_id(0)
     pid_cout = tl.program_id(1)
+
     total_tiles = N_val * GH * GW
     if tile_id >= total_tiles:
         return
@@ -80,30 +94,31 @@ def fused_conv3x3_lif_kernel_8x8(
     gh_idx = tmp % GH
     n_idx = tmp // GH
 
-    c_out_start = pid_cout * BLOCK_N
-    offs_n = c_out_start + tl.arange(0, BLOCK_N)
+    offs_n = pid_cout * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < C_OUT
 
     offs_m = tl.arange(0, BLOCK_M)
     out_h = gh_idx * BLOCK_H + offs_m // BLOCK_W
     out_w = gw_idx * BLOCK_W + offs_m % BLOCK_W
     m_mask = (out_h < H) & (out_w < W)
-    HW: tl.constexpr = H * W
 
-    tile_start = tl.load(tile_ptr_data + tile_id)
-    tile_end = tl.load(tile_ptr_data + tile_id + 1)
-    active_K = tile_end - tile_start
+    HW: tl.constexpr = H * W
+    W_CS: tl.constexpr = C_IN
+    W_KH: tl.constexpr = 3 * C_IN
+    W_CO: tl.constexpr = 9 * C_IN
+
+    active_count = tl.load(ag_count_ptr + tile_id)
+    list_base = tile_id * MAX_AG
+
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
-    W_CIN_STRIDE: tl.constexpr = C_IN
-    W_KH_STRIDE: tl.constexpr = 3 * C_IN
-    W_CO_STRIDE: tl.constexpr = 9 * C_IN
+    g_idx = 0
+    while g_idx < active_count:
+        gid = tl.load(ag_list_ptr + list_base + g_idx)
+        cin_start = gid * GROUP_SIZE_C
+        offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+        k_mask = offs_k < C_IN
 
-    k_start = 0
-    while k_start < active_K:
-        offs_k = k_start + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < active_K
-        cin_global = tl.load(tile_cin_ptr + tile_start + offs_k, mask=k_mask, other=0)
         for kh in tl.static_range(3):
             for kw in tl.static_range(3):
                 in_h = out_h + (kh - 1)
@@ -112,208 +127,193 @@ def fused_conv3x3_lif_kernel_8x8(
                 w_ok = (in_w >= 0) & (in_w < W)
                 safe_h = tl.minimum(tl.maximum(in_h, 0), H - 1)
                 safe_w = tl.minimum(tl.maximum(in_w, 0), W - 1)
-                x_addrs = (x_ptr + (n_idx * C_IN + cin_global[None, :]) * HW
-                           + safe_h[:, None] * W + safe_w[:, None])
-                x_lm = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
-                x_tile = tl.load(x_addrs, mask=x_lm, other=0.0).to(tl.float16)
-                w_addrs = (w_cl_ptr + offs_n[None, :] * W_CO_STRIDE
-                           + kh * W_KH_STRIDE + kw * W_CIN_STRIDE + cin_global[:, None])
-                w_lm = k_mask[:, None] & n_mask[None, :]
-                w_tile = tl.load(w_addrs, mask=w_lm, other=0.0).to(tl.float16)
+
+                x_addrs = (
+                    x_ptr
+                    + (n_idx * C_IN + offs_k[None, :]) * HW
+                    + safe_h[:, None] * W
+                    + safe_w[:, None]
+                )
+                x_mask = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
+                x_tile = tl.load(x_addrs, mask=x_mask, other=0.0).to(tl.float16)
+
+                w_addrs = (
+                    w_cl_ptr
+                    + offs_n[None, :] * W_CO
+                    + kh * W_KH
+                    + kw * W_CS
+                    + offs_k[:, None]
+                )
+                w_mask = k_mask[:, None] & n_mask[None, :]
+                w_tile = tl.load(w_addrs, mask=w_mask, other=0.0).to(tl.float16)
+
                 acc += tl.dot(x_tile, w_tile)
-        k_start += BLOCK_K
+
+        g_idx += 1
 
     if HAS_BIAS:
         acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
 
-    # ═══ FUSED LIF EPILOGUE ═══
-    out_addrs = (n_idx * C_OUT + offs_n[None, :]) * HW + out_h[:, None] * W + out_w[:, None]
-    out_mask = m_mask[:, None] & n_mask[None, :]
-    v_prev = tl.load(v_prev_ptr + out_addrs, mask=out_mask, other=0.0)
-    v_temp = v_prev * DECAY + acc
-    spike = (v_temp > V_TH).to(tl.float32)
-    v_next = v_temp * (1.0 - spike)
-    tl.store(spike_ptr + out_addrs, spike, mask=out_mask)
-    tl.store(v_next_ptr + out_addrs, v_next, mask=out_mask)
+    oa = (n_idx * C_OUT + offs_n[None, :]) * HW + out_h[:, None] * W + out_w[:, None]
+    om = m_mask[:, None] & n_mask[None, :]
+
+    vp = tl.load(v_prev_ptr + oa, mask=om, other=0.0)
+    vt = vp * DECAY + acc * RECIP_TAU
+    sp = (vt >= V_TH).to(tl.float32)
+
+    if HAS_V_RESET:
+        v_reset_tensor = vt * 0.0 + V_RESET
+        vn = tl.where(sp > 0.0, v_reset_tensor, vt)
+    else:
+        vn = vt - sp * V_TH
+
+    tl.store(spike_ptr + oa, sp, mask=om)
+    tl.store(v_next_ptr + oa, vn, mask=om)
 
 
-@autotune(configs=_FUSED_3X3_CONFIGS_8x16,
-          key=['C_IN', 'C_OUT', 'H', 'W', 'GH', 'GW'])
+@autotune(configs=_FC_8x16, key=["C_IN", "C_OUT", "H", "W", "GH", "GW"])
 @triton.jit
-def fused_conv3x3_lif_kernel_8x16(
-    x_ptr, w_cl_ptr, bias_ptr, tile_ptr_data, tile_cin_ptr,
-    v_prev_ptr, spike_ptr, v_next_ptr, N_val,
-    C_IN: tl.constexpr, C_OUT: tl.constexpr,
-    H: tl.constexpr, W: tl.constexpr,
-    GH: tl.constexpr, GW: tl.constexpr,
-    HAS_BIAS: tl.constexpr, DECAY: tl.constexpr, V_TH: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr,
+def fused_ag_conv3x3_lif_8x16(
+    x_ptr,
+    w_cl_ptr,
+    bias_ptr,
+    ag_count_ptr,
+    ag_list_ptr,
+    v_prev_ptr,
+    spike_ptr,
+    v_next_ptr,
+    N_val,
+    C_IN: tl.constexpr,
+    C_OUT: tl.constexpr,
+    H: tl.constexpr,
+    W: tl.constexpr,
+    GH: tl.constexpr,
+    GW: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    DECAY: tl.constexpr,
+    RECIP_TAU: tl.constexpr,
+    V_TH: tl.constexpr,
+    HAS_V_RESET: tl.constexpr,
+    V_RESET: tl.constexpr,
+    GROUP_SIZE_C: tl.constexpr,
+    MAX_AG: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
 ):
-    # Body identical to 8x8 — autotuner handles BH=8,BW=16
     tile_id = tl.program_id(0)
     pid_cout = tl.program_id(1)
+
     total_tiles = N_val * GH * GW
     if tile_id >= total_tiles:
         return
-    gw_idx = tile_id % GW; tmp = tile_id // GW
-    gh_idx = tmp % GH; n_idx = tmp // GH
-    c_out_start = pid_cout * BLOCK_N
-    offs_n = c_out_start + tl.arange(0, BLOCK_N); n_mask = offs_n < C_OUT
+
+    gw_idx = tile_id % GW
+    tmp = tile_id // GW
+    gh_idx = tmp % GH
+    n_idx = tmp // GH
+
+    offs_n = pid_cout * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < C_OUT
+
     offs_m = tl.arange(0, BLOCK_M)
     out_h = gh_idx * BLOCK_H + offs_m // BLOCK_W
     out_w = gw_idx * BLOCK_W + offs_m % BLOCK_W
     m_mask = (out_h < H) & (out_w < W)
+
     HW: tl.constexpr = H * W
-    tile_start = tl.load(tile_ptr_data + tile_id)
-    tile_end = tl.load(tile_ptr_data + tile_id + 1)
-    active_K = tile_end - tile_start
+    W_CS: tl.constexpr = C_IN
+    W_KH: tl.constexpr = 3 * C_IN
+    W_CO: tl.constexpr = 9 * C_IN
+
+    active_count = tl.load(ag_count_ptr + tile_id)
+    list_base = tile_id * MAX_AG
+
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    W_CIN_STRIDE: tl.constexpr = C_IN
-    W_KH_STRIDE: tl.constexpr = 3 * C_IN
-    W_CO_STRIDE: tl.constexpr = 9 * C_IN
-    k_start = 0
-    while k_start < active_K:
-        offs_k = k_start + tl.arange(0, BLOCK_K); k_mask = offs_k < active_K
-        cin_global = tl.load(tile_cin_ptr + tile_start + offs_k, mask=k_mask, other=0)
+
+    g_idx = 0
+    while g_idx < active_count:
+        gid = tl.load(ag_list_ptr + list_base + g_idx)
+        cin_start = gid * GROUP_SIZE_C
+        offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+        k_mask = offs_k < C_IN
+
         for kh in tl.static_range(3):
             for kw in tl.static_range(3):
-                in_h = out_h + (kh - 1); in_w = out_w + (kw - 1)
-                h_ok = (in_h >= 0) & (in_h < H); w_ok = (in_w >= 0) & (in_w < W)
+                in_h = out_h + (kh - 1)
+                in_w = out_w + (kw - 1)
+                h_ok = (in_h >= 0) & (in_h < H)
+                w_ok = (in_w >= 0) & (in_w < W)
                 safe_h = tl.minimum(tl.maximum(in_h, 0), H - 1)
                 safe_w = tl.minimum(tl.maximum(in_w, 0), W - 1)
-                x_addrs = x_ptr + (n_idx * C_IN + cin_global[None, :]) * HW + safe_h[:, None] * W + safe_w[:, None]
-                x_lm = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
-                x_tile = tl.load(x_addrs, mask=x_lm, other=0.0).to(tl.float16)
-                w_addrs = w_cl_ptr + offs_n[None, :] * W_CO_STRIDE + kh * W_KH_STRIDE + kw * W_CIN_STRIDE + cin_global[:, None]
-                w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+
+                x_addrs = (
+                    x_ptr
+                    + (n_idx * C_IN + offs_k[None, :]) * HW
+                    + safe_h[:, None] * W
+                    + safe_w[:, None]
+                )
+                x_mask = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
+                x_tile = tl.load(x_addrs, mask=x_mask, other=0.0).to(tl.float16)
+
+                w_addrs = (
+                    w_cl_ptr
+                    + offs_n[None, :] * W_CO
+                    + kh * W_KH
+                    + kw * W_CS
+                    + offs_k[:, None]
+                )
+                w_mask = k_mask[:, None] & n_mask[None, :]
+                w_tile = tl.load(w_addrs, mask=w_mask, other=0.0).to(tl.float16)
+
                 acc += tl.dot(x_tile, w_tile)
-        k_start += BLOCK_K
+
+        g_idx += 1
+
     if HAS_BIAS:
         acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
-    out_addrs = (n_idx * C_OUT + offs_n[None, :]) * HW + out_h[:, None] * W + out_w[:, None]
-    out_mask = m_mask[:, None] & n_mask[None, :]
-    v_prev = tl.load(v_prev_ptr + out_addrs, mask=out_mask, other=0.0)
-    v_temp = v_prev * DECAY + acc
-    spike = (v_temp > V_TH).to(tl.float32)
-    tl.store(spike_ptr + out_addrs, spike, mask=out_mask)
-    tl.store(v_next_ptr + out_addrs, v_temp * (1.0 - spike), mask=out_mask)
+
+    oa = (n_idx * C_OUT + offs_n[None, :]) * HW + out_h[:, None] * W + out_w[:, None]
+    om = m_mask[:, None] & n_mask[None, :]
+
+    vp = tl.load(v_prev_ptr + oa, mask=om, other=0.0)
+    vt = vp * DECAY + acc * RECIP_TAU
+    sp = (vt >= V_TH).to(tl.float32)
+
+    if HAS_V_RESET:
+        v_reset_tensor = vt * 0.0 + V_RESET
+        vn = tl.where(sp > 0.0, v_reset_tensor, vt)
+    else:
+        vn = vt - sp * V_TH
+
+    tl.store(spike_ptr + oa, sp, mask=om)
+    tl.store(v_next_ptr + oa, vn, mask=om)
 
 
-@autotune(configs=_FUSED_1X1_CONFIGS_8x8,
-          key=['C_IN', 'C_OUT', 'H', 'W', 'GH', 'GW'])
-@triton.jit
-def fused_conv1x1_lif_kernel_8x8(
-    x_ptr, w_ptr, bias_ptr, tile_ptr_data, tile_cin_ptr,
-    v_prev_ptr, spike_ptr, v_next_ptr, N_val,
-    C_IN: tl.constexpr, C_OUT: tl.constexpr,
-    H: tl.constexpr, W: tl.constexpr,
-    GH: tl.constexpr, GW: tl.constexpr,
-    HAS_BIAS: tl.constexpr, DECAY: tl.constexpr, V_TH: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr,
-):
-    tile_id = tl.program_id(0); pid_cout = tl.program_id(1)
-    total_tiles = N_val * GH * GW
-    if tile_id >= total_tiles: return
-    gw_idx = tile_id % GW; tmp = tile_id // GW
-    gh_idx = tmp % GH; n_idx = tmp // GH
-    offs_n = pid_cout * BLOCK_N + tl.arange(0, BLOCK_N); n_mask = offs_n < C_OUT
-    offs_m = tl.arange(0, BLOCK_M)
-    out_h = gh_idx * BLOCK_H + offs_m // BLOCK_W
-    out_w = gw_idx * BLOCK_W + offs_m % BLOCK_W
-    m_mask = (out_h < H) & (out_w < W)
-    safe_h = tl.minimum(out_h, H - 1); safe_w = tl.minimum(out_w, W - 1)
-    HW: tl.constexpr = H * W
-    tile_start = tl.load(tile_ptr_data + tile_id)
-    active_K = tl.load(tile_ptr_data + tile_id + 1) - tile_start
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    k_start = 0
-    while k_start < active_K:
-        offs_k = k_start + tl.arange(0, BLOCK_K); k_mask = offs_k < active_K
-        cin_g = tl.load(tile_cin_ptr + tile_start + offs_k, mask=k_mask, other=0)
-        x_tile = tl.load(x_ptr + (n_idx * C_IN + cin_g[None, :]) * HW + safe_h[:, None] * W + safe_w[:, None],
-                         mask=k_mask[None, :] & m_mask[:, None], other=0.0).to(tl.float16)
-        w_tile = tl.load(w_ptr + offs_n[None, :] * C_IN + cin_g[:, None],
-                         mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
-        acc += tl.dot(x_tile, w_tile)
-        k_start += BLOCK_K
-    if HAS_BIAS:
-        acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
-    out_addrs = (n_idx * C_OUT + offs_n[None, :]) * HW + out_h[:, None] * W + out_w[:, None]
-    out_mask = m_mask[:, None] & n_mask[None, :]
-    v_prev = tl.load(v_prev_ptr + out_addrs, mask=out_mask, other=0.0)
-    v_temp = v_prev * DECAY + acc
-    spike = (v_temp > V_TH).to(tl.float32)
-    tl.store(spike_ptr + out_addrs, spike, mask=out_mask)
-    tl.store(v_next_ptr + out_addrs, v_temp * (1.0 - spike), mask=out_mask)
-
-
-@autotune(configs=_FUSED_1X1_CONFIGS_8x16,
-          key=['C_IN', 'C_OUT', 'H', 'W', 'GH', 'GW'])
-@triton.jit
-def fused_conv1x1_lif_kernel_8x16(
-    x_ptr, w_ptr, bias_ptr, tile_ptr_data, tile_cin_ptr,
-    v_prev_ptr, spike_ptr, v_next_ptr, N_val,
-    C_IN: tl.constexpr, C_OUT: tl.constexpr,
-    H: tl.constexpr, W: tl.constexpr,
-    GH: tl.constexpr, GW: tl.constexpr,
-    HAS_BIAS: tl.constexpr, DECAY: tl.constexpr, V_TH: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr,
-):
-    tile_id = tl.program_id(0); pid_cout = tl.program_id(1)
-    total_tiles = N_val * GH * GW
-    if tile_id >= total_tiles: return
-    gw_idx = tile_id % GW; tmp = tile_id // GW
-    gh_idx = tmp % GH; n_idx = tmp // GH
-    offs_n = pid_cout * BLOCK_N + tl.arange(0, BLOCK_N); n_mask = offs_n < C_OUT
-    offs_m = tl.arange(0, BLOCK_M)
-    out_h = gh_idx * BLOCK_H + offs_m // BLOCK_W
-    out_w = gw_idx * BLOCK_W + offs_m % BLOCK_W
-    m_mask = (out_h < H) & (out_w < W)
-    safe_h = tl.minimum(out_h, H - 1); safe_w = tl.minimum(out_w, W - 1)
-    HW: tl.constexpr = H * W
-    tile_start = tl.load(tile_ptr_data + tile_id)
-    active_K = tl.load(tile_ptr_data + tile_id + 1) - tile_start
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    k_start = 0
-    while k_start < active_K:
-        offs_k = k_start + tl.arange(0, BLOCK_K); k_mask = offs_k < active_K
-        cin_g = tl.load(tile_cin_ptr + tile_start + offs_k, mask=k_mask, other=0)
-        x_tile = tl.load(x_ptr + (n_idx * C_IN + cin_g[None, :]) * HW + safe_h[:, None] * W + safe_w[:, None],
-                         mask=k_mask[None, :] & m_mask[:, None], other=0.0).to(tl.float16)
-        w_tile = tl.load(w_ptr + offs_n[None, :] * C_IN + cin_g[:, None],
-                         mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
-        acc += tl.dot(x_tile, w_tile)
-        k_start += BLOCK_K
-    if HAS_BIAS:
-        acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
-    out_addrs = (n_idx * C_OUT + offs_n[None, :]) * HW + out_h[:, None] * W + out_w[:, None]
-    out_mask = m_mask[:, None] & n_mask[None, :]
-    v_prev = tl.load(v_prev_ptr + out_addrs, mask=out_mask, other=0.0)
-    v_temp = v_prev * DECAY + acc
-    spike = (v_temp > V_TH).to(tl.float32)
-    tl.store(spike_ptr + out_addrs, spike, mask=out_mask)
-    tl.store(v_next_ptr + out_addrs, v_temp * (1.0 - spike), mask=out_mask)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Python entry
-# ═══════════════════════════════════════════════════════════════════════
-
-def fused_sparse_conv_lif_forward(
-    x, weight, bias, v_prev,
-    kernel_size=3, decay=0.5, v_threshold=1.0, threshold=1e-6,
-    w_cl=None, counts_buf=None, tile_cin_buf=None,
+def sparse_fused_conv_lif_forward(
+    x,
+    v_prev,
+    weight,
+    bias,
+    tau=2.0,
+    v_threshold=1.0,
+    v_reset=0.0,
+    decay_input=True,
+    block_size=None,
+    kernel_size=3,
+    threshold=1e-6,
+    w_cl=None,
+    counts_buf=None,       # 兼容旧接口，忽略
+    tile_cin_buf=None,     # 兼容旧接口，忽略
+    group_flags_buf=None,  # 兼容旧接口，忽略
+    ag_count_buf=None,
+    ag_list_buf=None,
     return_ms=False,
+    fallback_ratio=FALLBACK_RATIO,
+    return_avg_active_ratio=False,
 ):
-    """
-    Fused Sparse Conv + LIF. Reuses conv2d.py prescan infrastructure.
-
-    Returns: (spike_out, v_next, sparse_ms)
-    """
-    from Kernels.conv2d import _select_tile_sizes, _build_tile_csr
+    import torch.nn.functional as Fn
 
     N, C_IN, H, W = x.shape
     C_OUT = weight.shape[0]
@@ -323,8 +323,8 @@ def fused_sparse_conv_lif_forward(
     GH = triton.cdiv(H, BH)
     GW = triton.cdiv(W, BW)
     N_TILES = N * GH * GW
-
-    x_f16 = x.half().contiguous()
+    NUM_GROUPS = triton.cdiv(C_IN, GROUP_SIZE)
+    MAX_AG = NUM_GROUPS
 
     if w_cl is not None:
         w_cl_f16 = w_cl
@@ -334,20 +334,68 @@ def fused_sparse_conv_lif_forward(
         else:
             w_cl_f16 = weight.half().reshape(C_OUT, C_IN).contiguous()
 
-    if counts_buf is None or counts_buf.numel() < N_TILES:
-        counts_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
-    if tile_cin_buf is None or tile_cin_buf.numel() < N_TILES * C_IN:
-        tile_cin_buf = torch.empty(N_TILES * C_IN, dtype=torch.int32, device=device)
+    # 1x1 直接 dense fallback
+    if kernel_size != 3:
+        y = Fn.conv2d(x, weight, bias, stride=1, padding=0).float()
+        vp = v_prev.float()
+        if decay_input:
+            vt = vp + (y - (vp - (0.0 if v_reset is None else float(v_reset)))) / float(tau)
+        else:
+            vt = vp - (vp - (0.0 if v_reset is None else float(v_reset))) / float(tau) + y
+        sp = (vt >= v_threshold).float()
+        if v_reset is None:
+            vn = vt - sp * v_threshold
+        else:
+            vn = torch.where(sp.bool(), torch.full_like(vt, float(v_reset)), vt)
+        if return_avg_active_ratio:
+            return sp, vn, 0.0, 1.0
+        return sp, vn, 0.0
 
-    tile_ptr = _build_tile_csr(
-        x_f16, N, C_IN, H, W, BH, BW, GH, GW,
-        kernel_size, threshold, counts_buf=counts_buf, tile_cin_buf=tile_cin_buf)
+    x_f16 = x.half().contiguous()
+
+    if ag_count_buf is None or ag_count_buf.numel() < N_TILES:
+        ag_count_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
+    if ag_list_buf is None or ag_list_buf.numel() < N_TILES * MAX_AG:
+        ag_list_buf = torch.empty(N_TILES * MAX_AG, dtype=torch.int32, device=device)
+
+    _build_active_group_metadata(
+        x_f16,
+        N, C_IN, H, W, BH, BW, GH, GW,
+        kernel_size,
+        threshold,
+        ag_count_buf,
+        ag_list_buf,
+    )
+
+    avg_active_ratio = None
+    if return_avg_active_ratio:
+        avg_active_ratio = (
+            ag_count_buf[:N_TILES].float().mean().item() / max(NUM_GROUPS, 1)
+        )
+
+    if (avg_active_ratio is not None and avg_active_ratio > fallback_ratio) or (
+        avg_active_ratio is None and _check_dense_fallback(ag_count_buf, N_TILES, NUM_GROUPS, fallback_ratio)
+    ):
+        y = Fn.conv2d(x, weight, bias, stride=1, padding=1).float()
+        vp = v_prev.float()
+        if decay_input:
+            vt = vp + (y - (vp - (0.0 if v_reset is None else float(v_reset)))) / float(tau)
+        else:
+            vt = vp - (vp - (0.0 if v_reset is None else float(v_reset))) / float(tau) + y
+        sp = (vt >= v_threshold).float()
+        if v_reset is None:
+            vn = vt - sp * v_threshold
+        else:
+            vn = torch.where(sp.bool(), torch.full_like(vt, float(v_reset)), vt)
+        if return_avg_active_ratio:
+            return sp, vn, 0.0, avg_active_ratio
+        return sp, vn, 0.0
 
     has_bias = bias is not None
     bias_f32 = bias.float().contiguous() if has_bias else torch.empty(1, device=device)
     v_prev_f32 = v_prev.float().contiguous()
-    spike_out = torch.zeros(N, C_OUT, H, W, dtype=torch.float32, device=device)
-    v_next = torch.zeros(N, C_OUT, H, W, dtype=torch.float32, device=device)
+    spike_out = torch.empty(N, C_OUT, H, W, dtype=torch.float32, device=device)
+    v_next = torch.empty(N, C_OUT, H, W, dtype=torch.float32, device=device)
 
     sparse_ms = 0.0
     if return_ms:
@@ -356,21 +404,33 @@ def fused_sparse_conv_lif_forward(
         se.record()
 
     def _grid(META):
-        return (N_TILES, triton.cdiv(C_OUT, META['BLOCK_N']))
+        return (N_TILES, triton.cdiv(C_OUT, META["BLOCK_N"]))
 
-    if BW == 16:
-        _k3x3 = fused_conv3x3_lif_kernel_8x16
-        _k1x1 = fused_conv1x1_lif_kernel_8x16
-    else:
-        _k3x3 = fused_conv3x3_lif_kernel_8x8
-        _k1x1 = fused_conv1x1_lif_kernel_8x8
+    decay = 1.0 - 1.0 / float(tau)
+    recip_tau = 1.0 / float(tau)
+    has_v_reset = v_reset is not None
+    v_reset_val = 0.0 if v_reset is None else float(v_reset)
 
-    kfn = _k3x3 if kernel_size == 3 else _k1x1
-    kfn[_grid](
-        x_f16, w_cl_f16, bias_f32, tile_ptr, tile_cin_buf,
-        v_prev_f32, spike_out, v_next, N,
+    kernel = fused_ag_conv3x3_lif_8x16 if BW == 16 else fused_ag_conv3x3_lif_8x8
+    kernel[_grid](
+        x_f16,
+        w_cl_f16,
+        bias_f32,
+        ag_count_buf,
+        ag_list_buf,
+        v_prev_f32,
+        spike_out,
+        v_next,
+        N,
         C_IN, C_OUT, H, W, GH, GW,
-        HAS_BIAS=has_bias, DECAY=decay, V_TH=v_threshold,
+        HAS_BIAS=has_bias,
+        DECAY=decay,
+        RECIP_TAU=recip_tau,
+        V_TH=float(v_threshold),
+        HAS_V_RESET=has_v_reset,
+        V_RESET=v_reset_val,
+        GROUP_SIZE_C=GROUP_SIZE,
+        MAX_AG=MAX_AG,
     )
 
     if return_ms:
@@ -378,4 +438,6 @@ def fused_sparse_conv_lif_forward(
         torch.cuda.synchronize(device)
         sparse_ms = se.elapsed_time(ee)
 
+    if return_avg_active_ratio:
+        return spike_out, v_next, sparse_ms, avg_active_ratio
     return spike_out, v_next, sparse_ms
