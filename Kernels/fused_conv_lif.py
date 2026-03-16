@@ -319,9 +319,14 @@ def sparse_fused_conv_lif_forward(
     C_OUT = weight.shape[0]
     device = x.device
 
-    BH, BW = _select_tile_sizes(H, W)
-    GH = triton.cdiv(H, BH)
-    GW = triton.cdiv(W, BW)
+    stride = 1
+    padding = 1 if kernel_size == 3 else 0
+    H_OUT = (H + 2 * padding - kernel_size) // stride + 1
+    W_OUT = (W + 2 * padding - kernel_size) // stride + 1
+
+    BH, BW = _select_tile_sizes(H_OUT, W_OUT)
+    GH = triton.cdiv(H_OUT, BH)
+    GW = triton.cdiv(W_OUT, BW)
     N_TILES = N * GH * GW
     NUM_GROUPS = triton.cdiv(C_IN, GROUP_SIZE)
     MAX_AG = NUM_GROUPS
@@ -360,8 +365,19 @@ def sparse_fused_conv_lif_forward(
 
     _build_active_group_metadata(
         x_f16,
-        N, C_IN, H, W, BH, BW, GH, GW,
+        N,
+        C_IN,
+        H,
+        W,
+        H_OUT,
+        W_OUT,
+        BH,
+        BW,
+        GH,
+        GW,
         kernel_size,
+        stride,
+        padding,
         threshold,
         ag_count_buf,
         ag_list_buf,
@@ -394,8 +410,8 @@ def sparse_fused_conv_lif_forward(
     has_bias = bias is not None
     bias_f32 = bias.float().contiguous() if has_bias else torch.empty(1, device=device)
     v_prev_f32 = v_prev.float().contiguous()
-    spike_out = torch.empty(N, C_OUT, H, W, dtype=torch.float32, device=device)
-    v_next = torch.empty(N, C_OUT, H, W, dtype=torch.float32, device=device)
+    spike_out = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=torch.float32, device=device)
+    v_next = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=torch.float32, device=device)
 
     sparse_ms = 0.0
     if return_ms:
@@ -422,7 +438,7 @@ def sparse_fused_conv_lif_forward(
         spike_out,
         v_next,
         N,
-        C_IN, C_OUT, H, W, GH, GW,
+        C_IN, C_OUT, H_OUT, W_OUT, GH, GW,
         HAS_BIAS=has_bias,
         DECAY=decay,
         RECIP_TAU=recip_tau,

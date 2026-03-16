@@ -9,3 +9,5 @@ python Benchmark/bench_e2e.py --model resnet18 --dataset cifar10 --T 4 --layer_p
 
 # Fused + 逐层 profiling + 自定义 profile batch 数
 python Benchmark/bench_e2e.py --model resnet50 --dataset cifar100 --T 16 --fused --layer_profile --profile_batches 50
+
+python bench_e2e.py   --model resnet152 --dataset cifar10 --T 4   --v_threshold 1.0 --gpu 1 --batch_size 8   --inspect_spikes --inspect_logits --layer_profile   --profile_batches 20   --spike_mode raw_bernoulli   --disable_static_zero

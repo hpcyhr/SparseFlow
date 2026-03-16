@@ -6,9 +6,42 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 import math
+import time
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+@dataclass
+class _ProfileStats:
+    calls: int = 0
+    zero_path_hits: int = 0
+    sparse_path_hits: int = 0
+    dense_path_hits: int = 0
+    triton_supported_calls: int = 0
+
+    total_ms: float = 0.0
+    zero_check_ms: float = 0.0
+    policy_ms: float = 0.0
+    reshape_ms: float = 0.0
+    buffer_ms: float = 0.0
+    sparse_kernel_ms: float = 0.0
+    dense_fallback_ms: float = 0.0
+    output_pack_ms: float = 0.0
+
+    last_path: str = "none"
+    last_total_ms: float = 0.0
+    last_zero_check_ms: float = 0.0
+    last_policy_ms: float = 0.0
+    last_reshape_ms: float = 0.0
+    last_buffer_ms: float = 0.0
+    last_sparse_kernel_ms: float = 0.0
+    last_dense_fallback_ms: float = 0.0
+    last_output_pack_ms: float = 0.0
+    last_avg_active_ratio: float = -1.0
 
 
 class SparseConv2d(nn.Module):
@@ -25,6 +58,12 @@ class SparseConv2d(nn.Module):
         block_size=None,
         threshold=1e-6,
         return_ms=False,
+        dense_threshold: float = 0.85,
+        warmup_steps: int = 8,
+        calib_every: int = 32,
+        ema_decay: float = 0.9,
+        zero_streak_needed: int = 2,
+        profile_runtime: bool = False,
     ):
         super().__init__()
 
@@ -51,6 +90,7 @@ class SparseConv2d(nn.Module):
             self.register_parameter("bias", None)
 
         self._last_sparse_ms = 0.0
+        self._last_dense_ms = 0.0
         self._triton_available = False
         try:
             import triton  # noqa: F401
@@ -63,23 +103,97 @@ class SparseConv2d(nn.Module):
         self._ag_count_buf = None
         self._ag_list_buf = None
 
-        # 路径缓存
+        # runtime policy state
         self._force_zero = False
         self._force_dense = False
-        self._fallback_warmup_left = 4
+        self._warmup_left = int(max(0, warmup_steps))
+        self._calib_every = int(max(1, calib_every))
+        self._ema_decay = float(ema_decay)
+        self._dense_threshold = float(dense_threshold)
+        self._zero_streak_needed = int(max(1, zero_streak_needed))
+        self._zero_streak = 0
+        self._forward_count = 0
+        self._ema_active_ratio: Optional[float] = None
+        self._last_avg_active_ratio = -1.0
 
-        # 零输出模板缓存
-        # key = (device, dtype, H_out, W_out, bias_version)
-        self._zero_template_cache = {}
+        # zero-output template cache: key = (device, dtype, H_out, W_out, bias_version)
+        self._zero_template_cache: Dict[Tuple[str, str, int, int, int], torch.Tensor] = {}
+
+        # profiling
+        self.profile_runtime = bool(profile_runtime)
+        self._profile = _ProfileStats()
+
+    # -------------------------- public helpers --------------------------
+    def set_runtime_profiling(self, enabled: bool = True):
+        self.profile_runtime = bool(enabled)
+        return self
+
+    def reset_runtime_profile(self):
+        self._profile = _ProfileStats()
+
+    def get_runtime_profile(self) -> Dict[str, Any]:
+        return asdict(self._profile)
+
+    def get_runtime_profile_pretty(self) -> str:
+        p = self._profile
+        if p.calls == 0:
+            return "SparseConv2d runtime profile: no calls"
+        avg = lambda x: x / max(1, p.calls)
+        return (
+            f"SparseConv2d runtime profile\n"
+            f"  calls={p.calls}, last_path={p.last_path}\n"
+            f"  hits: zero={p.zero_path_hits}, sparse={p.sparse_path_hits}, dense={p.dense_path_hits}\n"
+            f"  avg total={avg(p.total_ms):.4f} ms, last total={p.last_total_ms:.4f} ms\n"
+            f"  avg zero_check={avg(p.zero_check_ms):.4f} ms\n"
+            f"  avg policy={avg(p.policy_ms):.4f} ms\n"
+            f"  avg reshape={avg(p.reshape_ms):.4f} ms\n"
+            f"  avg buffer={avg(p.buffer_ms):.4f} ms\n"
+            f"  avg sparse_kernel={avg(p.sparse_kernel_ms):.4f} ms\n"
+            f"  avg dense_fallback={avg(p.dense_fallback_ms):.4f} ms\n"
+            f"  avg output_pack={avg(p.output_pack_ms):.4f} ms\n"
+            f"  last avg_active_ratio={p.last_avg_active_ratio:.6f}"
+        )
+
+    # -------------------------- internal timing --------------------------
+    def _stamp(self) -> float:
+        if self.profile_runtime and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return time.perf_counter()
+
+    def _elapsed_ms(self, t0: float) -> float:
+        if self.profile_runtime and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return (time.perf_counter() - t0) * 1000.0
+
+    def _profile_add(self, field: str, ms: float):
+        if self.profile_runtime:
+            setattr(self._profile, field, getattr(self._profile, field) + ms)
+
+    def _profile_set_last(self, field: str, ms: float):
+        if self.profile_runtime:
+            setattr(self._profile, field, ms)
+
+    # -------------------------- support / cache --------------------------
+    def _supports_triton(self) -> bool:
+        if not self._triton_available:
+            return False
+        if self.dilation != (1, 1) or self.groups != 1:
+            return False
+        k = self.kernel_size
+        s = self.stride
+        p = self.padding
+        return (
+            (k == (1, 1) and s == (1, 1) and p == (0, 0))
+            or (k == (3, 3) and s == (1, 1) and p == (1, 1))
+            or (k == (3, 3) and s == (2, 2) and p == (1, 1))
+        )
 
     def _get_w_cl(self):
         ver = self.weight._version
         if self._w_cl is None or self._w_cl_version != ver:
             k = self.kernel_size[0]
             if k == 3:
-                self._w_cl = self.weight.data.half().permute(
-                    0, 2, 3, 1
-                ).contiguous()
+                self._w_cl = self.weight.data.half().permute(0, 2, 3, 1).contiguous()
             else:
                 self._w_cl = self.weight.data.half().reshape(
                     self.out_channels, self.in_channels
@@ -104,9 +218,7 @@ class SparseConv2d(nn.Module):
             or self._ag_count_buf.numel() < N_TILES
             or self._ag_count_buf.device != x.device
         ):
-            self._ag_count_buf = torch.empty(
-                N_TILES, dtype=torch.int32, device=x.device
-            )
+            self._ag_count_buf = torch.empty(N_TILES, dtype=torch.int32, device=x.device)
 
         needed_list = N_TILES * MAX_AG
         if (
@@ -114,9 +226,7 @@ class SparseConv2d(nn.Module):
             or self._ag_list_buf.numel() < needed_list
             or self._ag_list_buf.device != x.device
         ):
-            self._ag_list_buf = torch.empty(
-                needed_list, dtype=torch.int32, device=x.device
-            )
+            self._ag_list_buf = torch.empty(needed_list, dtype=torch.int32, device=x.device)
 
         return self._ag_count_buf, self._ag_list_buf
 
@@ -132,16 +242,13 @@ class SparseConv2d(nn.Module):
     def _get_zero_template(self, device, dtype, H_out, W_out):
         bias_ver = -1 if self.bias is None else self.bias._version
         key = (str(device), str(dtype), H_out, W_out, bias_ver)
-
         if key not in self._zero_template_cache:
             template = torch.zeros(
-                1, self.out_channels, H_out, W_out,
-                dtype=dtype, device=device
+                1, self.out_channels, H_out, W_out, dtype=dtype, device=device
             )
             if self.bias is not None:
                 template += self.bias.detach().to(dtype=dtype, device=device).view(1, -1, 1, 1)
             self._zero_template_cache[key] = template
-
         return self._zero_template_cache[key]
 
     def _zero_output_4d(self, x):
@@ -154,6 +261,7 @@ class SparseConv2d(nn.Module):
             W_out=W_out,
         )
         self._last_sparse_ms = 0.0
+        self._last_dense_ms = 0.0
         return template.expand(N, -1, -1, -1)
 
     def _zero_output_5d(self, x):
@@ -166,6 +274,7 @@ class SparseConv2d(nn.Module):
             W_out=W_out,
         )
         self._last_sparse_ms = 0.0
+        self._last_dense_ms = 0.0
         return template.expand(T * B, -1, -1, -1).reshape(
             T, B, self.out_channels, H_out, W_out
         )
@@ -177,6 +286,7 @@ class SparseConv2d(nn.Module):
         block_size=None,
         threshold: float = 1e-6,
         return_ms: bool = False,
+        **kwargs,
     ) -> "SparseConv2d":
         sparse_conv = cls(
             in_channels=conv.in_channels,
@@ -190,62 +300,184 @@ class SparseConv2d(nn.Module):
             block_size=block_size,
             threshold=threshold,
             return_ms=return_ms,
+            **kwargs,
         )
         sparse_conv.weight.data.copy_(conv.weight.data)
         if conv.bias is not None:
             sparse_conv.bias.data.copy_(conv.bias.data)
         return sparse_conv.to(conv.weight.device)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 零路径优先，直接绕过 flatten / kernel / buffer
-        if self._force_zero:
-            if x.dim() == 5:
-                return self._zero_output_5d(x)
-            elif x.dim() == 4:
-                return self._zero_output_4d(x)
-            else:
-                raise ValueError(f"Expected 4D or 5D input, got {x.dim()}D")
+    # -------------------------- policy --------------------------
+    def _maybe_zero_fast_path(self, x: torch.Tensor) -> bool:
+        return bool(torch.count_nonzero(x).item() == 0)
 
-        reshaped = False
-        if x.dim() == 5:
-            T, B, C, H, W = x.shape
-            x = x.reshape(T * B, C, H, W)
-            reshaped = True
+    def _should_collect_ratio(self) -> bool:
+        if self._warmup_left > 0:
+            return True
+        return (self._forward_count % self._calib_every) == 0
 
-        use_triton = (
-            self._triton_available
-            and x.is_cuda
-            and self.stride == (1, 1)
-            and self.dilation == (1, 1)
-            and self.groups == 1
-            and self.kernel_size in [(3, 3), (1, 1)]
+    def _update_policy(self, avg_active_ratio: Optional[float]):
+        if avg_active_ratio is None:
+            return
+
+        self._last_avg_active_ratio = float(avg_active_ratio)
+        if self._ema_active_ratio is None:
+            self._ema_active_ratio = float(avg_active_ratio)
+        else:
+            self._ema_active_ratio = (
+                self._ema_decay * self._ema_active_ratio
+                + (1.0 - self._ema_decay) * float(avg_active_ratio)
+            )
+
+        if avg_active_ratio == 0.0:
+            self._zero_streak += 1
+        else:
+            self._zero_streak = 0
+
+        self._force_zero = self._zero_streak >= self._zero_streak_needed
+        self._force_dense = (self._ema_active_ratio is not None) and (
+            self._ema_active_ratio > self._dense_threshold
         )
 
-        if use_triton:
-            y = self._triton_forward(x)
+        if self._warmup_left > 0:
+            self._warmup_left -= 1
+
+    # -------------------------- execution --------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() not in (4, 5):
+            raise ValueError(f"Expected 4D or 5D input, got {x.dim()}D")
+
+        if self.profile_runtime:
+            self._profile.calls += 1
+            t_total = self._stamp()
         else:
-            y = self._fallback_forward(x)
+            t_total = 0.0
+
+        # very fast zero check / forced-zero path
+        if self.profile_runtime:
+            t0 = self._stamp()
+        if self._force_zero:
+            y = self._zero_output_5d(x) if x.dim() == 5 else self._zero_output_4d(x)
+            if self.profile_runtime:
+                ms = self._elapsed_ms(t0)
+                self._profile_add("zero_check_ms", ms)
+                self._profile_set_last("last_zero_check_ms", ms)
+                self._profile.zero_path_hits += 1
+                self._profile.last_path = "zero(force)"
+                total_ms = self._elapsed_ms(t_total)
+                self._profile_add("total_ms", total_ms)
+                self._profile_set_last("last_total_ms", total_ms)
+            return y
+
+        is_zero = self._maybe_zero_fast_path(x)
+        if self.profile_runtime:
+            ms = self._elapsed_ms(t0)
+            self._profile_add("zero_check_ms", ms)
+            self._profile_set_last("last_zero_check_ms", ms)
+        if is_zero:
+            self._force_zero = True
+            y = self._zero_output_5d(x) if x.dim() == 5 else self._zero_output_4d(x)
+            if self.profile_runtime:
+                self._profile.zero_path_hits += 1
+                self._profile.last_path = "zero(runtime)"
+                total_ms = self._elapsed_ms(t_total)
+                self._profile_add("total_ms", total_ms)
+                self._profile_set_last("last_total_ms", total_ms)
+            return y
+
+        # reshape T,B to TB for conv-like stateless execution
+        reshaped = False
+        if self.profile_runtime:
+            t0 = self._stamp()
+        if x.dim() == 5:
+            T, B, C, H, W = x.shape
+            x4d = x.reshape(T * B, C, H, W)
+            reshaped = True
+        else:
+            x4d = x
+        if self.profile_runtime:
+            ms = self._elapsed_ms(t0)
+            self._profile_add("reshape_ms", ms)
+            self._profile_set_last("last_reshape_ms", ms)
+
+        use_triton = self._supports_triton() and x4d.is_cuda
+        if self.profile_runtime and use_triton:
+            self._profile.triton_supported_calls += 1
+
+        if self.profile_runtime:
+            t0 = self._stamp()
+        avg_active_ratio = None
+        need_ratio = use_triton and self._should_collect_ratio() and (not self._force_dense)
+        if self.profile_runtime:
+            ms = self._elapsed_ms(t0)
+            self._profile_add("policy_ms", ms)
+            self._profile_set_last("last_policy_ms", ms)
+
+        self._forward_count += 1
+
+        if use_triton and not self._force_dense:
+            y4d, avg_active_ratio = self._triton_forward(x4d, need_ratio=need_ratio)
+            path = "sparse"
+            if self.profile_runtime:
+                self._profile.sparse_path_hits += 1
+        else:
+            y4d = self._fallback_forward(x4d)
+            path = "dense"
+            if self.profile_runtime:
+                self._profile.dense_path_hits += 1
+
+        if self.profile_runtime:
+            self._profile.last_avg_active_ratio = self._last_avg_active_ratio
+
+        # policy update happens after we have a measured ratio
+        if self.profile_runtime:
+            t0 = self._stamp()
+        self._update_policy(avg_active_ratio)
+        if self.profile_runtime:
+            ms = self._elapsed_ms(t0)
+            self._profile_add("policy_ms", ms)
+            self._profile_set_last("last_policy_ms", self._profile.last_policy_ms + ms)
+
+        if self._force_zero and avg_active_ratio == 0.0:
+            y4d = self._zero_output_4d(x4d)
+            path = "zero(promoted)"
 
         if reshaped:
-            _, C_out, H_out, W_out = y.shape
-            y = y.reshape(T, B, C_out, H_out, W_out)
+            if self.profile_runtime:
+                t0 = self._stamp()
+            _, C_out, H_out, W_out = y4d.shape
+            y = y4d.reshape(T, B, C_out, H_out, W_out)
+            if self.profile_runtime:
+                ms = self._elapsed_ms(t0)
+                self._profile_add("output_pack_ms", ms)
+                self._profile_set_last("last_output_pack_ms", ms)
+        else:
+            y = y4d
+            if self.profile_runtime:
+                self._profile_set_last("last_output_pack_ms", 0.0)
+
+        if self.profile_runtime:
+            self._profile.last_path = path
+            total_ms = self._elapsed_ms(t_total)
+            self._profile_add("total_ms", total_ms)
+            self._profile_set_last("last_total_ms", total_ms)
 
         return y
 
-    def _triton_forward(self, x):
+    def _triton_forward(self, x, need_ratio: bool = False):
         from Kernels.conv2d import sparse_conv2d_forward
 
-        if self._force_zero:
-            return self._zero_output_4d(x)
-
-        if self._force_dense:
-            return self._fallback_forward(x)
-
-        w_cl = self._get_w_cl()
+        if self.profile_runtime:
+            t0 = self._stamp()
         ag_count_buf, ag_list_buf = self._ensure_buffers(x)
-        k = self.kernel_size[0]
+        w_cl = self._get_w_cl()
+        if self.profile_runtime:
+            ms = self._elapsed_ms(t0)
+            self._profile_add("buffer_ms", ms)
+            self._profile_set_last("last_buffer_ms", ms)
 
-        if self._fallback_warmup_left > 0:
+        k = self.kernel_size[0]
+        if need_ratio:
             y, sparse_ms, avg_active_ratio = sparse_conv2d_forward(
                 x=x.contiguous(),
                 weight=self.weight,
@@ -263,47 +495,51 @@ class SparseConv2d(nn.Module):
                 return_ms=self.return_ms,
                 return_avg_active_ratio=True,
             )
-            self._last_sparse_ms = sparse_ms
+        else:
+            out = sparse_conv2d_forward(
+                x=x.contiguous(),
+                weight=self.weight,
+                bias=self.bias,
+                block_size=self.block_size,
+                kernel_size=k,
+                stride=self.stride[0],
+                padding=self.padding[0],
+                dilation=self.dilation[0],
+                groups=self.groups,
+                threshold=self.threshold,
+                w_cl=w_cl,
+                ag_count_buf=ag_count_buf,
+                ag_list_buf=ag_list_buf,
+                return_ms=self.return_ms,
+                return_avg_active_ratio=False,
+            )
+            y, sparse_ms = out
+            avg_active_ratio = None
 
-            if avg_active_ratio == 0.0:
-                self._force_zero = True
-            elif avg_active_ratio > 0.85:
-                self._force_dense = True
-
-            self._fallback_warmup_left -= 1
-
-            if self._force_zero:
-                return self._zero_output_4d(x)
-            if self._force_dense:
-                return self._fallback_forward(x)
-            return y
-
-        y, sparse_ms = sparse_conv2d_forward(
-            x=x.contiguous(),
-            weight=self.weight,
-            bias=self.bias,
-            block_size=self.block_size,
-            kernel_size=k,
-            stride=self.stride[0],
-            padding=self.padding[0],
-            dilation=self.dilation[0],
-            groups=self.groups,
-            threshold=self.threshold,
-            w_cl=w_cl,
-            ag_count_buf=ag_count_buf,
-            ag_list_buf=ag_list_buf,
-            return_ms=self.return_ms,
-            return_avg_active_ratio=False,
-        )
-        self._last_sparse_ms = sparse_ms
-        return y
+        self._last_sparse_ms = float(sparse_ms)
+        self._last_dense_ms = 0.0
+        if self.profile_runtime:
+            self._profile_add("sparse_kernel_ms", self._last_sparse_ms)
+            self._profile_set_last("last_sparse_kernel_ms", self._last_sparse_ms)
+            self._profile_set_last("last_dense_fallback_ms", 0.0)
+        return y, avg_active_ratio
 
     def _fallback_forward(self, x):
-        self._last_sparse_ms = 0.0
-        return F.conv2d(
+        if self.profile_runtime:
+            t0 = self._stamp()
+        y = F.conv2d(
             x, self.weight, self.bias,
             self.stride, self.padding, self.dilation, self.groups
         )
+        self._last_sparse_ms = 0.0
+        if self.profile_runtime:
+            self._last_dense_ms = self._elapsed_ms(t0)
+            self._profile_add("dense_fallback_ms", self._last_dense_ms)
+            self._profile_set_last("last_dense_fallback_ms", self._last_dense_ms)
+            self._profile_set_last("last_sparse_kernel_ms", 0.0)
+        else:
+            self._last_dense_ms = 0.0
+        return y
 
     def extra_repr(self):
         bs = self.block_size if self.block_size is not None else "auto"
@@ -311,5 +547,7 @@ class SparseConv2d(nn.Module):
             f"{self.in_channels}, {self.out_channels}, "
             f"kernel_size={self.kernel_size}, stride={self.stride}, "
             f"padding={self.padding}, block_size={bs}, "
-            f"return_ms={self.return_ms}, sparse=True"
+            f"return_ms={self.return_ms}, sparse=True, "
+            f"dense_threshold={self._dense_threshold}, warmup_steps={self._warmup_left}, "
+            f"calib_every={self._calib_every}, profile_runtime={self.profile_runtime}"
         )
