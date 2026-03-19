@@ -119,6 +119,13 @@ class SparseConv2d(nn.Module):
         # zero-output template cache: key = (device, dtype, H_out, W_out, bias_version)
         self._zero_template_cache: Dict[Tuple[str, str, int, int, int], torch.Tensor] = {}
 
+        # --- PATCH: host-sync zero check disabled by default (was .item()) ---
+        self._sync_zero_check = False
+
+        # --- PATCH: per-forward diagnostics, populated when collect_diag=True ---
+        self.collect_diag = False
+        self._last_diag: Dict[str, Any] = {}
+
         # profiling
         self.profile_runtime = bool(profile_runtime)
         self._profile = _ProfileStats()
@@ -309,7 +316,13 @@ class SparseConv2d(nn.Module):
 
     # -------------------------- policy --------------------------
     def _maybe_zero_fast_path(self, x: torch.Tensor) -> bool:
-        return bool(torch.count_nonzero(x).item() == 0)
+        # PATCH: .item() forces GPU->CPU sync on every forward call, serializing
+        # the pipeline (~5-20us per call). Disabled by default; the existing
+        # _force_zero policy (set during warmup) handles genuinely all-zero layers.
+        # Set self._sync_zero_check = True to re-enable for debugging.
+        if self._sync_zero_check:
+            return bool(torch.count_nonzero(x).item() == 0)
+        return False
 
     def _should_collect_ratio(self) -> bool:
         if self._warmup_left > 0:
@@ -352,6 +365,10 @@ class SparseConv2d(nn.Module):
             t_total = self._stamp()
         else:
             t_total = 0.0
+
+        # PATCH: clear diagnostics at forward entry
+        if self.collect_diag:
+            self._last_diag = {'sparse_path_executed': False}
 
         # very fast zero check / forced-zero path
         if self.profile_runtime:
@@ -522,7 +539,52 @@ class SparseConv2d(nn.Module):
             self._profile_add("sparse_kernel_ms", self._last_sparse_ms)
             self._profile_set_last("last_sparse_kernel_ms", self._last_sparse_ms)
             self._profile_set_last("last_dense_fallback_ms", 0.0)
+
+        # PATCH: collect tile/group sparsity diagnostics (behind flag)
+        if self.collect_diag:
+            self._collect_tile_group_diag(x, ag_count_buf, sparse_ms, avg_active_ratio)
+
         return y, avg_active_ratio
+
+    def _collect_tile_group_diag(self, x, ag_count_buf, sparse_ms, avg_active_ratio):
+        """Collect per-forward tile/group sparsity diagnostics.
+
+        Only called when self.collect_diag is True.
+        NOTE: does a GPU->CPU transfer — must NOT be enabled during perf timing.
+        """
+        from Kernels.conv2d import _select_tile_sizes, GROUP_SIZE
+        import triton
+
+        N, C_IN, H, W = x.shape
+        BH, BW = _select_tile_sizes(H, W)
+        GH = triton.cdiv(H, BH)
+        GW = triton.cdiv(W, BW)
+        N_TILES = N * GH * GW
+        NUM_GROUPS = triton.cdiv(C_IN, GROUP_SIZE)
+
+        counts_cpu = ag_count_buf[:N_TILES].cpu()
+
+        total_groups_all_tiles = float(N_TILES * NUM_GROUPS)
+        nonzero_groups_all_tiles = float(counts_cpu.sum().item())
+        tile_zero_count = int((counts_cpu == 0).sum().item())
+
+        agr = nonzero_groups_all_tiles / max(total_groups_all_tiles, 1.0)
+        tzr = tile_zero_count / max(N_TILES, 1)
+
+        self._last_diag = {
+            'sparse_path_executed': True,
+            'nonzero_group_count': nonzero_groups_all_tiles,
+            'total_group_count': total_groups_all_tiles,
+            'active_group_ratio': agr,
+            'tile_zero_count': tile_zero_count,
+            'total_tile_count': N_TILES,
+            'tile_zero_ratio': tzr,
+            'effective_k_ratio': agr,
+            'sparse_compute_ms': sparse_ms,
+            'sparse_total_ms': sparse_ms,
+            'zero_check_ms': -1.0,
+            'metadata_ms': -1.0,
+        }
 
     def _fallback_forward(self, x):
         if self.profile_runtime:

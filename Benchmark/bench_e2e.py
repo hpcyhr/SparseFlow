@@ -26,6 +26,7 @@ from spikingjelly.activation_based import neuron as sj_neuron
 from Ops.sparse_conv2d import SparseConv2d
 from Ops.sparse_fused_conv_lif import FusedSparseConvLIF
 from Ops.static_zero_conv2d import StaticZeroConv2d
+from Utils.layer_logger import LayerLogger
 
 
 # =============================================================================
@@ -530,9 +531,77 @@ def collect_static_zero_layers(targets, sparsity_data):
     return zero_layers
 
 
+def measure_group_sparsity(model, targets, loader, device, T, num_batches=5,
+                           spike_mode="normalized_bernoulli"):
+    """Run sparse model with collect_diag=True to gather per-layer group/tile sparsity.
+
+    Returns dict: {layer_name: {active_group_ratio, tile_zero_ratio, ...}}.
+    NOTE: syncs per layer — do NOT use during perf timing.
+    """
+    for _, mod in model.named_modules():
+        if isinstance(mod, SparseConv2d):
+            mod.collect_diag = True
+
+    batch_count = 0
+    for imgs, _ in loader:
+        if batch_count >= num_batches:
+            break
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        sj_func.reset_net(model)
+        with torch.no_grad():
+            _ = model(inp)
+        batch_count += 1
+
+    target_names = {t["name"] for t in targets}
+    group_data = {}
+    for name, mod in model.named_modules():
+        if isinstance(mod, SparseConv2d) and name in target_names:
+            diag = getattr(mod, '_last_diag', {})
+            group_data[name] = {
+                'active_group_ratio': diag.get('active_group_ratio', -1.0),
+                'tile_zero_ratio': diag.get('tile_zero_ratio', -1.0),
+                'total_group_count': diag.get('total_group_count', -1.0),
+                'nonzero_group_count': diag.get('nonzero_group_count', -1.0),
+                'tile_zero_count': diag.get('tile_zero_count', -1.0),
+                'total_tile_count': diag.get('total_tile_count', -1.0),
+                'effective_k_ratio': diag.get('effective_k_ratio', -1.0),
+                'sparse_compute_ms': diag.get('sparse_compute_ms', -1.0),
+                'sparse_total_ms': diag.get('sparse_total_ms', -1.0),
+            }
+
+    for _, mod in model.named_modules():
+        if isinstance(mod, SparseConv2d):
+            mod.collect_diag = False
+
+    return group_data
+
+
+def should_use_sparse_selective(target, group_data, args):
+    """Selective replacement heuristic. Returns True if SparseConv2d should be used."""
+    name = target["name"]
+    c_in = target.get("in_channels", 0)
+    kind = classify_target_type(target)
+
+    if args.no_sparse_1x1 and kind == "1x1/s1":
+        return False
+
+    if c_in < args.min_cin_for_sparse:
+        return False
+
+    gd = group_data.get(name, {})
+    agr = gd.get('active_group_ratio', 1.0)
+    if agr < 0:
+        agr = 1.0
+    if agr > args.max_agr_for_sparse:
+        return False
+
+    return True
+
+
 # =============================================================================
 # stage/logits 诊断
 # =============================================================================
+  
 
 def pick_stage_probe_names(model, max_probes=8):
     spike_names = [name for name, module in model.named_modules() if isinstance(module, SPIKE_OPS)]
@@ -644,6 +713,7 @@ def replace_model(
     fused=False,
     static_zero_layers=None,
     only_static_zero=False,
+    selective_sparse_set=None,
 ):
     if static_zero_layers is None:
         static_zero_layers = set()
@@ -668,6 +738,12 @@ def replace_model(
 
         # 2) only_static_zero: 非全零层保持 dense
         if only_static_zero:
+            dense_keep_count += 1
+            replaced += 1
+            continue
+
+        # 2.5) PATCH: selective sparse — skip layers not in allowed set
+        if selective_sparse_set is not None and conv_name not in selective_sparse_set:
             dense_keep_count += 1
             replaced += 1
             continue
@@ -717,6 +793,7 @@ def measure_e2e_latency(model, loader, device, T, warmup=10, max_batches=None,
 
         inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
         sj_func.reset_net(model)
+        sync()  # PATCH: drain GPU pipeline before timing
 
         start_evt = make_event()
         end_evt = make_event()
@@ -960,6 +1037,22 @@ def main():
     parser.add_argument("--disable_static_zero", action="store_true")
     parser.add_argument("--only_static_zero", action="store_true")
 
+    # --- PATCH: diagnostic and selective-replacement flags ---
+    parser.add_argument("--collect_diag", action="store_true",
+                        help="Measure per-layer group/tile sparsity (adds sync; not for perf timing)")
+    parser.add_argument("--diag_json", type=str, default="",
+                        help="Save per-layer diagnostics as JSON")
+    parser.add_argument("--diag_csv", type=str, default="",
+                        help="Save per-layer diagnostics as CSV")
+    parser.add_argument("--selective_sparse", action="store_true",
+                        help="Only use SparseConv2d where heuristics predict benefit")
+    parser.add_argument("--min_cin_for_sparse", type=int, default=128,
+                        help="Selective: minimum C_IN for SparseConv2d (default 128)")
+    parser.add_argument("--max_agr_for_sparse", type=float, default=0.5,
+                        help="Selective: max active_group_ratio for SparseConv2d (default 0.5)")
+    parser.add_argument("--no_sparse_1x1", action="store_true",
+                        help="Selective: skip SparseConv2d for 1x1 convolutions")
+
     args = parser.parse_args()
 
     if args.list_models:
@@ -1115,6 +1208,52 @@ def main():
     else:
         logits_stats = {}
 
+    # --- PATCH: selective replacement and group-sparsity diagnostics ---
+    selective_sparse_set = None
+    group_sparsity_data = {}
+
+    if args.selective_sparse or args.collect_diag:
+        print(f"\n  [Diag] Measuring group/tile sparsity ...")
+        _tmp_model = copy.deepcopy(model_baseline)
+        replace_model(
+            _tmp_model, targets, fused=args.fused,
+            static_zero_layers=static_zero_layers,
+            only_static_zero=args.only_static_zero,
+        )
+        group_sparsity_data = measure_group_sparsity(
+            _tmp_model, targets, loader, device, args.T,
+            num_batches=min(args.sparsity_batches, 5),
+            spike_mode=args.spike_mode,
+        )
+        del _tmp_model
+
+        print(f"\n  {'Layer':<40} {'AGR':>8} {'TileZR':>8} {'Groups':>8}")
+        print(f"  {'-'*68}")
+        for t in targets:
+            name = t["name"]
+            gd = group_sparsity_data.get(name, {})
+            agr = gd.get('active_group_ratio', -1.0)
+            tzr = gd.get('tile_zero_ratio', -1.0)
+            tgc = gd.get('total_group_count', -1.0)
+            short = name if len(name) <= 39 else "..." + name[-36:]
+            agr_s = f"{agr:.4f}" if agr >= 0 else "n/a"
+            tzr_s = f"{tzr:.4f}" if tzr >= 0 else "n/a"
+            tgc_s = f"{tgc:.0f}" if tgc >= 0 else "n/a"
+            print(f"  {short:<40} {agr_s:>8} {tzr_s:>8} {tgc_s:>8}")
+
+        if args.selective_sparse:
+            selective_sparse_set = set()
+            for t in targets:
+                name = t["name"]
+                if name in static_zero_layers:
+                    continue
+                if should_use_sparse_selective(t, group_sparsity_data, args):
+                    selective_sparse_set.add(name)
+            print(f"\n  [Selective] {len(selective_sparse_set)}/{len(targets)} layers "
+                  f"selected for SparseConv2d")
+            print(f"  [Selective] Thresholds: min_cin={args.min_cin_for_sparse}, "
+                  f"max_agr={args.max_agr_for_sparse}, no_1x1={args.no_sparse_1x1}")
+
     # 构建 sparse model
     model_sparse = copy.deepcopy(model_baseline)
     replaced, sparse_n, fused_n, static_zero_n, dense_keep_n = replace_model(
@@ -1123,6 +1262,7 @@ def main():
         fused=args.fused,
         static_zero_layers=static_zero_layers,
         only_static_zero=args.only_static_zero,
+        selective_sparse_set=selective_sparse_set,
     )
 
     if args.disable_static_zero and static_zero_n != 0:
@@ -1275,6 +1415,54 @@ def main():
 
     if layer_profile_data:
         results["layer_profile"] = layer_profile_data
+
+    if group_sparsity_data:
+        results["group_sparsity"] = group_sparsity_data
+
+    # --- PATCH: structured diagnostic export ---
+    if args.collect_diag and (args.diag_json or args.diag_csv):
+        run_id = f"{args.model}_{args.dataset}_T{args.T}"
+        layer_logger = LayerLogger(
+            run_id=run_id, model=args.model,
+            dataset=args.dataset, T=args.T,
+        )
+        for t in targets:
+            name = t["name"]
+            sd = sparsity_data.get(name, {"zeros": 0, "total": 1})
+            elem_sp = sd["zeros"] / max(sd["total"], 1)
+            gd = group_sparsity_data.get(name, {})
+            ishape = t.get("input_shape")
+
+            if name in static_zero_layers:
+                layer_logger.log_static_zero(layer_name=name, input_shape=ishape)
+            elif selective_sparse_set is not None and name not in selective_sparse_set:
+                layer_logger.log_dense(
+                    layer_name=name, input_shape=ishape, element_sparsity=elem_sp)
+            else:
+                layer_logger.log_layer(
+                    layer_name=name,
+                    mode_used="sparseconv",
+                    replaced=True,
+                    sparse_path_executed=gd.get('active_group_ratio', -1) >= 0,
+                    input_shape=str(ishape) if ishape else "",
+                    element_sparsity=elem_sp,
+                    nonzero_group_count=gd.get('nonzero_group_count', -1.0),
+                    total_group_count=gd.get('total_group_count', -1.0),
+                    active_group_ratio=gd.get('active_group_ratio', -1.0),
+                    tile_zero_count=gd.get('tile_zero_count', -1.0),
+                    total_tile_count=gd.get('total_tile_count', -1.0),
+                    tile_zero_ratio=gd.get('tile_zero_ratio', -1.0),
+                    effective_k_ratio=gd.get('effective_k_ratio', -1.0),
+                    sparse_compute_ms=gd.get('sparse_compute_ms', -1.0),
+                    sparse_total_ms=gd.get('sparse_total_ms', -1.0),
+                )
+        if args.diag_json:
+            layer_logger.save_json(args.diag_json)
+            print(f"  诊断 JSON 已保存到: {args.diag_json}")
+        if args.diag_csv:
+            layer_logger.save_csv(args.diag_csv)
+            print(f"  诊断 CSV 已保存到: {args.diag_csv}")
+        layer_logger.print_summary()
 
     if args.save_json:
         with open(args.save_json, "w") as f:

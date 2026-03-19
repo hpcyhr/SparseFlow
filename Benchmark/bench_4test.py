@@ -26,6 +26,7 @@ from spikingjelly.activation_based import neuron as sj_neuron
 from Ops.sparse_conv2d import SparseConv2d
 from Ops.sparse_fused_conv_lif import FusedSparseConvLIF
 from Ops.static_zero_conv2d import StaticZeroConv2d
+from Utils.layer_logger import LayerLogger
 
 
 # =============================================================================
@@ -67,60 +68,35 @@ def _discover_model_builders():
     builders = OrderedDict()
     metadata = {}
 
-    for family, module, prefix in modules:
-        for attr_name in sorted(dir(module)):
+    for family, mod, prefix in modules:
+        for attr_name in dir(mod):
             if not attr_name.startswith(prefix):
                 continue
-            fn = getattr(module, attr_name)
+            fn = getattr(mod, attr_name)
             if not callable(fn):
                 continue
-            if attr_name[0].isupper():
-                continue
-
             builders[attr_name] = fn
-            metadata[attr_name] = {
-                "family": family,
-                "module": module.__name__,
-                "builder": attr_name,
-                "canonical": attr_name,
-            }
-
-            if family in ("resnet", "vgg") and attr_name.startswith("spiking_"):
-                alias = attr_name[len("spiking_"):]
-                if alias not in builders:
-                    builders[alias] = fn
-                    metadata[alias] = {
-                        "family": family,
-                        "module": module.__name__,
-                        "builder": attr_name,
-                        "canonical": attr_name,
-                        "alias_of": attr_name,
-                    }
+            metadata[attr_name] = {"family": family, "module": mod}
 
     return builders, metadata
 
 
-MODEL_BUILDERS, MODEL_METADATA = _discover_model_builders()
+MODEL_BUILDERS, MODEL_META = _discover_model_builders()
 
 
 def print_supported_models():
-    print("Supported SpikingJelly built-in models:")
-    grouped = OrderedDict()
-    for name, meta in MODEL_METADATA.items():
-        grouped.setdefault(meta["family"], []).append(name)
-
-    for family, names in grouped.items():
-        print(f"\n[{family}]")
-        for name in names:
-            meta = MODEL_METADATA[name]
-            if "alias_of" in meta:
-                print(f"  - {name}  (alias -> {meta['alias_of']})")
-            else:
-                print(f"  - {name}")
+    print("\n支持的模型:")
+    for name in MODEL_BUILDERS:
+        print(f"  {name}")
+    print()
 
 
-def _filter_builder_kwargs(builder, candidate_kwargs):
-    sig = signature(builder)
+def _filter_builder_kwargs(builder_fn, candidate_kwargs):
+    try:
+        sig = signature(builder_fn)
+    except (ValueError, TypeError):
+        return candidate_kwargs
+
     params = sig.parameters
     accepts_var_kw = any(p.kind == p.VAR_KEYWORD for p in params.values())
 
@@ -176,59 +152,41 @@ def build_model(model_name, device, v_threshold=1.0, weight_init="random", sew_c
         "pretrained": use_pretrained,
         "progress": True,
         "spiking_neuron": sj_neuron.LIFNode,
-        "surrogate_function": sj_neuron.LIFNode().surrogate_function,
-        "detach_reset": True,
-        "num_classes": num_classes if not use_pretrained else None,
+        "v_threshold": v_threshold,
+        "num_classes": num_classes,
+        "cnf": sew_cnf,
     }
-    if model_name.startswith("sew_"):
-        builder_kwargs["cnf"] = sew_cnf
+    filtered = _filter_builder_kwargs(builder, builder_kwargs)
 
     set_random_seed(seed)
-    model = builder(**_filter_builder_kwargs(builder, builder_kwargs))
+    model = builder(**filtered)
 
     if weight_init == "random":
-        set_random_seed(seed)
         reinitialize_model_weights(model)
 
-    for m in model.modules():
-        if isinstance(m, sj_neuron.LIFNode):
-            m.v_threshold = v_threshold
-    sj_func.set_step_mode(model, step_mode="m")
     model.to(device).eval()
+    sj_func.set_step_mode(model, 'm')
     return model
 
 
 def build_dataset(dataset_name, data_root, spike_mode="normalized_bernoulli"):
-    normalize = transforms.Normalize(
-        [0.485, 0.456, 0.406],
-        [0.229, 0.224, 0.225]
-    )
-
-    if spike_mode == "normalized_bernoulli":
-        transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            normalize,
-        ])
-    else:
-        transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-        ])
-
     if dataset_name == "cifar10":
-        ds = datasets.CIFAR10(root=data_root, train=False,
-                              download=True, transform=transform)
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+        ds = datasets.CIFAR10(root=data_root, train=False, download=True, transform=transform)
     elif dataset_name == "cifar100":
-        ds = datasets.CIFAR100(root=data_root, train=False,
-                               download=True, transform=transform)
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+        ds = datasets.CIFAR100(root=data_root, train=False, download=True, transform=transform)
     else:
-        raise ValueError(f"Unsupported dataset: {dataset_name}")
+        raise ValueError(f"Unknown dataset: {dataset_name}")
     return ds
 
 
 # =============================================================================
-# 工具函数
+# 辅助
 # =============================================================================
 
 def _set_module_by_name(model, name, new_module):
@@ -403,20 +361,6 @@ def analyze_targets(model, sample_input, device, fused=False):
 
             info["reason"] = "supported"
             info["kind"] = kind
-
-            if fused:
-                lif_name, lif_module = None, None
-                for jj in range(j + 1, min(j + 6, len(module_list))):
-                    jj_name, jj_mod = module_list[jj]
-                    if isinstance(jj_mod, (nn.BatchNorm2d, nn.Identity)):
-                        continue
-                    if isinstance(jj_mod, SPIKE_OPS):
-                        lif_name = jj_name
-                        lif_module = jj_mod
-                    break
-                info["lif_name"] = lif_name
-                info["lif_module"] = lif_module
-
             targets.append(info)
             visited.add(next_name)
 
@@ -425,8 +369,6 @@ def analyze_targets(model, sample_input, device, fused=False):
 
 def print_analysis_report(targets, skipped, fused=False):
     all_candidates = targets + skipped
-    all_candidates.sort(key=lambda x: x["name"])
-
     total_conv = len(all_candidates)
     supported_n = len(targets)
     skipped_n = len(skipped)
@@ -504,11 +446,9 @@ def measure_sparsity(model, targets, loader, device, T, num_batches=10,
                     T_, B, C, H, W = x.shape
                     x = x.reshape(T_ * B, C, H, W)
 
-                # 直接在 hook 中累计统计，避免缓存整块特征图
                 sparsity_data[name]["zeros"] += (x.abs() <= 1e-6).sum().item()
                 sparsity_data[name]["total"] += x.numel()
 
-                # 显式删除局部引用，帮助尽快释放
                 del x
         return hook
 
@@ -544,6 +484,73 @@ def collect_static_zero_layers(targets, sparsity_data):
         if sd["total"] > 0 and sd["zeros"] == sd["total"]:
             zero_layers.add(name)
     return zero_layers
+
+
+def measure_group_sparsity(model, targets, loader, device, T, num_batches=5,
+                           spike_mode="normalized_bernoulli"):
+    """Run sparse model with collect_diag=True to gather per-layer group/tile sparsity.
+
+    Returns dict: {layer_name: {active_group_ratio, tile_zero_ratio, ...}}.
+    NOTE: syncs per layer — do NOT use during perf timing.
+    """
+    for _, mod in model.named_modules():
+        if isinstance(mod, SparseConv2d):
+            mod.collect_diag = True
+
+    batch_count = 0
+    for imgs, _ in loader:
+        if batch_count >= num_batches:
+            break
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        sj_func.reset_net(model)
+        with torch.no_grad():
+            _ = model(inp)
+        batch_count += 1
+
+    target_names = {t["name"] for t in targets}
+    group_data = {}
+    for name, mod in model.named_modules():
+        if isinstance(mod, SparseConv2d) and name in target_names:
+            diag = getattr(mod, '_last_diag', {})
+            group_data[name] = {
+                'active_group_ratio': diag.get('active_group_ratio', -1.0),
+                'tile_zero_ratio': diag.get('tile_zero_ratio', -1.0),
+                'total_group_count': diag.get('total_group_count', -1.0),
+                'nonzero_group_count': diag.get('nonzero_group_count', -1.0),
+                'tile_zero_count': diag.get('tile_zero_count', -1.0),
+                'total_tile_count': diag.get('total_tile_count', -1.0),
+                'effective_k_ratio': diag.get('effective_k_ratio', -1.0),
+                'sparse_compute_ms': diag.get('sparse_compute_ms', -1.0),
+                'sparse_total_ms': diag.get('sparse_total_ms', -1.0),
+            }
+
+    for _, mod in model.named_modules():
+        if isinstance(mod, SparseConv2d):
+            mod.collect_diag = False
+
+    return group_data
+
+
+def should_use_sparse_selective(target, group_data, min_cin=128, max_agr=0.5, no_1x1=False):
+    """Selective replacement heuristic. Returns True if SparseConv2d should be used."""
+    name = target["name"]
+    c_in = target.get("in_channels", 0)
+    kind = classify_target_type(target)
+
+    if no_1x1 and kind == "1x1/s1":
+        return False
+
+    if c_in < min_cin:
+        return False
+
+    gd = group_data.get(name, {})
+    agr = gd.get('active_group_ratio', 1.0)
+    if agr < 0:
+        agr = 1.0
+    if agr > max_agr:
+        return False
+
+    return True
 
 
 # =============================================================================
@@ -660,6 +667,7 @@ def replace_model(
     fused=False,
     static_zero_layers=None,
     only_static_zero=False,
+    selective_sparse_set=None,
 ):
     if static_zero_layers is None:
         static_zero_layers = set()
@@ -684,6 +692,12 @@ def replace_model(
 
         # 2) only_static_zero: 非全零层保持 dense
         if only_static_zero:
+            dense_keep_count += 1
+            replaced += 1
+            continue
+
+        # 2.5) PATCH: selective sparse — skip layers not in allowed set
+        if selective_sparse_set is not None and conv_name not in selective_sparse_set:
             dense_keep_count += 1
             replaced += 1
             continue
@@ -733,6 +747,7 @@ def measure_e2e_latency(model, loader, device, T, warmup=10, max_batches=None,
 
         inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
         sj_func.reset_net(model)
+        sync()  # PATCH: drain GPU pipeline before timing
 
         start_evt = make_event()
         end_evt = make_event()
@@ -985,7 +1000,7 @@ def print_mode_result(res):
     print(f"    {res['label']:<24}{res['avg_ms']:.2f} ms/batch  (total={res['total_ms']:.1f} ms, {res['num_batches']} batches)")
 
 
-def build_fourway_models(model_baseline, targets, static_zero_layers):
+def build_fourway_models(model_baseline, targets, static_zero_layers, selective_sparse_set=None):
     model_static_zero_only = copy.deepcopy(model_baseline)
     _, sz_only_sparse_n, _, sz_only_static_zero_n, sz_only_dense_keep_n = replace_model(
         model_static_zero_only, targets, fused=False, static_zero_layers=set(static_zero_layers), only_static_zero=True
@@ -993,12 +1008,14 @@ def build_fourway_models(model_baseline, targets, static_zero_layers):
 
     model_sparse_only = copy.deepcopy(model_baseline)
     _, sparse_only_sparse_n, _, sparse_only_static_zero_n, sparse_only_dense_keep_n = replace_model(
-        model_sparse_only, targets, fused=False, static_zero_layers=set(), only_static_zero=False
+        model_sparse_only, targets, fused=False, static_zero_layers=set(), only_static_zero=False,
+        selective_sparse_set=selective_sparse_set,
     )
 
     model_hybrid = copy.deepcopy(model_baseline)
     _, hybrid_sparse_n, _, hybrid_static_zero_n, hybrid_dense_keep_n = replace_model(
-        model_hybrid, targets, fused=False, static_zero_layers=set(static_zero_layers), only_static_zero=False
+        model_hybrid, targets, fused=False, static_zero_layers=set(static_zero_layers), only_static_zero=False,
+        selective_sparse_set=selective_sparse_set,
     )
 
     counts = {
@@ -1055,6 +1072,22 @@ def main():
         default="normalized_bernoulli",
         choices=["normalized_bernoulli", "raw_bernoulli", "raw_repeat"],
     )
+
+    # --- PATCH: diagnostic and selective-replacement flags ---
+    parser.add_argument("--collect_diag", action="store_true",
+                        help="Measure per-layer group/tile sparsity (adds sync; not for perf timing)")
+    parser.add_argument("--diag_json", type=str, default="",
+                        help="Save per-layer diagnostics as JSON")
+    parser.add_argument("--diag_csv", type=str, default="",
+                        help="Save per-layer diagnostics as CSV")
+    parser.add_argument("--selective_sparse", action="store_true",
+                        help="Only use SparseConv2d where heuristics predict benefit")
+    parser.add_argument("--min_cin_for_sparse", type=int, default=128,
+                        help="Selective: minimum C_IN for SparseConv2d (default 128)")
+    parser.add_argument("--max_agr_for_sparse", type=float, default=0.5,
+                        help="Selective: max active_group_ratio for SparseConv2d (default 0.5)")
+    parser.add_argument("--no_sparse_1x1", action="store_true",
+                        help="Selective: skip SparseConv2d for 1x1 convolutions")
 
     args = parser.parse_args()
 
@@ -1126,8 +1159,59 @@ def main():
     print(f"\n  检测到 {len(zero_layers)} 个全零输入层。")
     avg_sparsity = print_fourway_route_report(targets, sparsity_data, zero_layers)
 
+    # --- PATCH: selective replacement and group-sparsity diagnostics ---
+    selective_sparse_set = None
+    group_sparsity_data = {}
+
+    if args.selective_sparse or args.collect_diag:
+        print(f"\n  [Diag] Measuring group/tile sparsity ...")
+        _tmp_model = copy.deepcopy(model_baseline)
+        replace_model(
+            _tmp_model, targets, fused=False,
+            static_zero_layers=set(zero_layers),
+            only_static_zero=False,
+        )
+        group_sparsity_data = measure_group_sparsity(
+            _tmp_model, targets, loader, device, args.T,
+            num_batches=min(args.sparsity_batches, 5),
+            spike_mode=args.spike_mode,
+        )
+        del _tmp_model
+
+        print(f"\n  {'Layer':<40} {'AGR':>8} {'TileZR':>8} {'Groups':>8}")
+        print(f"  {'-'*68}")
+        for t in targets:
+            name = t["name"]
+            gd = group_sparsity_data.get(name, {})
+            agr = gd.get('active_group_ratio', -1.0)
+            tzr = gd.get('tile_zero_ratio', -1.0)
+            tgc = gd.get('total_group_count', -1.0)
+            short = name if len(name) <= 39 else "..." + name[-36:]
+            agr_s = f"{agr:.4f}" if agr >= 0 else "n/a"
+            tzr_s = f"{tzr:.4f}" if tzr >= 0 else "n/a"
+            tgc_s = f"{tgc:.0f}" if tgc >= 0 else "n/a"
+            print(f"  {short:<40} {agr_s:>8} {tzr_s:>8} {tgc_s:>8}")
+
+        if args.selective_sparse:
+            selective_sparse_set = set()
+            for t in targets:
+                name = t["name"]
+                if name in zero_layers:
+                    continue
+                if should_use_sparse_selective(
+                    t, group_sparsity_data,
+                    min_cin=args.min_cin_for_sparse,
+                    max_agr=args.max_agr_for_sparse,
+                    no_1x1=args.no_sparse_1x1,
+                ):
+                    selective_sparse_set.add(name)
+            print(f"\n  [Selective] {len(selective_sparse_set)}/{len(targets)} layers "
+                  f"selected for SparseConv2d")
+            print(f"  [Selective] Thresholds: min_cin={args.min_cin_for_sparse}, "
+                  f"max_agr={args.max_agr_for_sparse}, no_1x1={args.no_sparse_1x1}")
+
     model_static_zero_only, model_sparse_only, model_hybrid, route_counts = build_fourway_models(
-        model_baseline, targets, zero_layers
+        model_baseline, targets, zero_layers, selective_sparse_set=selective_sparse_set,
     )
     print(f"\n  替换完成:")
     print(f"    StaticZero-only: {route_counts['static_zero_only']['num_sparse_conv']} SparseConv2d + {route_counts['static_zero_only']['num_static_zero']} StaticZeroConv2d + {route_counts['static_zero_only']['num_dense_keep']} DenseKeep")
@@ -1255,6 +1339,54 @@ def main():
         },
     }
 
+    if group_sparsity_data:
+        results["group_sparsity"] = group_sparsity_data
+
+    # --- PATCH: structured diagnostic export ---
+    if args.collect_diag and (args.diag_json or args.diag_csv):
+        run_id = f"{args.model}_{args.dataset}_T{args.T}_fourway"
+        layer_logger = LayerLogger(
+            run_id=run_id, model=args.model,
+            dataset=args.dataset, T=args.T,
+        )
+        for t in targets:
+            name = t["name"]
+            sd = sparsity_data.get(name, {"zeros": 0, "total": 1})
+            elem_sp = sd["zeros"] / max(sd["total"], 1)
+            gd = group_sparsity_data.get(name, {})
+            ishape = t.get("input_shape")
+
+            if name in zero_layers:
+                layer_logger.log_static_zero(layer_name=name, input_shape=ishape)
+            elif selective_sparse_set is not None and name not in selective_sparse_set:
+                layer_logger.log_dense(
+                    layer_name=name, input_shape=ishape, element_sparsity=elem_sp)
+            else:
+                layer_logger.log_layer(
+                    layer_name=name,
+                    mode_used="sparseconv",
+                    replaced=True,
+                    sparse_path_executed=gd.get('active_group_ratio', -1) >= 0,
+                    input_shape=str(ishape) if ishape else "",
+                    element_sparsity=elem_sp,
+                    nonzero_group_count=gd.get('nonzero_group_count', -1.0),
+                    total_group_count=gd.get('total_group_count', -1.0),
+                    active_group_ratio=gd.get('active_group_ratio', -1.0),
+                    tile_zero_count=gd.get('tile_zero_count', -1.0),
+                    total_tile_count=gd.get('total_tile_count', -1.0),
+                    tile_zero_ratio=gd.get('tile_zero_ratio', -1.0),
+                    effective_k_ratio=gd.get('effective_k_ratio', -1.0),
+                    sparse_compute_ms=gd.get('sparse_compute_ms', -1.0),
+                    sparse_total_ms=gd.get('sparse_total_ms', -1.0),
+                )
+        if args.diag_json:
+            layer_logger.save_json(args.diag_json)
+            print(f"  诊断 JSON 已保存到: {args.diag_json}")
+        if args.diag_csv:
+            layer_logger.save_csv(args.diag_csv)
+            print(f"  诊断 CSV 已保存到: {args.diag_csv}")
+        layer_logger.print_summary()
+
     if args.save_json:
         out_path = args.save_json
     else:
@@ -1266,12 +1398,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# 查看支持的模型
-# python bench_4test.py --list_models
-
-# python bench_4test.py --model resnet18 --dataset cifar10 --T 4 --gpu 0
-
-# python bench_4test.py --model vgg16_bn --dataset cifar10 --T 4 --gpu 0
-
-# python bench_4test.py --model sew_resnet18 --dataset cifar10 --T 4 --gpu 0 --sew_cnf ADD
