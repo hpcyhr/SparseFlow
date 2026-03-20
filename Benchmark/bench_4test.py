@@ -43,7 +43,7 @@ TRANSPARENT_TYPES = (
     nn.ReLU, nn.ReLU6, nn.LeakyReLU,
 )
 
-MIN_SPATIAL_SIZE = 8
+MIN_SPATIAL_SIZE = 4
 
 
 def sync():
@@ -270,7 +270,7 @@ def route_label(info, static_zero_layers, disable_static_zero, only_static_zero)
 # 网络分析
 # =============================================================================
 
-def analyze_targets(model, sample_input, device, fused=False):
+def analyze_targets(model, sample_input, device, fused=False, min_spatial_size=MIN_SPATIAL_SIZE):
     input_shapes = {}
     hooks = []
 
@@ -346,7 +346,7 @@ def analyze_targets(model, sample_input, device, fused=False):
                 visited.add(next_name)
                 continue
 
-            if min(H, W) < MIN_SPATIAL_SIZE:
+            if min(H, W) < min_spatial_size:
                 info["reason"] = "small_feature_map"
                 skipped.append(info)
                 visited.add(next_name)
@@ -1088,6 +1088,8 @@ def main():
                         help="Selective: max active_group_ratio for SparseConv2d (default 0.5)")
     parser.add_argument("--no_sparse_1x1", action="store_true",
                         help="Selective: skip SparseConv2d for 1x1 convolutions")
+    parser.add_argument("--min_spatial_size", type=int, default=4,
+                        help="Minimum feature-map spatial size allowed for replacement candidates (default: 4)")
 
     args = parser.parse_args()
 
@@ -1124,6 +1126,7 @@ def main():
     print(f"  Weight init:  {args.weight_init}")
     print(f"  Seed:         {args.seed}")
     print(f"  Power (TDP):  {args.power} W")
+    print(f"  Min spatial:  {args.min_spatial_size}x{args.min_spatial_size}")
     print()
 
     print(f"[1/6] 构建 {args.model} ...")
@@ -1144,7 +1147,10 @@ def main():
     print(f"[3/6] 分析网络拓扑，识别替换目标 ...")
     imgs_s, _ = next(iter(loader))
     sample_input = make_spike_input(imgs_s[:4], args.T, device, spike_mode=args.spike_mode)
-    targets, skipped = analyze_targets(model_baseline, sample_input, device, fused=False)
+    targets, skipped = analyze_targets(
+        model_baseline, sample_input, device, fused=False,
+        min_spatial_size=args.min_spatial_size,
+    )
     print_analysis_report(targets, skipped, fused=False)
     if not targets:
         print("\n  未找到可替换的目标层，退出。")
