@@ -689,23 +689,26 @@ def _build_active_group_metadata(
 def _check_dense_fallback(ag_mask_buf, N_TILES, NUM_GROUPS, fallback_ratio=FALLBACK_RATIO):
     if NUM_GROUPS == 0:
         return False
-    pc = _popcount_buf(ag_mask_buf, N_TILES)
+    masks = ag_mask_buf[:N_TILES].int()
+    pc = torch.zeros(N_TILES, dtype=torch.int32, device=masks.device)
+    tmp = masks.clone()
+    for _ in range(32):
+        pc += tmp & 1
+        tmp = tmp >> 1
     avg_active = pc.float().mean().item()
     threshold = fallback_ratio * NUM_GROUPS
     return avg_active > threshold
 
 
 def _popcount_buf(ag_mask_buf, N_TILES):
-    """Vectorised popcount for int32 bitmask buffer (parallel bit-count)."""
-    # Use the standard Hamming-weight (SWAR) approach — no Python loop.
-    # Works on int32 via standard bit manipulation constants.
-    v = ag_mask_buf[:N_TILES].int()
-    v = v - ((v >> 1) & 0x55555555)
-    v = (v & 0x33333333) + ((v >> 2) & 0x33333333)
-    v = (v + (v >> 4)) & 0x0F0F0F0F
-    v = v + (v >> 8)
-    v = v + (v >> 16)
-    return (v & 0x3F).to(torch.int32)
+    """Vectorised popcount for int32 bitmask buffer."""
+    masks = ag_mask_buf[:N_TILES].int()
+    pc = torch.zeros(N_TILES, dtype=torch.int32, device=masks.device)
+    tmp = masks.clone()
+    for _ in range(32):
+        pc += tmp & 1
+        tmp = tmp >> 1
+    return pc
 
 
 # ---------------------------------------------------------------------------
@@ -894,18 +897,16 @@ def sparse_conv1x1_bm_kernel_8x16(
             w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
             acc += tl.dot(x_tile, w_tile)
     else:
-        # TILE_SPARSE: bitmask-gated with true group skip
         for g in range(NUM_GROUPS):
             g_active = (ag_mask >> g) & 1
-            if g_active != 0:
-                cin_start = g * GROUP_SIZE_C
-                offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
-                k_mask = offs_k < C_IN
-                x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + out_h[:, None] * W_IN + out_w[:, None]
-                x_tile = tl.load(x_addrs, mask=k_mask[None, :] & m_mask[:, None], other=0.0).to(tl.float16)
-                w_addrs = w_cl_ptr + offs_n[None, :] * C_IN + offs_k[:, None]
-                w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
-                acc += tl.dot(x_tile, w_tile)
+            cin_start = g * GROUP_SIZE_C
+            offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+            k_mask = (g_active != 0) & (offs_k < C_IN)
+            x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + out_h[:, None] * W_IN + out_w[:, None]
+            x_tile = tl.load(x_addrs, mask=k_mask[None, :] & m_mask[:, None], other=0.0).to(tl.float16)
+            w_addrs = w_cl_ptr + offs_n[None, :] * C_IN + offs_k[:, None]
+            w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+            acc += tl.dot(x_tile, w_tile)
 
     if HAS_BIAS:
         acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
@@ -1084,27 +1085,25 @@ def sparse_conv3x3s1_bm_kernel_8x16(
                     w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
                     acc += tl.dot(x_tile, w_tile)
     else:
-        # TILE_SPARSE: bitmask-gated with true group skip
         for g in range(NUM_GROUPS):
             g_active = (ag_mask >> g) & 1
-            if g_active != 0:
-                cin_start = g * GROUP_SIZE_C
-                offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
-                k_mask = offs_k < C_IN
-                for kh in tl.static_range(3):
-                    for kw in tl.static_range(3):
-                        in_h = out_h + (kh - 1)
-                        in_w = out_w + (kw - 1)
-                        h_ok = (in_h >= 0) & (in_h < H_IN)
-                        w_ok = (in_w >= 0) & (in_w < W_IN)
-                        safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
-                        safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
-                        x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + safe_h[:, None] * W_IN + safe_w[:, None]
-                        x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
-                        x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
-                        w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
-                        w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
-                        acc += tl.dot(x_tile, w_tile)
+            cin_start = g * GROUP_SIZE_C
+            offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+            k_mask = (g_active != 0) & (offs_k < C_IN)
+            for kh in tl.static_range(3):
+                for kw in tl.static_range(3):
+                    in_h = out_h + (kh - 1)
+                    in_w = out_w + (kw - 1)
+                    h_ok = (in_h >= 0) & (in_h < H_IN)
+                    w_ok = (in_w >= 0) & (in_w < W_IN)
+                    safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
+                    safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
+                    x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + safe_h[:, None] * W_IN + safe_w[:, None]
+                    x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
+                    x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
+                    w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
+                    w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                    acc += tl.dot(x_tile, w_tile)
 
     if HAS_BIAS:
         acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
@@ -1184,27 +1183,25 @@ def sparse_conv3x3s2_bm_kernel_8x8(
                     w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
                     acc += tl.dot(x_tile, w_tile)
     else:
-        # TILE_SPARSE: bitmask-gated with true group skip
         for g in range(NUM_GROUPS):
             g_active = (ag_mask >> g) & 1
-            if g_active != 0:
-                cin_start = g * GROUP_SIZE_C
-                offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
-                k_mask = offs_k < C_IN
-                for kh in tl.static_range(3):
-                    for kw in tl.static_range(3):
-                        in_h = out_h * 2 + (kh - 1)
-                        in_w = out_w * 2 + (kw - 1)
-                        h_ok = (in_h >= 0) & (in_h < H_IN)
-                        w_ok = (in_w >= 0) & (in_w < W_IN)
-                        safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
-                        safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
-                        x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + safe_h[:, None] * W_IN + safe_w[:, None]
-                        x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
-                        x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
-                        w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
-                        w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
-                        acc += tl.dot(x_tile, w_tile)
+            cin_start = g * GROUP_SIZE_C
+            offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+            k_mask = (g_active != 0) & (offs_k < C_IN)
+            for kh in tl.static_range(3):
+                for kw in tl.static_range(3):
+                    in_h = out_h * 2 + (kh - 1)
+                    in_w = out_w * 2 + (kw - 1)
+                    h_ok = (in_h >= 0) & (in_h < H_IN)
+                    w_ok = (in_w >= 0) & (in_w < W_IN)
+                    safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
+                    safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
+                    x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + safe_h[:, None] * W_IN + safe_w[:, None]
+                    x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
+                    x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
+                    w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
+                    w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                    acc += tl.dot(x_tile, w_tile)
 
     if HAS_BIAS:
         acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
@@ -1281,27 +1278,25 @@ def sparse_conv3x3s2_bm_kernel_8x16(
                     w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
                     acc += tl.dot(x_tile, w_tile)
     else:
-        # TILE_SPARSE: bitmask-gated with true group skip
         for g in range(NUM_GROUPS):
             g_active = (ag_mask >> g) & 1
-            if g_active != 0:
-                cin_start = g * GROUP_SIZE_C
-                offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
-                k_mask = offs_k < C_IN
-                for kh in tl.static_range(3):
-                    for kw in tl.static_range(3):
-                        in_h = out_h * 2 + (kh - 1)
-                        in_w = out_w * 2 + (kw - 1)
-                        h_ok = (in_h >= 0) & (in_h < H_IN)
-                        w_ok = (in_w >= 0) & (in_w < W_IN)
-                        safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
-                        safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
-                        x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + safe_h[:, None] * W_IN + safe_w[:, None]
-                        x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
-                        x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
-                        w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
-                        w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
-                        acc += tl.dot(x_tile, w_tile)
+            cin_start = g * GROUP_SIZE_C
+            offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+            k_mask = (g_active != 0) & (offs_k < C_IN)
+            for kh in tl.static_range(3):
+                for kw in tl.static_range(3):
+                    in_h = out_h * 2 + (kh - 1)
+                    in_w = out_w * 2 + (kw - 1)
+                    h_ok = (in_h >= 0) & (in_h < H_IN)
+                    w_ok = (in_w >= 0) & (in_w < W_IN)
+                    safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
+                    safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
+                    x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + safe_h[:, None] * W_IN + safe_w[:, None]
+                    x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
+                    x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
+                    w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
+                    w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                    acc += tl.dot(x_tile, w_tile)
 
     if HAS_BIAS:
         acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]

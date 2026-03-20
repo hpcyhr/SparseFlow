@@ -391,14 +391,12 @@ def sparse_fused_conv_lif_forward(
 
     avg_active_ratio = None
     if return_avg_active_ratio:
-        # Vectorized SWAR popcount (no Python loop)
-        v = ag_mask_buf[:N_TILES].int()
-        v = v - ((v >> 1) & 0x55555555)
-        v = (v & 0x33333333) + ((v >> 2) & 0x33333333)
-        v = (v + (v >> 4)) & 0x0F0F0F0F
-        v = v + (v >> 8)
-        v = v + (v >> 16)
-        pc = (v & 0x3F).to(torch.int32)
+        masks = ag_mask_buf[:N_TILES].int()
+        pc = torch.zeros(N_TILES, dtype=torch.int32, device=device)
+        tmp = masks.clone()
+        for _ in range(32):
+            pc += tmp & 1
+            tmp = tmp >> 1
         avg_active_ratio = pc.float().mean().item() / max(NUM_GROUPS, 1)
 
     if (avg_active_ratio is not None and avg_active_ratio > fallback_ratio) or (
