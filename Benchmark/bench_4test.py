@@ -246,6 +246,8 @@ def classify_target_type(info):
 
     if k == (1, 1) and s == (1, 1) and p == (0, 0) and g == 1:
         return "1x1/s1"
+    if k == (1, 1) and s == (2, 2) and p == (0, 0) and g == 1:
+        return "1x1/s2"
     if k == (3, 3) and s == (1, 1) and p == (1, 1) and g == 1:
         return "3x3/s1"
     if k == (3, 3) and s == (2, 2) and p == (1, 1) and g == 1:
@@ -882,7 +884,7 @@ def print_layer_profile(baseline_timing, sparse_timing, targets, e2e_ms=None):
 
     print(f"\n  {'Bucket':<12} {'Count':>6} {'Base(ms)':>10} {'Sparse(ms)':>11} {'Speedup':>8}")
     print(f"  {'-'*58}")
-    for kind in ["1x1/s1", "3x3/s1", "3x3/s2"]:
+    for kind in ["1x1/s1", "1x1/s2", "3x3/s1", "3x3/s2"]:
         c = bucket[kind]["count"]
         b = bucket[kind]["base"]
         s = bucket[kind]["sparse"]
@@ -1171,10 +1173,11 @@ def main():
 
     if args.selective_sparse or args.collect_diag:
         print(f"\n  [Diag] Measuring group/tile sparsity ...")
+        # Use sparse-only model so ALL targets become SparseConv2d for measurement
         _tmp_model = copy.deepcopy(model_baseline)
         replace_model(
             _tmp_model, targets, fused=False,
-            static_zero_layers=set(zero_layers),
+            static_zero_layers=set(),
             only_static_zero=False,
         )
         group_sparsity_data = measure_group_sparsity(
@@ -1184,19 +1187,67 @@ def main():
         )
         del _tmp_model
 
-        print(f"\n  {'Layer':<40} {'AGR':>8} {'TileZR':>8} {'Groups':>8}")
-        print(f"  {'-'*68}")
+        # Override: StaticZero layers get synthetic diag (100% zero → AGR=0, TZR=1)
+        for _t in targets:
+            _n = _t["name"]
+            if _n in zero_layers:
+                _gd_existing = group_sparsity_data.get(_n, {})
+                group_sparsity_data[_n] = {
+                    'active_group_ratio': 0.0,
+                    'tile_zero_ratio': 1.0,
+                    'total_group_count': _gd_existing.get('total_group_count', -1.0),
+                    'nonzero_group_count': 0.0,
+                    'tile_zero_count': _gd_existing.get('total_tile_count', -1.0),
+                    'total_tile_count': _gd_existing.get('total_tile_count', -1.0),
+                    'effective_k_ratio': 0.0,
+                    'sparse_compute_ms': -1.0,
+                    'sparse_total_ms': -1.0,
+                    '_synthetic': True,
+                    '_diag_path': 'staticzero',
+                }
+
+        # Catch-all: layers with near-100% sparsity that took the zero fast-path
+        # during measurement (SparseConv2d._force_zero skips Triton → empty _last_diag)
+        for _t in targets:
+            _n = _t["name"]
+            if _n in zero_layers:
+                continue  # already handled above
+            _gd = group_sparsity_data.get(_n, {})
+            if _gd.get('active_group_ratio', -1.0) >= 0:
+                continue  # already has real diag data
+            _sd = sparsity_data.get(_n, {"zeros": 0, "total": 1})
+            _elem_sp = _sd["zeros"] / max(_sd["total"], 1)
+            if _elem_sp >= 0.9999:
+                _gd_existing = group_sparsity_data.get(_n, {})
+                group_sparsity_data[_n] = {
+                    'active_group_ratio': 0.0,
+                    'tile_zero_ratio': 1.0,
+                    'total_group_count': _gd_existing.get('total_group_count', -1.0),
+                    'nonzero_group_count': 0.0,
+                    'tile_zero_count': _gd_existing.get('total_tile_count', -1.0),
+                    'total_tile_count': _gd_existing.get('total_tile_count', -1.0),
+                    'effective_k_ratio': 0.0,
+                    'sparse_compute_ms': -1.0,
+                    'sparse_total_ms': -1.0,
+                    '_synthetic': True,
+                    '_diag_path': 'zero_fastpath',
+                }
+
+        print(f"\n  {'Layer':<40} {'AGR':>8} {'TileZR':>8} {'Groups':>8} {'Source':>10}")
+        print(f"  {'-'*78}")
         for t in targets:
             name = t["name"]
             gd = group_sparsity_data.get(name, {})
             agr = gd.get('active_group_ratio', -1.0)
             tzr = gd.get('tile_zero_ratio', -1.0)
             tgc = gd.get('total_group_count', -1.0)
+            _synth = gd.get('_synthetic', False)
+            _src = gd.get('_diag_path', 'measured') if _synth else ('measured' if agr >= 0 else 'unavail')
             short = name if len(name) <= 39 else "..." + name[-36:]
             agr_s = f"{agr:.4f}" if agr >= 0 else "n/a"
             tzr_s = f"{tzr:.4f}" if tzr >= 0 else "n/a"
             tgc_s = f"{tgc:.0f}" if tgc >= 0 else "n/a"
-            print(f"  {short:<40} {agr_s:>8} {tzr_s:>8} {tgc_s:>8}")
+            print(f"  {short:<40} {agr_s:>8} {tzr_s:>8} {tgc_s:>8} {_src:>10}")
 
         if args.selective_sparse:
             selective_sparse_set = set()
@@ -1362,17 +1413,23 @@ def main():
             gd = group_sparsity_data.get(name, {})
             ishape = t.get("input_shape")
 
-            if name in zero_layers:
+            _is_sz = (name in zero_layers)
+            _is_dk = (selective_sparse_set is not None
+                      and name not in selective_sparse_set
+                      and not _is_sz)
+
+            if _is_sz:
                 layer_logger.log_static_zero(layer_name=name, input_shape=ishape)
-            elif selective_sparse_set is not None and name not in selective_sparse_set:
+            elif _is_dk:
                 layer_logger.log_dense(
                     layer_name=name, input_shape=ishape, element_sparsity=elem_sp)
             else:
+                _has_diag = gd.get('active_group_ratio', -1) >= 0
                 layer_logger.log_layer(
                     layer_name=name,
                     mode_used="sparseconv",
                     replaced=True,
-                    sparse_path_executed=gd.get('active_group_ratio', -1) >= 0,
+                    sparse_path_executed=_has_diag,
                     input_shape=str(ishape) if ishape else "",
                     element_sparsity=elem_sp,
                     nonzero_group_count=gd.get('nonzero_group_count', -1.0),
