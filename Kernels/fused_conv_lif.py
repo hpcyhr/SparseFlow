@@ -1,11 +1,11 @@
 """
-SparseFlow Fused Sparse Conv + LIF — v16.4 Compact Active-Group
+SparseFlow Fused Sparse Conv + LIF — v18.0 Bitmask
 
-改动：
-1. 与 conv2d.py 统一使用 active_group_count + active_group_list
-2. 与 Ops 层接口对齐，入口函数名统一为 `sparse_fused_conv_lif_forward`
-3. 去掉 tl.full_like，兼容较老 Triton 版本
-4. 新增 `return_avg_active_ratio`，仅在需要时才同步读取
+Changes from v16.4:
+  - Uses per-tile uint32 bitmask instead of ag_count / ag_list
+  - Adaptive GROUP_SIZE via choose_group_size()
+  - Zero-tile early return in compute kernels
+  - Unified with conv2d.py bitmask infrastructure
 """
 
 import torch
@@ -14,17 +14,19 @@ import triton.language as tl
 from triton import autotune, Config
 
 from Kernels.conv2d import (
-    GROUP_SIZE,
     FALLBACK_RATIO,
+    choose_group_size,
     _select_tile_sizes,
-    _build_active_group_metadata,
+    _build_active_group_bitmask,
     _check_dense_fallback,
+    _make_configs,
 )
 
 
 def _select_block_sizes(H, W, C_IN, C_OUT, kernel_size, N):
     BH, BW = _select_tile_sizes(H, W)
-    return BH, BW, BH * BW, 64, GROUP_SIZE
+    gs = choose_group_size(C_IN)
+    return BH, BW, BH * BW, 64, gs
 
 
 def _make_fused_configs(bh, bw):
@@ -51,14 +53,17 @@ _FC_8x8 = _make_fused_configs(8, 8)
 _FC_8x16 = _make_fused_configs(8, 16)
 
 
+# ===================================================================
+# Fused Conv3x3 + LIF kernels — bitmask-based
+# ===================================================================
+
 @autotune(configs=_FC_8x8, key=["C_IN", "C_OUT", "H", "W", "GH", "GW"])
 @triton.jit
-def fused_ag_conv3x3_lif_8x8(
+def fused_bm_conv3x3_lif_8x8(
     x_ptr,
     w_cl_ptr,
     bias_ptr,
-    ag_count_ptr,
-    ag_list_ptr,
+    ag_mask_ptr,
     v_prev_ptr,
     spike_ptr,
     v_next_ptr,
@@ -76,7 +81,7 @@ def fused_ag_conv3x3_lif_8x8(
     HAS_V_RESET: tl.constexpr,
     V_RESET: tl.constexpr,
     GROUP_SIZE_C: tl.constexpr,
-    MAX_AG: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -107,17 +112,37 @@ def fused_ag_conv3x3_lif_8x8(
     W_KH: tl.constexpr = 3 * C_IN
     W_CO: tl.constexpr = 9 * C_IN
 
-    active_count = tl.load(ag_count_ptr + tile_id)
-    list_base = tile_id * MAX_AG
+    oa = (n_idx * C_OUT + offs_n[None, :]) * HW + out_h[:, None] * W + out_w[:, None]
+    om = m_mask[:, None] & n_mask[None, :]
 
+    ag_mask = tl.load(ag_mask_ptr + tile_id)
+
+    # Zero-tile fast path
+    if ag_mask == 0:
+        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        if HAS_BIAS:
+            acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
+
+        vp = tl.load(v_prev_ptr + oa, mask=om, other=0.0)
+        vt = vp * DECAY + acc * RECIP_TAU
+        sp = (vt >= V_TH).to(tl.float32)
+        if HAS_V_RESET:
+            v_reset_tensor = vt * 0.0 + V_RESET
+            vn = tl.where(sp > 0.0, v_reset_tensor, vt)
+        else:
+            vn = vt - sp * V_TH
+        tl.store(spike_ptr + oa, sp, mask=om)
+        tl.store(v_next_ptr + oa, vn, mask=om)
+        return
+
+    # Active tile: sparse compute via bitmask
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
-    g_idx = 0
-    while g_idx < active_count:
-        gid = tl.load(ag_list_ptr + list_base + g_idx)
-        cin_start = gid * GROUP_SIZE_C
+    for g in range(NUM_GROUPS):
+        g_active = (ag_mask >> g) & 1
+        cin_start = g * GROUP_SIZE_C
         offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
-        k_mask = offs_k < C_IN
+        k_mask = (g_active != 0) & (offs_k < C_IN)
 
         for kh in tl.static_range(3):
             for kw in tl.static_range(3):
@@ -134,8 +159,8 @@ def fused_ag_conv3x3_lif_8x8(
                     + safe_h[:, None] * W
                     + safe_w[:, None]
                 )
-                x_mask = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
-                x_tile = tl.load(x_addrs, mask=x_mask, other=0.0).to(tl.float16)
+                x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
+                x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
 
                 w_addrs = (
                     w_cl_ptr
@@ -144,19 +169,13 @@ def fused_ag_conv3x3_lif_8x8(
                     + kw * W_CS
                     + offs_k[:, None]
                 )
-                w_mask = k_mask[:, None] & n_mask[None, :]
-                w_tile = tl.load(w_addrs, mask=w_mask, other=0.0).to(tl.float16)
-
+                w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
                 acc += tl.dot(x_tile, w_tile)
-
-        g_idx += 1
 
     if HAS_BIAS:
         acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
 
-    oa = (n_idx * C_OUT + offs_n[None, :]) * HW + out_h[:, None] * W + out_w[:, None]
-    om = m_mask[:, None] & n_mask[None, :]
-
+    # LIF dynamics
     vp = tl.load(v_prev_ptr + oa, mask=om, other=0.0)
     vt = vp * DECAY + acc * RECIP_TAU
     sp = (vt >= V_TH).to(tl.float32)
@@ -173,12 +192,11 @@ def fused_ag_conv3x3_lif_8x8(
 
 @autotune(configs=_FC_8x16, key=["C_IN", "C_OUT", "H", "W", "GH", "GW"])
 @triton.jit
-def fused_ag_conv3x3_lif_8x16(
+def fused_bm_conv3x3_lif_8x16(
     x_ptr,
     w_cl_ptr,
     bias_ptr,
-    ag_count_ptr,
-    ag_list_ptr,
+    ag_mask_ptr,
     v_prev_ptr,
     spike_ptr,
     v_next_ptr,
@@ -196,7 +214,7 @@ def fused_ag_conv3x3_lif_8x16(
     HAS_V_RESET: tl.constexpr,
     V_RESET: tl.constexpr,
     GROUP_SIZE_C: tl.constexpr,
-    MAX_AG: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -204,7 +222,6 @@ def fused_ag_conv3x3_lif_8x16(
 ):
     tile_id = tl.program_id(0)
     pid_cout = tl.program_id(1)
-
     total_tiles = N_val * GH * GW
     if tile_id >= total_tiles:
         return
@@ -213,10 +230,8 @@ def fused_ag_conv3x3_lif_8x16(
     tmp = tile_id // GW
     gh_idx = tmp % GH
     n_idx = tmp // GH
-
     offs_n = pid_cout * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < C_OUT
-
     offs_m = tl.arange(0, BLOCK_M)
     out_h = gh_idx * BLOCK_H + offs_m // BLOCK_W
     out_w = gw_idx * BLOCK_W + offs_m % BLOCK_W
@@ -227,17 +242,33 @@ def fused_ag_conv3x3_lif_8x16(
     W_KH: tl.constexpr = 3 * C_IN
     W_CO: tl.constexpr = 9 * C_IN
 
-    active_count = tl.load(ag_count_ptr + tile_id)
-    list_base = tile_id * MAX_AG
+    oa = (n_idx * C_OUT + offs_n[None, :]) * HW + out_h[:, None] * W + out_w[:, None]
+    om = m_mask[:, None] & n_mask[None, :]
+
+    ag_mask = tl.load(ag_mask_ptr + tile_id)
+
+    if ag_mask == 0:
+        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        if HAS_BIAS:
+            acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
+        vp = tl.load(v_prev_ptr + oa, mask=om, other=0.0)
+        vt = vp * DECAY + acc * RECIP_TAU
+        sp = (vt >= V_TH).to(tl.float32)
+        if HAS_V_RESET:
+            v_reset_tensor = vt * 0.0 + V_RESET
+            vn = tl.where(sp > 0.0, v_reset_tensor, vt)
+        else:
+            vn = vt - sp * V_TH
+        tl.store(spike_ptr + oa, sp, mask=om)
+        tl.store(v_next_ptr + oa, vn, mask=om)
+        return
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-    g_idx = 0
-    while g_idx < active_count:
-        gid = tl.load(ag_list_ptr + list_base + g_idx)
-        cin_start = gid * GROUP_SIZE_C
+    for g in range(NUM_GROUPS):
+        g_active = (ag_mask >> g) & 1
+        cin_start = g * GROUP_SIZE_C
         offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
-        k_mask = offs_k < C_IN
+        k_mask = (g_active != 0) & (offs_k < C_IN)
 
         for kh in tl.static_range(3):
             for kw in tl.static_range(3):
@@ -247,49 +278,31 @@ def fused_ag_conv3x3_lif_8x16(
                 w_ok = (in_w >= 0) & (in_w < W)
                 safe_h = tl.minimum(tl.maximum(in_h, 0), H - 1)
                 safe_w = tl.minimum(tl.maximum(in_w, 0), W - 1)
-
-                x_addrs = (
-                    x_ptr
-                    + (n_idx * C_IN + offs_k[None, :]) * HW
-                    + safe_h[:, None] * W
-                    + safe_w[:, None]
-                )
-                x_mask = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
-                x_tile = tl.load(x_addrs, mask=x_mask, other=0.0).to(tl.float16)
-
-                w_addrs = (
-                    w_cl_ptr
-                    + offs_n[None, :] * W_CO
-                    + kh * W_KH
-                    + kw * W_CS
-                    + offs_k[:, None]
-                )
-                w_mask = k_mask[:, None] & n_mask[None, :]
-                w_tile = tl.load(w_addrs, mask=w_mask, other=0.0).to(tl.float16)
-
+                x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW + safe_h[:, None] * W + safe_w[:, None]
+                x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
+                x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
+                w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
+                w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
                 acc += tl.dot(x_tile, w_tile)
-
-        g_idx += 1
 
     if HAS_BIAS:
         acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
 
-    oa = (n_idx * C_OUT + offs_n[None, :]) * HW + out_h[:, None] * W + out_w[:, None]
-    om = m_mask[:, None] & n_mask[None, :]
-
     vp = tl.load(v_prev_ptr + oa, mask=om, other=0.0)
     vt = vp * DECAY + acc * RECIP_TAU
     sp = (vt >= V_TH).to(tl.float32)
-
     if HAS_V_RESET:
         v_reset_tensor = vt * 0.0 + V_RESET
         vn = tl.where(sp > 0.0, v_reset_tensor, vt)
     else:
         vn = vt - sp * V_TH
-
     tl.store(spike_ptr + oa, sp, mask=om)
     tl.store(v_next_ptr + oa, vn, mask=om)
 
+
+# ===================================================================
+# Python entry point
+# ===================================================================
 
 def sparse_fused_conv_lif_forward(
     x,
@@ -304,11 +317,14 @@ def sparse_fused_conv_lif_forward(
     kernel_size=3,
     threshold=1e-6,
     w_cl=None,
-    counts_buf=None,       # 兼容旧接口，忽略
-    tile_cin_buf=None,     # 兼容旧接口，忽略
-    group_flags_buf=None,  # 兼容旧接口，忽略
+    # Legacy params (kept for call-site compat, ignored)
+    counts_buf=None,
+    tile_cin_buf=None,
+    group_flags_buf=None,
     ag_count_buf=None,
     ag_list_buf=None,
+    # New bitmask buffer
+    ag_mask_buf=None,
     return_ms=False,
     fallback_ratio=FALLBACK_RATIO,
     return_avg_active_ratio=False,
@@ -324,12 +340,13 @@ def sparse_fused_conv_lif_forward(
     H_OUT = (H + 2 * padding - kernel_size) // stride + 1
     W_OUT = (W + 2 * padding - kernel_size) // stride + 1
 
+    GROUP_SIZE_C = choose_group_size(C_IN)
+    NUM_GROUPS = triton.cdiv(C_IN, GROUP_SIZE_C)
+
     BH, BW = _select_tile_sizes(H_OUT, W_OUT)
     GH = triton.cdiv(H_OUT, BH)
     GW = triton.cdiv(W_OUT, BW)
     N_TILES = N * GH * GW
-    NUM_GROUPS = triton.cdiv(C_IN, GROUP_SIZE)
-    MAX_AG = NUM_GROUPS
 
     if w_cl is not None:
         w_cl_f16 = w_cl
@@ -339,7 +356,7 @@ def sparse_fused_conv_lif_forward(
         else:
             w_cl_f16 = weight.half().reshape(C_OUT, C_IN).contiguous()
 
-    # 1x1 直接 dense fallback
+    # 1x1 or unsupported → dense fallback with LIF
     if kernel_size != 3:
         y = Fn.conv2d(x, weight, bias, stride=1, padding=0).float()
         vp = v_prev.float()
@@ -358,39 +375,32 @@ def sparse_fused_conv_lif_forward(
 
     x_f16 = x.half().contiguous()
 
-    if ag_count_buf is None or ag_count_buf.numel() < N_TILES:
-        ag_count_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
-    if ag_list_buf is None or ag_list_buf.numel() < N_TILES * MAX_AG:
-        ag_list_buf = torch.empty(N_TILES * MAX_AG, dtype=torch.int32, device=device)
+    # Use ag_count_buf as ag_mask_buf if provided (legacy compat shim)
+    if ag_mask_buf is None:
+        if ag_count_buf is not None and ag_count_buf.numel() >= N_TILES:
+            ag_mask_buf = ag_count_buf  # reuse same buffer
+        else:
+            ag_mask_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
 
-    _build_active_group_metadata(
-        x_f16,
-        N,
-        C_IN,
-        H,
-        W,
-        H_OUT,
-        W_OUT,
-        BH,
-        BW,
-        GH,
-        GW,
-        kernel_size,
-        stride,
-        padding,
-        threshold,
-        ag_count_buf,
-        ag_list_buf,
+    _build_active_group_bitmask(
+        x_f16, N, C_IN, H, W, H_OUT, W_OUT,
+        BH, BW, GH, GW,
+        kernel_size, stride, padding,
+        threshold, ag_mask_buf,
     )
 
     avg_active_ratio = None
     if return_avg_active_ratio:
-        avg_active_ratio = (
-            ag_count_buf[:N_TILES].float().mean().item() / max(NUM_GROUPS, 1)
-        )
+        masks = ag_mask_buf[:N_TILES].int()
+        pc = torch.zeros(N_TILES, dtype=torch.int32, device=device)
+        tmp = masks.clone()
+        for _ in range(32):
+            pc += tmp & 1
+            tmp = tmp >> 1
+        avg_active_ratio = pc.float().mean().item() / max(NUM_GROUPS, 1)
 
     if (avg_active_ratio is not None and avg_active_ratio > fallback_ratio) or (
-        avg_active_ratio is None and _check_dense_fallback(ag_count_buf, N_TILES, NUM_GROUPS, fallback_ratio)
+        avg_active_ratio is None and _check_dense_fallback(ag_mask_buf, N_TILES, NUM_GROUPS, fallback_ratio)
     ):
         y = Fn.conv2d(x, weight, bias, stride=1, padding=1).float()
         vp = v_prev.float()
@@ -427,13 +437,12 @@ def sparse_fused_conv_lif_forward(
     has_v_reset = v_reset is not None
     v_reset_val = 0.0 if v_reset is None else float(v_reset)
 
-    kernel = fused_ag_conv3x3_lif_8x16 if BW == 16 else fused_ag_conv3x3_lif_8x8
+    kernel = fused_bm_conv3x3_lif_8x16 if BW == 16 else fused_bm_conv3x3_lif_8x8
     kernel[_grid](
         x_f16,
         w_cl_f16,
         bias_f32,
-        ag_count_buf,
-        ag_list_buf,
+        ag_mask_buf,
         v_prev_f32,
         spike_out,
         v_next,
@@ -445,8 +454,8 @@ def sparse_fused_conv_lif_forward(
         V_TH=float(v_threshold),
         HAS_V_RESET=has_v_reset,
         V_RESET=v_reset_val,
-        GROUP_SIZE_C=GROUP_SIZE,
-        MAX_AG=MAX_AG,
+        GROUP_SIZE_C=GROUP_SIZE_C,
+        NUM_GROUPS=NUM_GROUPS,
     )
 
     if return_ms:

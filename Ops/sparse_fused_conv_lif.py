@@ -1,3 +1,12 @@
+"""
+FusedSparseConvLIF — v18 bitmask-based stateful Conv+LIF fused module.
+
+Changes from v16:
+  - _ag_count_buf / _ag_list_buf replaced with single _ag_mask_buf
+  - Uses choose_group_size() for adaptive GROUP_SIZE
+  - Forwards to bitmask-based fused kernel
+"""
+
 import sys
 from pathlib import Path
 from typing import Optional
@@ -67,8 +76,9 @@ class FusedSparseConvLIF(sj_base.MemoryModule):
 
         self._last_sparse_ms = 0.0
         self._w_cl = None
-        self._ag_count_buf = None
-        self._ag_list_buf = None
+
+        # Bitmask buffer (replaces ag_count_buf + ag_list_buf)
+        self._ag_mask_buf = None
 
         self._warmup_steps = 8
         self._calib_interval = 32
@@ -81,7 +91,8 @@ class FusedSparseConvLIF(sj_base.MemoryModule):
         self.register_memory('v', None)
 
     @classmethod
-    def from_conv_and_lif(cls, conv: nn.Conv2d, lif_node, block_size=None, threshold: float = 1e-6, return_ms: bool = False):
+    def from_conv_and_lif(cls, conv: nn.Conv2d, lif_node, block_size=None,
+                          threshold: float = 1e-6, return_ms: bool = False):
         mod = cls(
             in_channels=conv.in_channels,
             out_channels=conv.out_channels,
@@ -127,21 +138,21 @@ class FusedSparseConvLIF(sj_base.MemoryModule):
         return self._w_cl
 
     def _ensure_buffers(self, x_single):
-        from Kernels.conv2d import _select_tile_sizes, GROUP_SIZE
+        """Allocate bitmask buffer (one int32 per tile)."""
+        from Kernels.conv2d import _select_tile_sizes
         import triton
         B, C_IN, H, W = x_single.shape
         BH, BW = _select_tile_sizes(H, W)
         GH = triton.cdiv(H, BH)
         GW = triton.cdiv(W, BW)
         n_tiles = B * GH * GW
-        num_groups = triton.cdiv(C_IN, GROUP_SIZE)
-        max_ag = num_groups
-        if self._ag_count_buf is None or self._ag_count_buf.numel() < n_tiles or self._ag_count_buf.device != x_single.device:
-            self._ag_count_buf = torch.empty(n_tiles, dtype=torch.int32, device=x_single.device)
-        needed = n_tiles * max_ag
-        if self._ag_list_buf is None or self._ag_list_buf.numel() < needed or self._ag_list_buf.device != x_single.device:
-            self._ag_list_buf = torch.empty(needed, dtype=torch.int32, device=x_single.device)
-        return self._ag_count_buf, self._ag_list_buf
+
+        if (self._ag_mask_buf is None
+                or self._ag_mask_buf.numel() < n_tiles
+                or self._ag_mask_buf.device != x_single.device):
+            self._ag_mask_buf = torch.empty(n_tiles, dtype=torch.int32, device=x_single.device)
+
+        return self._ag_mask_buf
 
     def _supports_triton_fused(self, x):
         return (
@@ -199,7 +210,8 @@ class FusedSparseConvLIF(sj_base.MemoryModule):
     def _triton_forward(self, x, need_ratio: bool = False):
         from Kernels.fused_conv_lif import sparse_fused_conv_lif_forward
         w_cl = self._get_w_cl()
-        ag_count_buf, ag_list_buf = self._ensure_buffers(x)
+        ag_mask_buf = self._ensure_buffers(x)
+
         if need_ratio:
             spike, v_next, ms, avg_active_ratio = sparse_fused_conv_lif_forward(
                 x=x.contiguous(),
@@ -213,13 +225,13 @@ class FusedSparseConvLIF(sj_base.MemoryModule):
                 kernel_size=self.kernel_size[0],
                 threshold=self.threshold,
                 w_cl=w_cl,
-                ag_count_buf=ag_count_buf,
-                ag_list_buf=ag_list_buf,
+                ag_mask_buf=ag_mask_buf,
                 return_ms=self.return_ms,
                 return_avg_active_ratio=True,
             )
             self._last_sparse_ms = ms
             return spike, v_next, avg_active_ratio
+
         spike, v_next, ms = sparse_fused_conv_lif_forward(
             x=x.contiguous(),
             v_prev=self.v,
@@ -232,8 +244,7 @@ class FusedSparseConvLIF(sj_base.MemoryModule):
             kernel_size=self.kernel_size[0],
             threshold=self.threshold,
             w_cl=w_cl,
-            ag_count_buf=ag_count_buf,
-            ag_list_buf=ag_list_buf,
+            ag_mask_buf=ag_mask_buf,
             return_ms=self.return_ms,
             return_avg_active_ratio=False,
         )
@@ -269,5 +280,6 @@ class FusedSparseConvLIF(sj_base.MemoryModule):
         return (
             f'{self.in_channels}, {self.out_channels}, kernel_size={self.kernel_size}, '
             f'stride={self.stride}, padding={self.padding}, tau={self.tau}, '
-            f'v_threshold={self.v_threshold}, v_reset={self.v_reset}, block_size={bs}, fused=True'
+            f'v_threshold={self.v_threshold}, v_reset={self.v_reset}, block_size={bs}, '
+            f'fused=True, metadata=bitmask'
         )
