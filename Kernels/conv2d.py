@@ -1,12 +1,20 @@
 """
-SparseFlow Conv2d Triton Kernels — v18.0 Bitmask + Adaptive Grouping
+SparseFlow Conv2d Triton Kernels — v19.0 Two-Stage Prescan + Tile Classification
 
-Changes from v17:
-  A. Metadata: per-tile uint32 active-group BITMASK replaces ag_count / ag_list
-  B. GROUP_SIZE: adaptive via choose_group_size(c_in) instead of fixed 32
-  C. Prescan: two-stage design (tile screen → group bitmask, single kernel)
-  D. Compute: zero-tile early return; iterate groups via range(NUM_GROUPS) with bit check
-  E. Diagnostics: metadata_kind, group_size, prescan stats from bitmask
+Changes from v18:
+  A. Prescan: genuine two-stage design
+     - Stage 1 (tile_screen): cheap per-tile max across ALL channels (no per-group tracking)
+       → classifies tiles as ZERO or ALIVE
+     - Stage 2 (group_bitmask): only runs on ALIVE tiles, builds per-group bitmask
+     - Zero tiles (~99% in SNN) skip Stage 2 entirely
+  B. Tile classification: TILE_ZERO / TILE_SPARSE / TILE_DENSEISH
+     - Dense-ish tiles (all groups active) use simplified compute path
+  C. Compute kernels: per-tile adaptive path
+     - Zero tiles: bias-only early return
+     - Dense-ish tiles: iterate all groups unconditionally (no bit-check overhead)
+     - Sparse tiles: bitmask-gated iteration (existing path)
+  D. 1x1 specialization: simpler prescan (no spatial RF expansion)
+  E. Diagnostics: stage1_zero_tiles, stage2_tiles, denseish_tiles, sparse_tiles
 
 Supported patterns:
   1x1/s1/p0, 1x1/s2/p0 (via subsample), 3x3/s1/p1, 3x3/s2/p1
@@ -18,27 +26,20 @@ import triton.language as tl
 from triton import autotune, Config
 
 # ---------------------------------------------------------------------------
-# Adaptive group size
+# Tile classification constants (used in tile_class buffer)
 # ---------------------------------------------------------------------------
+TILE_ZERO = 0
+TILE_SPARSE = 1
+TILE_DENSEISH = 2
+
 FALLBACK_RATIO = 0.85
 
 
 def choose_group_size(c_in: int) -> int:
-    """
-    Adaptive group size based on input channels.
-
-    Policy:
-      C_IN <= 64  → 16  (finer granularity for early layers; 4 groups)
-      64 < C_IN <= 128 → 16  (8 groups)
-      C_IN > 128  → 32  (coarser for deeper layers; <=16 groups)
-
-    Constraint: num_groups must fit in uint32 bitmask (≤ 32 bits).
-    """
     if c_in <= 128:
         gs = 16
     else:
         gs = 32
-    # Safety: ensure num_groups ≤ 32 for uint32 bitmask
     num_groups = (c_in + gs - 1) // gs
     while num_groups > 32:
         gs *= 2
@@ -46,13 +47,11 @@ def choose_group_size(c_in: int) -> int:
     return gs
 
 
-# Legacy alias kept for any external code that reads this constant.
-# New code should call choose_group_size(c_in) instead.
+# Legacy alias
 GROUP_SIZE = 32
 
 
 def _select_tile_sizes(H, W):
-    """Deterministic tile-size selection (shared by prescan & compute)."""
     pixels = H * W
     if pixels >= 3136:
         return 8, 16
@@ -60,39 +59,25 @@ def _select_tile_sizes(H, W):
 
 
 def _select_block_sizes(H, W, C_IN, C_OUT, kernel_size, N):
-    """Compat helper used by other modules."""
     BH, BW = _select_tile_sizes(H, W)
     gs = choose_group_size(C_IN)
     return BH, BW, BH * BW, 64, gs
 
 
 # ---------------------------------------------------------------------------
-# Prescan kernel — produces per-tile uint32 bitmask
+# Stage 1: Tile screen — cheap per-tile zero/alive classification
 # ---------------------------------------------------------------------------
-#
-# Two-stage design (inside a single kernel launch):
-#   Stage 1: For each tile, accumulate a tile-level max across ALL channels
-#            and ALL receptive-field positions.  If tile_max == 0 the tile is
-#            definitely zero → store mask = 0 and skip the per-group breakdown.
-#   Stage 2: For tiles with activity, scan each channel-group separately to
-#            build the per-group bitmask.
-#
-# Because Triton does not support `break` in range-loops the tile-max is
-# accumulated cheaply as a single scalar *alongside* the group-level scan.
-# Zero tiles therefore pay the same data-load cost but avoid bitmask book-
-# keeping.  The main savings come at *compute* time: zero-tile tiles early-
-# return from the compute kernel, completely skipping the 9×K dot loop.
+# Single scalar accumulator per tile. No per-group bookkeeping.
+# For zero tiles (99%+), this is the ONLY prescan work done.
 
 @triton.jit
-def prescan_bitmask_kernel(
+def tile_screen_kernel(
     x_ptr,
-    ag_mask_ptr,          # [N_TILES] int32 output — per-tile bitmask
+    tile_alive_ptr,       # [N_TILES] int32 output: 0=zero, 1=alive
     N_val,
     C_IN,
     H_IN,
     W_IN,
-    H_OUT,
-    W_OUT,
     GH,
     GW,
     BLOCK_H: tl.constexpr,
@@ -100,11 +85,17 @@ def prescan_bitmask_kernel(
     KERNEL_SIZE: tl.constexpr,
     STRIDE: tl.constexpr,
     PAD: tl.constexpr,
-    GROUP_SIZE_C: tl.constexpr,
-    NUM_GROUPS: tl.constexpr,
     RF_SIZE: tl.constexpr,
     THRESHOLD: tl.constexpr,
+    # Number of channels to check per iteration for early-exit
+    C_BATCH: tl.constexpr,
 ):
+    """Stage 1: Quick tile-level zero/alive classification.
+
+    Scans ALL channels × RF positions using a single scalar accumulator.
+    Uses while-loop with early exit: as soon as ANY nonzero value is found,
+    the tile is classified as alive and we stop scanning.
+    """
     tile_id = tl.program_id(0)
     total_tiles = N_val * GH * GW
     if tile_id >= total_tiles:
@@ -115,7 +106,6 @@ def prescan_bitmask_kernel(
     gh_idx = tmp % GH
     n_idx = tmp // GH
 
-    # Receptive-field bounds for this output tile
     rf_h_start = gh_idx * BLOCK_H * STRIDE - PAD
     rf_w_start = gw_idx * BLOCK_W * STRIDE - PAD
     RF_H: tl.constexpr = (BLOCK_H - 1) * STRIDE + KERNEL_SIZE
@@ -135,8 +125,152 @@ def prescan_bitmask_kernel(
 
     HW = H_IN * W_IN
 
-    # --- Per-group bitmask construction ---
+    # Scan channels with early exit via while loop
+    c_idx = 0
+    found = tl.zeros([1], dtype=tl.int32)
+
+    while (c_idx < C_IN) & (tl.sum(found) == 0):
+        base = (n_idx * C_IN + c_idx) * HW
+        vals = tl.load(
+            x_ptr + base + safe_h * W_IN + safe_w,
+            mask=hw_mask,
+            other=0.0,
+        )
+        ch_max = tl.max(vals, axis=0)
+        found = found + (ch_max > THRESHOLD).to(tl.int32)
+        c_idx += 1
+
     off1 = tl.arange(0, 1)
+    tl.store(tile_alive_ptr + tile_id + off1, found)
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 specialized for 1x1 conv: no spatial RF expansion needed
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def tile_screen_1x1_kernel(
+    x_ptr,
+    tile_alive_ptr,
+    N_val,
+    C_IN,
+    H_IN,
+    W_IN,
+    GH,
+    GW,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    THRESHOLD: tl.constexpr,
+):
+    """Stage 1 for 1x1 conv: tile positions correspond directly to input positions."""
+    tile_id = tl.program_id(0)
+    total_tiles = N_val * GH * GW
+    if tile_id >= total_tiles:
+        return
+
+    gw_idx = tile_id % GW
+    tmp = tile_id // GW
+    gh_idx = tmp % GH
+    n_idx = tmp // GH
+
+    offs_m = tl.arange(0, BLOCK_M)
+    out_h = gh_idx * BLOCK_H + offs_m // BLOCK_W
+    out_w = gw_idx * BLOCK_W + offs_m % BLOCK_W
+    m_mask = (out_h < H_IN) & (out_w < W_IN)
+
+    HW = H_IN * W_IN
+
+    c_idx = 0
+    found = tl.zeros([1], dtype=tl.int32)
+
+    while (c_idx < C_IN) & (tl.sum(found) == 0):
+        addrs = (n_idx * C_IN + c_idx) * HW + out_h * W_IN + out_w
+        vals = tl.load(x_ptr + addrs, mask=m_mask, other=0.0)
+        ch_max = tl.max(vals, axis=0)
+        found = found + (ch_max > THRESHOLD).to(tl.int32)
+        c_idx += 1
+
+    off1 = tl.arange(0, 1)
+    tl.store(tile_alive_ptr + tile_id + off1, found)
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: Group bitmask — only runs on alive tiles
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def group_bitmask_kernel(
+    x_ptr,
+    tile_alive_ptr,       # [N_TILES] int32 input from Stage 1
+    ag_mask_ptr,          # [N_TILES] int32 output — per-tile bitmask
+    tile_class_ptr,       # [N_TILES] int32 output — TILE_ZERO/SPARSE/DENSEISH
+    N_val,
+    C_IN,
+    H_IN,
+    W_IN,
+    H_OUT,
+    W_OUT,
+    GH,
+    GW,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    KERNEL_SIZE: tl.constexpr,
+    STRIDE: tl.constexpr,
+    PAD: tl.constexpr,
+    GROUP_SIZE_C: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    MAX_AG: tl.constexpr,
+    RF_SIZE: tl.constexpr,
+    THRESHOLD: tl.constexpr,
+    ALL_ONES_MASK: tl.constexpr,
+):
+    """Stage 2: Per-group bitmask construction for ALIVE tiles only.
+
+    Dead tiles (tile_alive==0) get mask=0 and class=TILE_ZERO immediately.
+    Alive tiles get full group scan and classification:
+      - All groups active → TILE_DENSEISH
+      - Some groups active → TILE_SPARSE
+    """
+    tile_id = tl.program_id(0)
+    total_tiles = N_val * GH * GW
+    if tile_id >= total_tiles:
+        return
+
+    off1 = tl.arange(0, 1)
+
+    # Check Stage 1 result — dead tiles skip entirely
+    alive = tl.load(tile_alive_ptr + tile_id + off1)
+    if tl.sum(alive) == 0:
+        tl.store(ag_mask_ptr + tile_id + off1, tl.zeros([1], dtype=tl.int32))
+        tl.store(tile_class_ptr + tile_id + off1, tl.zeros([1], dtype=tl.int32))  # TILE_ZERO=0
+        return
+
+    # Alive tile — full per-group bitmask construction
+    gw_idx = tile_id % GW
+    tmp = tile_id // GW
+    gh_idx = tmp % GH
+    n_idx = tmp // GH
+
+    rf_h_start = gh_idx * BLOCK_H * STRIDE - PAD
+    rf_w_start = gw_idx * BLOCK_W * STRIDE - PAD
+    RF_H: tl.constexpr = (BLOCK_H - 1) * STRIDE + KERNEL_SIZE
+    RF_W: tl.constexpr = (BLOCK_W - 1) * STRIDE + KERNEL_SIZE
+
+    flat_idx = tl.arange(0, RF_SIZE)
+    flat_row = flat_idx // RF_W
+    flat_col = flat_idx % RF_W
+    valid_mask = flat_idx < (RF_H * RF_W)
+
+    hh = rf_h_start + flat_row
+    ww = rf_w_start + flat_col
+    hw_mask = valid_mask & (hh >= 0) & (hh < H_IN) & (ww >= 0) & (ww < W_IN)
+
+    safe_h = tl.minimum(tl.maximum(hh, 0), H_IN - 1)
+    safe_w = tl.minimum(tl.maximum(ww, 0), W_IN - 1)
+
+    HW = H_IN * W_IN
+
     mask = tl.zeros([1], dtype=tl.int32)
 
     for g in range(NUM_GROUPS):
@@ -155,18 +289,89 @@ def prescan_bitmask_kernel(
                 group_max = tl.maximum(group_max, ch_max)
 
         is_active_int = (group_max > THRESHOLD).to(tl.int32)
-        # Set bit g in mask  (1 << g is a Python int since g comes from range)
         mask = mask + is_active_int * (1 << g)
 
     tl.store(ag_mask_ptr + tile_id + off1, mask)
 
+    # Classify: denseish if all groups active, else sparse
+    is_denseish = (mask == ALL_ONES_MASK).to(tl.int32)
+    # TILE_SPARSE=1, TILE_DENSEISH=2
+    tile_class = 1 + is_denseish
+    tl.store(tile_class_ptr + tile_id + off1, tile_class)
+
 
 # ---------------------------------------------------------------------------
-# Python helpers — metadata construction & fallback check
+# Stage 2 specialized for 1x1 conv
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def group_bitmask_1x1_kernel(
+    x_ptr,
+    tile_alive_ptr,
+    ag_mask_ptr,
+    tile_class_ptr,
+    N_val,
+    C_IN,
+    H_IN,
+    W_IN,
+    GH,
+    GW,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    GROUP_SIZE_C: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    THRESHOLD: tl.constexpr,
+    ALL_ONES_MASK: tl.constexpr,
+):
+    tile_id = tl.program_id(0)
+    total_tiles = N_val * GH * GW
+    if tile_id >= total_tiles:
+        return
+
+    off1 = tl.arange(0, 1)
+    alive = tl.load(tile_alive_ptr + tile_id + off1)
+    if tl.sum(alive) == 0:
+        tl.store(ag_mask_ptr + tile_id + off1, tl.zeros([1], dtype=tl.int32))
+        tl.store(tile_class_ptr + tile_id + off1, tl.zeros([1], dtype=tl.int32))
+        return
+
+    gw_idx = tile_id % GW
+    tmp = tile_id // GW
+    gh_idx = tmp % GH
+    n_idx = tmp // GH
+
+    offs_m = tl.arange(0, BLOCK_M)
+    out_h = gh_idx * BLOCK_H + offs_m // BLOCK_W
+    out_w = gw_idx * BLOCK_W + offs_m % BLOCK_W
+    m_mask = (out_h < H_IN) & (out_w < W_IN)
+    HW = H_IN * W_IN
+
+    mask = tl.zeros([1], dtype=tl.int32)
+    for g in range(NUM_GROUPS):
+        group_max = tl.zeros([1], dtype=tl.float32)
+        for c_off in range(GROUP_SIZE_C):
+            c = g * GROUP_SIZE_C + c_off
+            if c < C_IN:
+                addrs = (n_idx * C_IN + c) * HW + out_h * W_IN + out_w
+                vals = tl.load(x_ptr + addrs, mask=m_mask, other=0.0)
+                ch_max = tl.max(vals, axis=0)
+                group_max = tl.maximum(group_max, ch_max)
+        is_active_int = (group_max > THRESHOLD).to(tl.int32)
+        mask = mask + is_active_int * (1 << g)
+
+    tl.store(ag_mask_ptr + tile_id + off1, mask)
+    is_denseish = (mask == ALL_ONES_MASK).to(tl.int32)
+    tile_class = 1 + is_denseish
+    tl.store(tile_class_ptr + tile_id + off1, tile_class)
+
+
+# ---------------------------------------------------------------------------
+# Python helpers — two-stage metadata construction
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def _build_active_group_bitmask(
+def _build_two_stage_metadata(
     x_f16,
     N,
     C_IN,
@@ -182,77 +387,114 @@ def _build_active_group_bitmask(
     stride,
     padding,
     threshold,
+    tile_alive_buf,
     ag_mask_buf,
+    tile_class_buf,
 ):
-    """Build per-tile active-group bitmask (uint32).
+    """Two-stage prescan: tile_screen → conditional group_bitmask.
 
-    Returns (GROUP_SIZE_C, NUM_GROUPS) actually used.
+    Returns (GROUP_SIZE_C, NUM_GROUPS).
     """
     GROUP_SIZE_C = choose_group_size(C_IN)
     N_TILES = N * GH * GW
     NUM_GROUPS = triton.cdiv(C_IN, GROUP_SIZE_C)
+    ALL_ONES_MASK = (1 << NUM_GROUPS) - 1
 
-    rf_h = (BH - 1) * stride + kernel_size
-    rf_w = (BW - 1) * stride + kernel_size
-    rf_actual = rf_h * rf_w
-    RF_SIZE = triton.next_power_of_2(max(rf_actual, 1))
+    # --- Stage 1: tile screening ---
+    if kernel_size == 1:
+        BM = BH * BW
+        tile_screen_1x1_kernel[(N_TILES,)](
+            x_f16,
+            tile_alive_buf,
+            N, C_IN, H_IN, W_IN, GH, GW,
+            BLOCK_H=BH, BLOCK_W=BW, BLOCK_M=BM,
+            THRESHOLD=threshold,
+        )
+    else:
+        rf_h = (BH - 1) * stride + kernel_size
+        rf_w = (BW - 1) * stride + kernel_size
+        RF_SIZE = triton.next_power_of_2(max(rf_h * rf_w, 1))
 
-    prescan_bitmask_kernel[(N_TILES,)](
-        x_f16,
-        ag_mask_buf,
-        N,
-        C_IN,
-        H_IN,
-        W_IN,
-        H_OUT,
-        W_OUT,
-        GH,
-        GW,
-        BLOCK_H=BH,
-        BLOCK_W=BW,
-        KERNEL_SIZE=kernel_size,
-        STRIDE=stride,
-        PAD=padding,
-        GROUP_SIZE_C=GROUP_SIZE_C,
-        NUM_GROUPS=NUM_GROUPS,
-        RF_SIZE=RF_SIZE,
-        THRESHOLD=threshold,
-    )
+        tile_screen_kernel[(N_TILES,)](
+            x_f16,
+            tile_alive_buf,
+            N, C_IN, H_IN, W_IN, GH, GW,
+            BLOCK_H=BH, BLOCK_W=BW,
+            KERNEL_SIZE=kernel_size, STRIDE=stride, PAD=padding,
+            RF_SIZE=RF_SIZE, THRESHOLD=threshold,
+            C_BATCH=1,
+        )
+
+    # --- Stage 2: group bitmask (only meaningful for alive tiles) ---
+    if kernel_size == 1:
+        BM = BH * BW
+        group_bitmask_1x1_kernel[(N_TILES,)](
+            x_f16,
+            tile_alive_buf,
+            ag_mask_buf,
+            tile_class_buf,
+            N, C_IN, H_IN, W_IN, GH, GW,
+            BLOCK_H=BH, BLOCK_W=BW, BLOCK_M=BM,
+            GROUP_SIZE_C=GROUP_SIZE_C, NUM_GROUPS=NUM_GROUPS,
+            THRESHOLD=threshold, ALL_ONES_MASK=ALL_ONES_MASK,
+        )
+    else:
+        rf_h = (BH - 1) * stride + kernel_size
+        rf_w = (BW - 1) * stride + kernel_size
+        RF_SIZE = triton.next_power_of_2(max(rf_h * rf_w, 1))
+
+        group_bitmask_kernel[(N_TILES,)](
+            x_f16,
+            tile_alive_buf,
+            ag_mask_buf,
+            tile_class_buf,
+            N, C_IN, H_IN, W_IN, H_OUT, W_OUT, GH, GW,
+            BLOCK_H=BH, BLOCK_W=BW,
+            KERNEL_SIZE=kernel_size, STRIDE=stride, PAD=padding,
+            GROUP_SIZE_C=GROUP_SIZE_C, NUM_GROUPS=NUM_GROUPS,
+            MAX_AG=NUM_GROUPS,
+            RF_SIZE=RF_SIZE, THRESHOLD=threshold,
+            ALL_ONES_MASK=ALL_ONES_MASK,
+        )
 
     return GROUP_SIZE_C, NUM_GROUPS
 
 
-# Backward-compat alias used by fused_conv_lif.py
+# Backward-compat aliases for fused_conv_lif.py and other callers
+def _build_active_group_bitmask(
+    x_f16, N, C_IN, H_IN, W_IN, H_OUT, W_OUT,
+    BH, BW, GH, GW, kernel_size, stride, padding,
+    threshold, ag_mask_buf,
+):
+    """Compat shim — allocates temp buffers and calls two-stage builder."""
+    N_TILES = N * GH * GW
+    device = x_f16.device
+    tile_alive_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
+    tile_class_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
+    return _build_two_stage_metadata(
+        x_f16, N, C_IN, H_IN, W_IN, H_OUT, W_OUT,
+        BH, BW, GH, GW, kernel_size, stride, padding,
+        threshold, tile_alive_buf, ag_mask_buf, tile_class_buf,
+    )
+
+
 def _build_active_group_metadata(
     x_f16, N, C_IN, H_IN, W_IN, H_OUT, W_OUT,
     BH, BW, GH, GW, kernel_size, stride, padding,
     threshold, ag_count_buf, ag_list_buf,
 ):
-    """Legacy shim — redirects to bitmask builder.
-
-    ag_count_buf is reinterpreted as ag_mask_buf (same shape: [N_TILES] int32).
-    ag_list_buf is IGNORED (no longer needed).
-    """
+    """Legacy shim for fused_conv_lif.py."""
     return _build_active_group_bitmask(
         x_f16, N, C_IN, H_IN, W_IN, H_OUT, W_OUT,
         BH, BW, GH, GW, kernel_size, stride, padding,
-        threshold, ag_count_buf,  # reuse as mask buf
+        threshold, ag_count_buf,
     )
 
 
 def _check_dense_fallback(ag_mask_buf, N_TILES, NUM_GROUPS, fallback_ratio=FALLBACK_RATIO):
-    """Check if average active-group ratio exceeds fallback threshold."""
     if NUM_GROUPS == 0:
         return False
-    # popcount via bit tricks on int32: count set bits per mask
     masks = ag_mask_buf[:N_TILES].int()
-    # Compute popcount for each mask value
-    total_active = 0
-    # GPU-friendly popcount: convert to float bit-count
-    # Use the identity: popcount(x) = sum of bits
-    # For int32, iterate 32 bits is expensive; use a simpler proxy:
-    # avg_active ≈ (sum of masks != 0) is too coarse.
-    # Instead use a vectorized approach:
     pc = torch.zeros(N_TILES, dtype=torch.int32, device=masks.device)
     tmp = masks.clone()
     for _ in range(32):
@@ -263,21 +505,15 @@ def _check_dense_fallback(ag_mask_buf, N_TILES, NUM_GROUPS, fallback_ratio=FALLB
     return avg_active > threshold
 
 
-def _check_dense_fallback_fast(ag_mask_buf, N_TILES, NUM_GROUPS, fallback_ratio=FALLBACK_RATIO):
-    """Fast approximate fallback check — avoids full popcount.
-
-    Uses the fraction of non-zero masks as a conservative proxy.
-    If most tiles have *any* activity AND NUM_GROUPS is small,
-    the actual AGR is likely high → fall back.
-    """
-    if NUM_GROUPS == 0:
-        return False
-    nonzero_frac = (ag_mask_buf[:N_TILES] != 0).float().mean().item()
-    # If almost all tiles are active and few groups exist, AGR is high
-    if nonzero_frac > fallback_ratio and NUM_GROUPS <= 4:
-        return True
-    # Otherwise do full popcount check
-    return _check_dense_fallback(ag_mask_buf, N_TILES, NUM_GROUPS, fallback_ratio)
+def _popcount_buf(ag_mask_buf, N_TILES):
+    """Vectorised popcount for int32 bitmask buffer."""
+    masks = ag_mask_buf[:N_TILES].int()
+    pc = torch.zeros(N_TILES, dtype=torch.int32, device=masks.device)
+    tmp = masks.clone()
+    for _ in range(32):
+        pc += tmp & 1
+        tmp = tmp >> 1
+    return pc
 
 
 # ---------------------------------------------------------------------------
@@ -309,21 +545,11 @@ _CONFIGS_8x16 = _make_configs(8, 16)
 
 
 # ===================================================================
-# Compute kernels — bitmask-based iteration with zero-tile early return
+# Compute kernels — three-path per tile:
+#   TILE_ZERO (mask==0): bias-only early return
+#   TILE_DENSEISH (all groups active): unconditional group iteration
+#   TILE_SPARSE: bitmask-gated iteration
 # ===================================================================
-#
-# Naming: sparse_conv{K}x{K}s{S}_bm_kernel_{BH}x{BW}
-#   K  = kernel size (1 or 3)
-#   S  = stride (1 or 2)
-#   BH×BW = tile size
-#
-# Inner loop: for g in range(NUM_GROUPS):  (constexpr-unrolled)
-#   - check bit g of ag_mask
-#   - if inactive, k_mask is all-False → masked loads return zero
-#   - dot with zero operands is a no-op in terms of result
-#
-# Zero-tile early return: if ag_mask == 0, write bias-only and return.
-# This avoids the entire NUM_GROUPS × 9 inner loop for 99%+ of tiles.
 
 # ---- 1x1 / stride=1 ----
 
@@ -337,6 +563,7 @@ def sparse_conv1x1_bm_kernel_8x8(
     GH: tl.constexpr, GW: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     GROUP_SIZE_C: tl.constexpr, NUM_GROUPS: tl.constexpr,
+    ALL_ONES_MASK: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr,
 ):
@@ -361,8 +588,9 @@ def sparse_conv1x1_bm_kernel_8x8(
     HW_IN: tl.constexpr = H_IN * W_IN
     HW_OUT: tl.constexpr = H_OUT * W_OUT
 
-    # Stage 1: bitmask check — zero-tile early return
     ag_mask = tl.load(ag_mask_ptr + tile_id)
+
+    # --- Path 1: Zero tile early return ---
     if ag_mask == 0:
         acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         if HAS_BIAS:
@@ -371,19 +599,31 @@ def sparse_conv1x1_bm_kernel_8x8(
         tl.store(oa, acc, mask=m_mask[:, None] & n_mask[None, :])
         return
 
-    # Stage 2: sparse compute via bitmask
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    for g in range(NUM_GROUPS):
-        g_active = (ag_mask >> g) & 1
-        cin_start = g * GROUP_SIZE_C
-        offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
-        k_mask = (g_active != 0) & (offs_k < C_IN)
 
-        x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + out_h[:, None] * W_IN + out_w[:, None]
-        x_tile = tl.load(x_addrs, mask=k_mask[None, :] & m_mask[:, None], other=0.0).to(tl.float16)
-        w_addrs = w_cl_ptr + offs_n[None, :] * C_IN + offs_k[:, None]
-        w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
-        acc += tl.dot(x_tile, w_tile)
+    # --- Path 2: Dense-ish tile (all groups active) — no bit-check ---
+    if ag_mask == ALL_ONES_MASK:
+        for g in range(NUM_GROUPS):
+            cin_start = g * GROUP_SIZE_C
+            offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+            k_mask = offs_k < C_IN
+            x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + out_h[:, None] * W_IN + out_w[:, None]
+            x_tile = tl.load(x_addrs, mask=k_mask[None, :] & m_mask[:, None], other=0.0).to(tl.float16)
+            w_addrs = w_cl_ptr + offs_n[None, :] * C_IN + offs_k[:, None]
+            w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+            acc += tl.dot(x_tile, w_tile)
+    else:
+        # --- Path 3: Sparse tile — bitmask-gated ---
+        for g in range(NUM_GROUPS):
+            g_active = (ag_mask >> g) & 1
+            cin_start = g * GROUP_SIZE_C
+            offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+            k_mask = (g_active != 0) & (offs_k < C_IN)
+            x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + out_h[:, None] * W_IN + out_w[:, None]
+            x_tile = tl.load(x_addrs, mask=k_mask[None, :] & m_mask[:, None], other=0.0).to(tl.float16)
+            w_addrs = w_cl_ptr + offs_n[None, :] * C_IN + offs_k[:, None]
+            w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+            acc += tl.dot(x_tile, w_tile)
 
     if HAS_BIAS:
         acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
@@ -401,6 +641,7 @@ def sparse_conv1x1_bm_kernel_8x16(
     GH: tl.constexpr, GW: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     GROUP_SIZE_C: tl.constexpr, NUM_GROUPS: tl.constexpr,
+    ALL_ONES_MASK: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr,
 ):
@@ -432,16 +673,27 @@ def sparse_conv1x1_bm_kernel_8x16(
         return
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    for g in range(NUM_GROUPS):
-        g_active = (ag_mask >> g) & 1
-        cin_start = g * GROUP_SIZE_C
-        offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
-        k_mask = (g_active != 0) & (offs_k < C_IN)
-        x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + out_h[:, None] * W_IN + out_w[:, None]
-        x_tile = tl.load(x_addrs, mask=k_mask[None, :] & m_mask[:, None], other=0.0).to(tl.float16)
-        w_addrs = w_cl_ptr + offs_n[None, :] * C_IN + offs_k[:, None]
-        w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
-        acc += tl.dot(x_tile, w_tile)
+    if ag_mask == ALL_ONES_MASK:
+        for g in range(NUM_GROUPS):
+            cin_start = g * GROUP_SIZE_C
+            offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+            k_mask = offs_k < C_IN
+            x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + out_h[:, None] * W_IN + out_w[:, None]
+            x_tile = tl.load(x_addrs, mask=k_mask[None, :] & m_mask[:, None], other=0.0).to(tl.float16)
+            w_addrs = w_cl_ptr + offs_n[None, :] * C_IN + offs_k[:, None]
+            w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+            acc += tl.dot(x_tile, w_tile)
+    else:
+        for g in range(NUM_GROUPS):
+            g_active = (ag_mask >> g) & 1
+            cin_start = g * GROUP_SIZE_C
+            offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+            k_mask = (g_active != 0) & (offs_k < C_IN)
+            x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + out_h[:, None] * W_IN + out_w[:, None]
+            x_tile = tl.load(x_addrs, mask=k_mask[None, :] & m_mask[:, None], other=0.0).to(tl.float16)
+            w_addrs = w_cl_ptr + offs_n[None, :] * C_IN + offs_k[:, None]
+            w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+            acc += tl.dot(x_tile, w_tile)
 
     if HAS_BIAS:
         acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
@@ -461,6 +713,7 @@ def sparse_conv3x3s1_bm_kernel_8x8(
     GH: tl.constexpr, GW: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     GROUP_SIZE_C: tl.constexpr, NUM_GROUPS: tl.constexpr,
+    ALL_ONES_MASK: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr,
 ):
@@ -487,6 +740,8 @@ def sparse_conv3x3s1_bm_kernel_8x8(
     W_CO: tl.constexpr = 9 * C_IN
 
     ag_mask = tl.load(ag_mask_ptr + tile_id)
+
+    # Zero tile
     if ag_mask == 0:
         acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         if HAS_BIAS:
@@ -496,28 +751,48 @@ def sparse_conv3x3s1_bm_kernel_8x8(
         return
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    for g in range(NUM_GROUPS):
-        g_active = (ag_mask >> g) & 1
-        cin_start = g * GROUP_SIZE_C
-        offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
-        k_mask = (g_active != 0) & (offs_k < C_IN)
 
-        for kh in tl.static_range(3):
-            for kw in tl.static_range(3):
-                in_h = out_h + (kh - 1)
-                in_w = out_w + (kw - 1)
-                h_ok = (in_h >= 0) & (in_h < H_IN)
-                w_ok = (in_w >= 0) & (in_w < W_IN)
-                safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
-                safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
-
-                x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + safe_h[:, None] * W_IN + safe_w[:, None]
-                x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
-                x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
-
-                w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
-                w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
-                acc += tl.dot(x_tile, w_tile)
+    # Dense-ish tile: skip per-group bit check
+    if ag_mask == ALL_ONES_MASK:
+        for g in range(NUM_GROUPS):
+            cin_start = g * GROUP_SIZE_C
+            offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+            k_mask = offs_k < C_IN
+            for kh in tl.static_range(3):
+                for kw in tl.static_range(3):
+                    in_h = out_h + (kh - 1)
+                    in_w = out_w + (kw - 1)
+                    h_ok = (in_h >= 0) & (in_h < H_IN)
+                    w_ok = (in_w >= 0) & (in_w < W_IN)
+                    safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
+                    safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
+                    x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + safe_h[:, None] * W_IN + safe_w[:, None]
+                    x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
+                    x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
+                    w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
+                    w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                    acc += tl.dot(x_tile, w_tile)
+    else:
+        # Sparse tile: bitmask-gated
+        for g in range(NUM_GROUPS):
+            g_active = (ag_mask >> g) & 1
+            cin_start = g * GROUP_SIZE_C
+            offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+            k_mask = (g_active != 0) & (offs_k < C_IN)
+            for kh in tl.static_range(3):
+                for kw in tl.static_range(3):
+                    in_h = out_h + (kh - 1)
+                    in_w = out_w + (kw - 1)
+                    h_ok = (in_h >= 0) & (in_h < H_IN)
+                    w_ok = (in_w >= 0) & (in_w < W_IN)
+                    safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
+                    safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
+                    x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + safe_h[:, None] * W_IN + safe_w[:, None]
+                    x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
+                    x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
+                    w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
+                    w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                    acc += tl.dot(x_tile, w_tile)
 
     if HAS_BIAS:
         acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
@@ -535,6 +810,7 @@ def sparse_conv3x3s1_bm_kernel_8x16(
     GH: tl.constexpr, GW: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     GROUP_SIZE_C: tl.constexpr, NUM_GROUPS: tl.constexpr,
+    ALL_ONES_MASK: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr,
 ):
@@ -569,28 +845,45 @@ def sparse_conv3x3s1_bm_kernel_8x16(
         return
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    for g in range(NUM_GROUPS):
-        g_active = (ag_mask >> g) & 1
-        cin_start = g * GROUP_SIZE_C
-        offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
-        k_mask = (g_active != 0) & (offs_k < C_IN)
-
-        for kh in tl.static_range(3):
-            for kw in tl.static_range(3):
-                in_h = out_h + (kh - 1)
-                in_w = out_w + (kw - 1)
-                h_ok = (in_h >= 0) & (in_h < H_IN)
-                w_ok = (in_w >= 0) & (in_w < W_IN)
-                safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
-                safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
-
-                x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + safe_h[:, None] * W_IN + safe_w[:, None]
-                x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
-                x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
-
-                w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
-                w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
-                acc += tl.dot(x_tile, w_tile)
+    if ag_mask == ALL_ONES_MASK:
+        for g in range(NUM_GROUPS):
+            cin_start = g * GROUP_SIZE_C
+            offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+            k_mask = offs_k < C_IN
+            for kh in tl.static_range(3):
+                for kw in tl.static_range(3):
+                    in_h = out_h + (kh - 1)
+                    in_w = out_w + (kw - 1)
+                    h_ok = (in_h >= 0) & (in_h < H_IN)
+                    w_ok = (in_w >= 0) & (in_w < W_IN)
+                    safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
+                    safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
+                    x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + safe_h[:, None] * W_IN + safe_w[:, None]
+                    x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
+                    x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
+                    w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
+                    w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                    acc += tl.dot(x_tile, w_tile)
+    else:
+        for g in range(NUM_GROUPS):
+            g_active = (ag_mask >> g) & 1
+            cin_start = g * GROUP_SIZE_C
+            offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+            k_mask = (g_active != 0) & (offs_k < C_IN)
+            for kh in tl.static_range(3):
+                for kw in tl.static_range(3):
+                    in_h = out_h + (kh - 1)
+                    in_w = out_w + (kw - 1)
+                    h_ok = (in_h >= 0) & (in_h < H_IN)
+                    w_ok = (in_w >= 0) & (in_w < W_IN)
+                    safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
+                    safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
+                    x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + safe_h[:, None] * W_IN + safe_w[:, None]
+                    x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
+                    x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
+                    w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
+                    w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                    acc += tl.dot(x_tile, w_tile)
 
     if HAS_BIAS:
         acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
@@ -610,6 +903,7 @@ def sparse_conv3x3s2_bm_kernel_8x8(
     GH: tl.constexpr, GW: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     GROUP_SIZE_C: tl.constexpr, NUM_GROUPS: tl.constexpr,
+    ALL_ONES_MASK: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr,
 ):
@@ -644,28 +938,45 @@ def sparse_conv3x3s2_bm_kernel_8x8(
         return
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    for g in range(NUM_GROUPS):
-        g_active = (ag_mask >> g) & 1
-        cin_start = g * GROUP_SIZE_C
-        offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
-        k_mask = (g_active != 0) & (offs_k < C_IN)
-
-        for kh in tl.static_range(3):
-            for kw in tl.static_range(3):
-                in_h = out_h * 2 + (kh - 1)
-                in_w = out_w * 2 + (kw - 1)
-                h_ok = (in_h >= 0) & (in_h < H_IN)
-                w_ok = (in_w >= 0) & (in_w < W_IN)
-                safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
-                safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
-
-                x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + safe_h[:, None] * W_IN + safe_w[:, None]
-                x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
-                x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
-
-                w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
-                w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
-                acc += tl.dot(x_tile, w_tile)
+    if ag_mask == ALL_ONES_MASK:
+        for g in range(NUM_GROUPS):
+            cin_start = g * GROUP_SIZE_C
+            offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+            k_mask = offs_k < C_IN
+            for kh in tl.static_range(3):
+                for kw in tl.static_range(3):
+                    in_h = out_h * 2 + (kh - 1)
+                    in_w = out_w * 2 + (kw - 1)
+                    h_ok = (in_h >= 0) & (in_h < H_IN)
+                    w_ok = (in_w >= 0) & (in_w < W_IN)
+                    safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
+                    safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
+                    x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + safe_h[:, None] * W_IN + safe_w[:, None]
+                    x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
+                    x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
+                    w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
+                    w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                    acc += tl.dot(x_tile, w_tile)
+    else:
+        for g in range(NUM_GROUPS):
+            g_active = (ag_mask >> g) & 1
+            cin_start = g * GROUP_SIZE_C
+            offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+            k_mask = (g_active != 0) & (offs_k < C_IN)
+            for kh in tl.static_range(3):
+                for kw in tl.static_range(3):
+                    in_h = out_h * 2 + (kh - 1)
+                    in_w = out_w * 2 + (kw - 1)
+                    h_ok = (in_h >= 0) & (in_h < H_IN)
+                    w_ok = (in_w >= 0) & (in_w < W_IN)
+                    safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
+                    safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
+                    x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + safe_h[:, None] * W_IN + safe_w[:, None]
+                    x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
+                    x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
+                    w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
+                    w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                    acc += tl.dot(x_tile, w_tile)
 
     if HAS_BIAS:
         acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
@@ -683,6 +994,7 @@ def sparse_conv3x3s2_bm_kernel_8x16(
     GH: tl.constexpr, GW: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     GROUP_SIZE_C: tl.constexpr, NUM_GROUPS: tl.constexpr,
+    ALL_ONES_MASK: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr,
 ):
@@ -717,28 +1029,45 @@ def sparse_conv3x3s2_bm_kernel_8x16(
         return
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    for g in range(NUM_GROUPS):
-        g_active = (ag_mask >> g) & 1
-        cin_start = g * GROUP_SIZE_C
-        offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
-        k_mask = (g_active != 0) & (offs_k < C_IN)
-
-        for kh in tl.static_range(3):
-            for kw in tl.static_range(3):
-                in_h = out_h * 2 + (kh - 1)
-                in_w = out_w * 2 + (kw - 1)
-                h_ok = (in_h >= 0) & (in_h < H_IN)
-                w_ok = (in_w >= 0) & (in_w < W_IN)
-                safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
-                safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
-
-                x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + safe_h[:, None] * W_IN + safe_w[:, None]
-                x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
-                x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
-
-                w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
-                w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
-                acc += tl.dot(x_tile, w_tile)
+    if ag_mask == ALL_ONES_MASK:
+        for g in range(NUM_GROUPS):
+            cin_start = g * GROUP_SIZE_C
+            offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+            k_mask = offs_k < C_IN
+            for kh in tl.static_range(3):
+                for kw in tl.static_range(3):
+                    in_h = out_h * 2 + (kh - 1)
+                    in_w = out_w * 2 + (kw - 1)
+                    h_ok = (in_h >= 0) & (in_h < H_IN)
+                    w_ok = (in_w >= 0) & (in_w < W_IN)
+                    safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
+                    safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
+                    x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + safe_h[:, None] * W_IN + safe_w[:, None]
+                    x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
+                    x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
+                    w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
+                    w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                    acc += tl.dot(x_tile, w_tile)
+    else:
+        for g in range(NUM_GROUPS):
+            g_active = (ag_mask >> g) & 1
+            cin_start = g * GROUP_SIZE_C
+            offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+            k_mask = (g_active != 0) & (offs_k < C_IN)
+            for kh in tl.static_range(3):
+                for kw in tl.static_range(3):
+                    in_h = out_h * 2 + (kh - 1)
+                    in_w = out_w * 2 + (kw - 1)
+                    h_ok = (in_h >= 0) & (in_h < H_IN)
+                    w_ok = (in_w >= 0) & (in_w < W_IN)
+                    safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
+                    safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
+                    x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + safe_h[:, None] * W_IN + safe_w[:, None]
+                    x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
+                    x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
+                    w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
+                    w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                    acc += tl.dot(x_tile, w_tile)
 
     if HAS_BIAS:
         acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
@@ -762,17 +1091,20 @@ def sparse_conv2d_forward(
     groups=1,
     threshold=1e-6,
     w_cl=None,
-    # Legacy params (ignored — kept for call-site compat)
+    # Legacy params (kept for compat)
     counts_buf=None,
     tile_cin_buf=None,
     group_flags_buf=None,
     ag_count_buf=None,
     ag_list_buf=None,
-    # New bitmask buffer
     ag_mask_buf=None,
+    # New two-stage buffers
+    tile_alive_buf=None,
+    tile_class_buf=None,
     return_ms=False,
     fallback_ratio=FALLBACK_RATIO,
     return_avg_active_ratio=False,
+    return_tile_stats=False,
 ):
     import torch.nn.functional as Fn
 
@@ -787,13 +1119,15 @@ def sparse_conv2d_forward(
     if isinstance(dilation, tuple):
         dilation = dilation[0]
 
-    # Unsupported configs → dense fallback
     if groups != 1 or dilation != 1:
         y = Fn.conv2d(x, weight, bias, stride=stride, padding=padding,
                       dilation=dilation, groups=groups).float()
+        ret = (y, 0.0)
         if return_avg_active_ratio:
-            return y, 0.0, 1.0
-        return y, 0.0
+            ret = ret + (1.0,)
+        if return_tile_stats:
+            ret = ret + (None,)
+        return ret
 
     H_OUT = (H_IN + 2 * padding - dilation * (kernel_size - 1) - 1) // stride + 1
     W_OUT = (W_IN + 2 * padding - dilation * (kernel_size - 1) - 1) // stride + 1
@@ -801,9 +1135,12 @@ def sparse_conv2d_forward(
     if H_OUT <= 0 or W_OUT <= 0:
         y = Fn.conv2d(x, weight, bias, stride=stride, padding=padding,
                       dilation=dilation, groups=groups).float()
+        ret = (y, 0.0)
         if return_avg_active_ratio:
-            return y, 0.0, 1.0
-        return y, 0.0
+            ret = ret + (1.0,)
+        if return_tile_stats:
+            ret = ret + (None,)
+        return ret
 
     supported = (
         (kernel_size == 1 and stride == 1 and padding == 0) or
@@ -814,28 +1151,31 @@ def sparse_conv2d_forward(
     if not supported:
         y = Fn.conv2d(x, weight, bias, stride=stride, padding=padding,
                       dilation=dilation, groups=groups).float()
+        ret = (y, 0.0)
         if return_avg_active_ratio:
-            return y, 0.0, 1.0
-        return y, 0.0
+            ret = ret + (1.0,)
+        if return_tile_stats:
+            ret = ret + (None,)
+        return ret
 
-    # 1x1/s2 → subsample input then use 1x1/s1 path
-    if kernel_size == 1 and stride == 2:
+    # 1x1/s2 → subsample then 1x1/s1
+    actual_kernel_1x1s2 = (kernel_size == 1 and stride == 2)
+    if actual_kernel_1x1s2:
         x = x[:, :, ::2, ::2].contiguous()
         N, C_IN, H_IN, W_IN = x.shape
         stride = 1
         H_OUT = H_IN
         W_OUT = W_IN
 
-    # Adaptive group size
     GROUP_SIZE_C = choose_group_size(C_IN)
     NUM_GROUPS = triton.cdiv(C_IN, GROUP_SIZE_C)
+    ALL_ONES_MASK = (1 << NUM_GROUPS) - 1
 
     BH, BW = _select_tile_sizes(H_OUT, W_OUT)
     GH = triton.cdiv(H_OUT, BH)
     GW = triton.cdiv(W_OUT, BW)
     N_TILES = N * GH * GW
 
-    # Weight layout
     if w_cl is not None:
         w_cl_f16 = w_cl
     else:
@@ -846,39 +1186,70 @@ def sparse_conv2d_forward(
 
     x_f16 = x.half().contiguous()
 
-    # Allocate bitmask buffer
+    # Allocate buffers
+    if tile_alive_buf is None or tile_alive_buf.numel() < N_TILES:
+        tile_alive_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
     if ag_mask_buf is None or ag_mask_buf.numel() < N_TILES:
         ag_mask_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
+    if tile_class_buf is None or tile_class_buf.numel() < N_TILES:
+        tile_class_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
 
-    # Build bitmask metadata (two-stage prescan)
-    _build_active_group_bitmask(
+    # Two-stage prescan
+    _build_two_stage_metadata(
         x_f16, N, C_IN, H_IN, W_IN, H_OUT, W_OUT,
         BH, BW, GH, GW,
         kernel_size, stride, padding,
-        threshold, ag_mask_buf,
+        threshold, tile_alive_buf, ag_mask_buf, tile_class_buf,
     )
 
-    # Compute AGR if requested
+    # Compute tile stats and AGR
+    tile_stats = None
     avg_active_ratio = None
-    if return_avg_active_ratio:
-        # Vectorised popcount via bit iteration
-        masks = ag_mask_buf[:N_TILES].int()
-        pc = torch.zeros(N_TILES, dtype=torch.int32, device=device)
-        tmp = masks.clone()
-        for _ in range(32):
-            pc += tmp & 1
-            tmp = tmp >> 1
-        avg_active_ratio = pc.float().mean().item() / max(NUM_GROUPS, 1)
+
+    if return_avg_active_ratio or return_tile_stats:
+        tc = tile_class_buf[:N_TILES]
+        zero_count = int((tc == TILE_ZERO).sum().item())
+        sparse_count = int((tc == TILE_SPARSE).sum().item())
+        denseish_count = int((tc == TILE_DENSEISH).sum().item())
+        alive_count = sparse_count + denseish_count
+
+        if return_tile_stats:
+            tile_stats = {
+                'stage1_zero_tiles': zero_count,
+                'stage2_tiles': alive_count,
+                'zero_tiles': zero_count,
+                'sparse_tiles': sparse_count,
+                'denseish_tiles': denseish_count,
+                'total_tiles': N_TILES,
+                'prescan_mode': 'two_stage',
+            }
+
+        if NUM_GROUPS > 0:
+            pc = _popcount_buf(ag_mask_buf, N_TILES)
+            avg_active_ratio = pc.float().mean().item() / max(NUM_GROUPS, 1)
+        else:
+            avg_active_ratio = 0.0
 
         if avg_active_ratio == 0.0:
             y = torch.zeros(N, C_OUT, H_OUT, W_OUT, dtype=torch.float32, device=device)
             if bias is not None:
                 y += bias.float().view(1, -1, 1, 1)
-            return y, 0.0, avg_active_ratio
+            ret = (y, 0.0)
+            if return_avg_active_ratio:
+                ret = ret + (avg_active_ratio,)
+            if return_tile_stats:
+                ret = ret + (tile_stats,)
+            return ret
+
         if avg_active_ratio > fallback_ratio:
             y = Fn.conv2d(x, weight, bias, stride=stride, padding=padding,
                           dilation=dilation, groups=groups).float()
-            return y, 0.0, avg_active_ratio
+            ret = (y, 0.0)
+            if return_avg_active_ratio:
+                ret = ret + (avg_active_ratio,)
+            if return_tile_stats:
+                ret = ret + (tile_stats,)
+            return ret
 
     has_bias = bias is not None
     bias_f32 = bias.float().contiguous() if has_bias else torch.empty(1, device=device)
@@ -893,7 +1264,6 @@ def sparse_conv2d_forward(
     def _grid(META):
         return (N_TILES, triton.cdiv(C_OUT, META["BLOCK_N"]))
 
-    # Select kernel by pattern + tile size
     if kernel_size == 1:
         kernel = sparse_conv1x1_bm_kernel_8x16 if BW == 16 else sparse_conv1x1_bm_kernel_8x8
     elif stride == 1:
@@ -915,6 +1285,7 @@ def sparse_conv2d_forward(
         HAS_BIAS=has_bias,
         GROUP_SIZE_C=GROUP_SIZE_C,
         NUM_GROUPS=NUM_GROUPS,
+        ALL_ONES_MASK=ALL_ONES_MASK,
     )
 
     if return_ms:
@@ -922,6 +1293,12 @@ def sparse_conv2d_forward(
         torch.cuda.synchronize(device)
         sparse_ms = se.elapsed_time(ee)
 
+    ret = (y, sparse_ms)
     if return_avg_active_ratio:
-        return y, sparse_ms, avg_active_ratio
-    return y, sparse_ms
+        if avg_active_ratio is None:
+            pc = _popcount_buf(ag_mask_buf, N_TILES)
+            avg_active_ratio = pc.float().mean().item() / max(NUM_GROUPS, 1)
+        ret = ret + (avg_active_ratio,)
+    if return_tile_stats:
+        ret = ret + (tile_stats,)
+    return ret

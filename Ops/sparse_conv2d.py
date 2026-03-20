@@ -1,11 +1,11 @@
 """
-SparseConv2d — v18 bitmask-based sparse Conv2d nn.Module wrapper.
+SparseConv2d — v19 Two-Stage Prescan + Tile Classification
 
-Changes from v17:
-  - _ag_count_buf / _ag_list_buf replaced with single _ag_mask_buf (int32 per tile)
-  - Diagnostics use bitmask popcount for active_group_ratio
-  - choose_group_size() for adaptive GROUP_SIZE per layer
-  - metadata_kind = "bitmask" in diagnostics
+Changes from v18:
+  - Three buffers: tile_alive_buf, ag_mask_buf, tile_class_buf
+  - Diagnostics include stage1_zero_tiles, stage2_tiles, denseish_tiles, sparse_tiles
+  - Unified zero backend via Ops.static_zero_conv2d.make_zero_conv_output
+  - metadata_kind = "two_stage_bitmask"
 """
 
 import sys
@@ -23,6 +23,8 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from Ops.static_zero_conv2d import make_zero_conv_output, ZERO_BACKEND_FAMILY
 
 
 @dataclass
@@ -112,8 +114,10 @@ class SparseConv2d(nn.Module):
         self._w_cl = None
         self._w_cl_version = -1
 
-        # Bitmask buffer (replaces old ag_count + ag_list)
+        # Two-stage prescan buffers
+        self._tile_alive_buf = None
         self._ag_mask_buf = None
+        self._tile_class_buf = None
 
         # Runtime policy state
         self._force_zero = False
@@ -134,7 +138,7 @@ class SparseConv2d(nn.Module):
         # Host-sync zero check disabled by default
         self._sync_zero_check = False
 
-        # Diagnostics (populated when collect_diag=True)
+        # Diagnostics
         self.collect_diag = False
         self._last_diag: Dict[str, Any] = {}
 
@@ -228,7 +232,7 @@ class SparseConv2d(nn.Module):
         return self._w_cl
 
     def _ensure_buffers(self, x):
-        """Allocate bitmask buffer (one int32 per tile)."""
+        """Allocate three buffers for two-stage prescan."""
         from Kernels.conv2d import _select_tile_sizes
         import triton
 
@@ -238,14 +242,16 @@ class SparseConv2d(nn.Module):
         GW = triton.cdiv(W, BW)
         N_TILES = N * GH * GW
 
-        if (
-            self._ag_mask_buf is None
-            or self._ag_mask_buf.numel() < N_TILES
-            or self._ag_mask_buf.device != x.device
-        ):
-            self._ag_mask_buf = torch.empty(N_TILES, dtype=torch.int32, device=x.device)
+        def _ensure(buf, needed, device):
+            if buf is None or buf.numel() < needed or buf.device != device:
+                return torch.empty(needed, dtype=torch.int32, device=device)
+            return buf
 
-        return self._ag_mask_buf
+        self._tile_alive_buf = _ensure(self._tile_alive_buf, N_TILES, x.device)
+        self._ag_mask_buf = _ensure(self._ag_mask_buf, N_TILES, x.device)
+        self._tile_class_buf = _ensure(self._tile_class_buf, N_TILES, x.device)
+
+        return self._tile_alive_buf, self._ag_mask_buf, self._tile_class_buf
 
     def _output_hw(self, H, W):
         kh, kw = self.kernel_size
@@ -260,11 +266,11 @@ class SparseConv2d(nn.Module):
         bias_ver = -1 if self.bias is None else self.bias._version
         key = (str(device), str(dtype), H_out, W_out, bias_ver)
         if key not in self._zero_template_cache:
-            template = torch.zeros(
-                1, self.out_channels, H_out, W_out, dtype=dtype, device=device
+            template = make_zero_conv_output(
+                1, self.out_channels, H_out, W_out, self.bias, device, dtype
             )
-            if self.bias is not None:
-                template += self.bias.detach().to(dtype=dtype, device=device).view(1, -1, 1, 1)
+            if not template.is_contiguous():
+                template = template.contiguous()
             self._zero_template_cache[key] = template
         return self._zero_template_cache[key]
 
@@ -480,7 +486,7 @@ class SparseConv2d(nn.Module):
 
         if self.profile_runtime:
             t0 = self._stamp()
-        ag_mask_buf = self._ensure_buffers(x)
+        tile_alive_buf, ag_mask_buf, tile_class_buf = self._ensure_buffers(x)
         w_cl = self._get_w_cl()
         if self.profile_runtime:
             ms = self._elapsed_ms(t0)
@@ -488,8 +494,10 @@ class SparseConv2d(nn.Module):
             self._profile_set_last("last_buffer_ms", ms)
 
         k = self.kernel_size[0]
-        if need_ratio:
-            y, sparse_ms, avg_active_ratio = sparse_conv2d_forward(
+        collect_tiles = self.collect_diag
+
+        if need_ratio or collect_tiles:
+            result = sparse_conv2d_forward(
                 x=x.contiguous(),
                 weight=self.weight,
                 bias=self.bias,
@@ -502,9 +510,17 @@ class SparseConv2d(nn.Module):
                 threshold=self.threshold,
                 w_cl=w_cl,
                 ag_mask_buf=ag_mask_buf,
+                tile_alive_buf=tile_alive_buf,
+                tile_class_buf=tile_class_buf,
                 return_ms=self.return_ms,
                 return_avg_active_ratio=True,
+                return_tile_stats=collect_tiles,
             )
+            if collect_tiles:
+                y, sparse_ms, avg_active_ratio, tile_stats = result
+            else:
+                y, sparse_ms, avg_active_ratio = result
+                tile_stats = None
         else:
             out = sparse_conv2d_forward(
                 x=x.contiguous(),
@@ -519,11 +535,15 @@ class SparseConv2d(nn.Module):
                 threshold=self.threshold,
                 w_cl=w_cl,
                 ag_mask_buf=ag_mask_buf,
+                tile_alive_buf=tile_alive_buf,
+                tile_class_buf=tile_class_buf,
                 return_ms=self.return_ms,
                 return_avg_active_ratio=False,
+                return_tile_stats=False,
             )
             y, sparse_ms = out
             avg_active_ratio = None
+            tile_stats = None
 
         self._last_sparse_ms = float(sparse_ms)
         self._last_dense_ms = 0.0
@@ -533,17 +553,16 @@ class SparseConv2d(nn.Module):
             self._profile_set_last("last_dense_fallback_ms", 0.0)
 
         if self.collect_diag:
-            self._collect_tile_group_diag(x, ag_mask_buf, sparse_ms, avg_active_ratio)
+            self._collect_tile_group_diag(x, ag_mask_buf, tile_class_buf, sparse_ms, avg_active_ratio, tile_stats)
 
         return y, avg_active_ratio
 
-    def _collect_tile_group_diag(self, x, ag_mask_buf, sparse_ms, avg_active_ratio):
-        """Collect per-forward bitmask-based diagnostics.
+    def _collect_tile_group_diag(self, x, ag_mask_buf, tile_class_buf, sparse_ms, avg_active_ratio, tile_stats):
+        """Collect per-forward diagnostics from two-stage prescan.
 
-        Only called when self.collect_diag is True.
         NOTE: GPU→CPU transfer — must NOT be enabled during perf timing.
         """
-        from Kernels.conv2d import _select_tile_sizes, choose_group_size
+        from Kernels.conv2d import _select_tile_sizes, choose_group_size, TILE_ZERO, TILE_SPARSE, TILE_DENSEISH
         import triton
 
         N, C_IN, H, W = x.shape
@@ -554,9 +573,24 @@ class SparseConv2d(nn.Module):
         GW = triton.cdiv(W, BW)
         N_TILES = N * GH * GW
 
-        masks_cpu = ag_mask_buf[:N_TILES].cpu().int()
+        # Get tile classification stats
+        if tile_stats is not None:
+            zero_tiles = tile_stats.get('zero_tiles', -1)
+            sparse_tiles = tile_stats.get('sparse_tiles', -1)
+            denseish_tiles = tile_stats.get('denseish_tiles', -1)
+            stage1_zero = tile_stats.get('stage1_zero_tiles', -1)
+            stage2_n = tile_stats.get('stage2_tiles', -1)
+        else:
+            # Compute from tile_class_buf directly
+            tc = tile_class_buf[:N_TILES].cpu()
+            zero_tiles = int((tc == TILE_ZERO).sum().item())
+            sparse_tiles = int((tc == TILE_SPARSE).sum().item())
+            denseish_tiles = int((tc == TILE_DENSEISH).sum().item())
+            stage1_zero = zero_tiles
+            stage2_n = sparse_tiles + denseish_tiles
 
-        # Vectorised popcount
+        # Compute AGR from bitmask
+        masks_cpu = ag_mask_buf[:N_TILES].cpu().int()
         pc = torch.zeros(N_TILES, dtype=torch.int32)
         tmp = masks_cpu.clone()
         for _ in range(32):
@@ -565,20 +599,19 @@ class SparseConv2d(nn.Module):
 
         total_groups_all_tiles = float(N_TILES * NUM_GROUPS)
         nonzero_groups_all_tiles = float(pc.sum().item())
-        tile_zero_count = int((masks_cpu == 0).sum().item())
 
         agr = nonzero_groups_all_tiles / max(total_groups_all_tiles, 1.0)
-        tzr = tile_zero_count / max(N_TILES, 1)
+        tzr = zero_tiles / max(N_TILES, 1)
 
         self._last_diag = {
             'sparse_path_executed': True,
-            'metadata_kind': 'bitmask',
+            'metadata_kind': 'two_stage_bitmask',
             'group_size': GROUP_SIZE_C,
             'num_groups': NUM_GROUPS,
             'nonzero_group_count': nonzero_groups_all_tiles,
             'total_group_count': total_groups_all_tiles,
             'active_group_ratio': agr,
-            'tile_zero_count': tile_zero_count,
+            'tile_zero_count': zero_tiles,
             'total_tile_count': N_TILES,
             'tile_zero_ratio': tzr,
             'effective_k_ratio': agr,
@@ -586,10 +619,15 @@ class SparseConv2d(nn.Module):
             'sparse_total_ms': sparse_ms,
             'zero_check_ms': -1.0,
             'metadata_ms': -1.0,
-            # Two-stage prescan stats (tile_zero_count = stage1 zeros)
-            'prescan_stage1_zero_tiles': tile_zero_count,
-            'prescan_stage2_tiles': N_TILES - tile_zero_count,
-            'prescan_mode': 'two_stage_bitmask',
+            # Two-stage prescan stats
+            'stage1_zero_tiles': stage1_zero,
+            'stage2_tiles': stage2_n,
+            'zero_tiles': zero_tiles,
+            'sparse_tiles': sparse_tiles,
+            'denseish_tiles': denseish_tiles,
+            'prescan_mode': 'two_stage',
+            # Operator type
+            'kernel_type': f"{self.kernel_size[0]}x{self.kernel_size[0]}/s{self.stride[0]}",
         }
 
     def _fallback_forward(self, x):
@@ -615,7 +653,7 @@ class SparseConv2d(nn.Module):
             f"{self.in_channels}, {self.out_channels}, "
             f"kernel_size={self.kernel_size}, stride={self.stride}, "
             f"padding={self.padding}, block_size={bs}, "
-            f"return_ms={self.return_ms}, sparse=True, metadata=bitmask, "
+            f"return_ms={self.return_ms}, sparse=True, metadata=two_stage_bitmask, "
             f"dense_threshold={self._dense_threshold}, warmup_steps={self._warmup_left}, "
             f"calib_every={self._calib_every}, profile_runtime={self.profile_runtime}"
         )
