@@ -1,26 +1,21 @@
 """
-SparseFlow Conv2d Triton Kernels — v21.0 Refined Two-Stage Prescan
+SparseFlow Conv2d Triton Kernels — v22.0
 
-Changes from v20:
-  A. Stage 1 is now genuinely cheap for ALL tiles:
-     - Checks only the first channel per group across RF positions
-     - Classifies as DENSEISH (all groups' rep channels active) or UNCERTAIN
-     - NO expensive exact-zero verification inline — that moves to Stage 2
-     - Cost: O(NUM_GROUPS × RF_SIZE) per tile, uniformly
-  B. Stage 2 handles all refinement for UNCERTAIN tiles:
-     - Full per-group scan → exact bitmask
-     - Classifies as ZERO (mask==0), DENSEISH (mask==ALL_ONES), or SPARSE
-     - Includes early-exit when all groups found active
-  C. Dense-ish tile execution path is more truly dense-like:
-     - 3x3 kernels: spatial-outer / channel-inner loop order
-       → spatial addresses computed once per (kh,kw), reused across channel groups
-     - 1x1 kernels: pre-computed spatial base, flat channel iteration
-     - Structurally distinct from the sparse bitmask-gated path
-  D. Tile classification uses named constants throughout:
-     - TILE_ZERO = 0
-     - TILE_SPARSE = 1
-     - TILE_DENSEISH = 2
-     - TILE_UNCERTAIN = 3  (no more magic number)
+Changes from v21:
+  A. Zero-candidate refinement lane in two-stage prescan:
+     - Stage 1 now classifies: DENSEISH / ZERO_CANDIDATE / UNCERTAIN
+     - Stage 2a: cheap early-exit flat scan for zero-candidate tiles
+     - Stage 2b: full per-group bitmask for uncertain tiles (existing)
+  B. Dense-ish tile path restructured as flat dense microkernel:
+     - No group/bitmask abstraction in dense path
+     - Spatial-outer / flat-channel-inner loop (3x3)
+     - Pre-computed spatial base / flat channel (1x1)
+     - Sparse path: true group skip via `if g_active != 0:`
+  C. Legacy compatibility cleanup:
+     - Removed stale tile_screen/tile_alive kernels
+     - Removed legacy ag_count/ag_list parameter threading
+     - Simplified compat shims for fused_conv_lif.py
+     - Vectorised popcount (SWAR, no Python loop)
 
 Supported patterns:
   1x1/s1/p0, 1x1/s2/p0 (via subsample), 3x3/s1/p1, 3x3/s2/p1
@@ -38,9 +33,14 @@ TILE_ZERO = 0
 TILE_SPARSE = 1
 TILE_DENSEISH = 2
 TILE_UNCERTAIN = 3
+TILE_ZERO_CANDIDATE = 4
 
 FALLBACK_RATIO = 0.85
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def choose_group_size(c_in: int) -> int:
     if c_in <= 128:
@@ -52,10 +52,6 @@ def choose_group_size(c_in: int) -> int:
         gs *= 2
         num_groups = (c_in + gs - 1) // gs
     return gs
-
-
-# Legacy alias
-GROUP_SIZE = 32
 
 
 def _select_tile_sizes(H, W):
@@ -77,23 +73,17 @@ def _select_block_sizes(H, W, C_IN, C_OUT, kernel_size, N):
 # Checks ONE representative channel (first) per group across RF positions.
 # Cost: O(NUM_GROUPS × RF_SIZE) per tile — uniformly cheap.
 #
-# Classification:
+# Three-way classification:
 #   - ALL groups' rep channels active → DENSEISH
-#     (safe: dense path iterates all channels unconditionally)
-#   - Otherwise → UNCERTAIN (includes possible-zero and mixed)
-#     (Stage 2 will refine with full per-group scan)
-#
-# KEY DESIGN POINT:
-#   Stage 1 does NOT attempt to confirm zero tiles.
-#   The expensive full-channel verification is entirely in Stage 2.
-#   This keeps Stage 1 uniformly cheap with no data-dependent branches.
+#   - NO group's rep channel active   → ZERO_CANDIDATE
+#   - Otherwise                       → UNCERTAIN
 # ===========================================================================
 
 @triton.jit
 def tile_coarse_classify_kernel(
     x_ptr,
-    tile_class_ptr,       # [N_TILES] int32 output
-    ag_mask_ptr,          # [N_TILES] int32 output: preliminary rough mask
+    tile_class_ptr,
+    ag_mask_ptr,
     N_val,
     C_IN,
     H_IN,
@@ -111,13 +101,9 @@ def tile_coarse_classify_kernel(
     NUM_GROUPS: tl.constexpr,
     ALL_ONES_MASK: tl.constexpr,
     UNCERTAIN_CLASS: tl.constexpr,
+    ZERO_CANDIDATE_CLASS: tl.constexpr,
 ):
-    """Stage 1: Coarse classification for 3x3 convolutions.
-
-    Checks first channel per group across all RF positions.
-    Only classifies DENSEISH (all groups active) vs UNCERTAIN.
-    No expensive zero verification — that is Stage 2's job.
-    """
+    """Stage 1 for 3x3 convolutions: coarse 3-way classification."""
     tile_id = tl.program_id(0)
     total_tiles = N_val * GH * GW
     if tile_id >= total_tiles:
@@ -128,7 +114,6 @@ def tile_coarse_classify_kernel(
     gh_idx = tmp % GH
     n_idx = tmp // GH
 
-    # Compute receptive field positions
     rf_h_start = gh_idx * BLOCK_H * STRIDE - PAD
     rf_w_start = gw_idx * BLOCK_W * STRIDE - PAD
     RF_H: tl.constexpr = (BLOCK_H - 1) * STRIDE + KERNEL_SIZE
@@ -149,10 +134,9 @@ def tile_coarse_classify_kernel(
     HW = H_IN * W_IN
     off1 = tl.arange(0, 1)
 
-    # ---- Coarse group check: first channel per group ----
     rough_mask = tl.zeros([1], dtype=tl.int32)
     for g in range(NUM_GROUPS):
-        c_rep = g * GROUP_SIZE_C  # first channel of group
+        c_rep = g * GROUP_SIZE_C
         if c_rep < C_IN:
             base = (n_idx * C_IN + c_rep) * HW
             vals = tl.load(
@@ -164,18 +148,22 @@ def tile_coarse_classify_kernel(
             is_active = (ch_max > THRESHOLD).to(tl.int32)
             rough_mask = rough_mask + is_active * (1 << g)
 
-    # ---- Classify ----
+    # 3-way classify
     if tl.sum(rough_mask == ALL_ONES_MASK) > 0:
-        # All groups have active first channel → DENSEISH
         tl.store(tile_class_ptr + tile_id + off1,
                  tl.full([1], 2, dtype=tl.int32))  # TILE_DENSEISH
         tl.store(ag_mask_ptr + tile_id + off1,
                  tl.full([1], ALL_ONES_MASK, dtype=tl.int32))
     else:
-        # UNCERTAIN — Stage 2 will do the full group scan
-        tl.store(tile_class_ptr + tile_id + off1,
-                 tl.full([1], UNCERTAIN_CLASS, dtype=tl.int32))
-        tl.store(ag_mask_ptr + tile_id + off1, rough_mask)
+        if tl.sum(rough_mask) == 0:
+            tl.store(tile_class_ptr + tile_id + off1,
+                     tl.full([1], ZERO_CANDIDATE_CLASS, dtype=tl.int32))
+            tl.store(ag_mask_ptr + tile_id + off1,
+                     tl.zeros([1], dtype=tl.int32))
+        else:
+            tl.store(tile_class_ptr + tile_id + off1,
+                     tl.full([1], UNCERTAIN_CLASS, dtype=tl.int32))
+            tl.store(ag_mask_ptr + tile_id + off1, rough_mask)
 
 
 @triton.jit
@@ -197,8 +185,9 @@ def tile_coarse_classify_1x1_kernel(
     NUM_GROUPS: tl.constexpr,
     ALL_ONES_MASK: tl.constexpr,
     UNCERTAIN_CLASS: tl.constexpr,
+    ZERO_CANDIDATE_CLASS: tl.constexpr,
 ):
-    """Stage 1 for 1x1 conv: same cheap coarse classification."""
+    """Stage 1 for 1x1 conv: coarse 3-way classification."""
     tile_id = tl.program_id(0)
     total_tiles = N_val * GH * GW
     if tile_id >= total_tiles:
@@ -216,7 +205,6 @@ def tile_coarse_classify_1x1_kernel(
     HW = H_IN * W_IN
     off1 = tl.arange(0, 1)
 
-    # ---- Coarse group check: first channel per group ----
     rough_mask = tl.zeros([1], dtype=tl.int32)
     for g in range(NUM_GROUPS):
         c_rep = g * GROUP_SIZE_C
@@ -227,36 +215,40 @@ def tile_coarse_classify_1x1_kernel(
             is_active = (ch_max > THRESHOLD).to(tl.int32)
             rough_mask = rough_mask + is_active * (1 << g)
 
-    # ---- Classify ----
     if tl.sum(rough_mask == ALL_ONES_MASK) > 0:
         tl.store(tile_class_ptr + tile_id + off1,
-                 tl.full([1], 2, dtype=tl.int32))  # TILE_DENSEISH
+                 tl.full([1], 2, dtype=tl.int32))
         tl.store(ag_mask_ptr + tile_id + off1,
                  tl.full([1], ALL_ONES_MASK, dtype=tl.int32))
     else:
-        tl.store(tile_class_ptr + tile_id + off1,
-                 tl.full([1], UNCERTAIN_CLASS, dtype=tl.int32))
-        tl.store(ag_mask_ptr + tile_id + off1, rough_mask)
+        if tl.sum(rough_mask) == 0:
+            tl.store(tile_class_ptr + tile_id + off1,
+                     tl.full([1], ZERO_CANDIDATE_CLASS, dtype=tl.int32))
+            tl.store(ag_mask_ptr + tile_id + off1,
+                     tl.zeros([1], dtype=tl.int32))
+        else:
+            tl.store(tile_class_ptr + tile_id + off1,
+                     tl.full([1], UNCERTAIN_CLASS, dtype=tl.int32))
+            tl.store(ag_mask_ptr + tile_id + off1, rough_mask)
 
 
 # ===========================================================================
-# STAGE 2: Exact group bitmask refinement — ONLY for UNCERTAIN tiles
+# STAGE 2a: Zero-candidate refinement — cheap early-exit scan
 # ===========================================================================
-# Tiles classified DENSEISH by Stage 1 are SKIPPED (early return).
-# UNCERTAIN tiles get the full per-group channel scan.
-# After building exact bitmask:
-#   mask == 0         → TILE_ZERO
-#   mask == ALL_ONES  → TILE_DENSEISH
-#   otherwise         → TILE_SPARSE
+# Tiles classified ZERO_CANDIDATE by Stage 1 get a flat channel scan.
+# - If truly zero → TILE_ZERO, mask=0 (confirmed)
+# - If not zero → build full group bitmask inline, classify SPARSE/DENSEISH
 #
-# This is where the expensive work lives — but only for tiles that need it.
+# The flat scan uses a while-loop with early exit on first nonzero channel.
+# For truly zero tiles (common case), this is cheaper than full group scan
+# because no bitmask accumulation is needed and the branch exits cleanly.
 # ===========================================================================
 
 @triton.jit
-def group_bitmask_refine_kernel(
+def zero_candidate_refine_kernel(
     x_ptr,
-    tile_class_ptr,       # [N_TILES] int32 — read: skip if != UNCERTAIN
-    ag_mask_ptr,          # [N_TILES] int32 — overwrite with exact bitmask
+    tile_class_ptr,
+    ag_mask_ptr,
     N_val,
     C_IN,
     H_IN,
@@ -275,22 +267,19 @@ def group_bitmask_refine_kernel(
     RF_SIZE: tl.constexpr,
     THRESHOLD: tl.constexpr,
     ALL_ONES_MASK: tl.constexpr,
-    UNCERTAIN_CLASS: tl.constexpr,
+    ZERO_CANDIDATE_CLASS: tl.constexpr,
 ):
-    """Stage 2: Exact per-group bitmask for UNCERTAIN tiles only."""
+    """Stage 2a for 3x3: early-exit zero confirmation, fallback to bitmask."""
     tile_id = tl.program_id(0)
     total_tiles = N_val * GH * GW
     if tile_id >= total_tiles:
         return
 
     off1 = tl.arange(0, 1)
-
-    # ---- Skip non-uncertain tiles ----
     tc = tl.load(tile_class_ptr + tile_id + off1)
-    if tl.sum(tc) != UNCERTAIN_CLASS:
+    if tl.sum(tc) != ZERO_CANDIDATE_CLASS:
         return
 
-    # ---- Compute RF positions ----
     gw_idx = tile_id % GW
     tmp = tile_id // GW
     gh_idx = tmp % GH
@@ -312,10 +301,194 @@ def group_bitmask_refine_kernel(
 
     safe_h = tl.minimum(tl.maximum(hh, 0), H_IN - 1)
     safe_w = tl.minimum(tl.maximum(ww, 0), W_IN - 1)
-
     HW = H_IN * W_IN
 
-    # ---- Full group scan with early exit on all-active ----
+    # Phase 1: cheap flat scan with early exit on first nonzero
+    c_idx = 0
+    found_nz = tl.zeros([1], dtype=tl.int32)
+    while (c_idx < C_IN) & (tl.sum(found_nz) == 0):
+        base = (n_idx * C_IN + c_idx) * HW
+        vals = tl.load(x_ptr + base + safe_h * W_IN + safe_w,
+                       mask=hw_mask, other=0.0)
+        ch_max = tl.max(vals, axis=0)
+        found_nz = found_nz + (ch_max > THRESHOLD).to(tl.int32)
+        c_idx += 1
+
+    if tl.sum(found_nz) == 0:
+        # Confirmed zero
+        tl.store(tile_class_ptr + tile_id + off1,
+                 tl.zeros([1], dtype=tl.int32))  # TILE_ZERO
+        tl.store(ag_mask_ptr + tile_id + off1,
+                 tl.zeros([1], dtype=tl.int32))
+        return
+
+    # Phase 2: false positive — build full group bitmask inline
+    mask = tl.zeros([1], dtype=tl.int32)
+    for g in range(NUM_GROUPS):
+        group_max = tl.zeros([1], dtype=tl.float32)
+        for c_off in range(GROUP_SIZE_C):
+            c = g * GROUP_SIZE_C + c_off
+            if c < C_IN:
+                base = (n_idx * C_IN + c) * HW
+                vals = tl.load(x_ptr + base + safe_h * W_IN + safe_w,
+                               mask=hw_mask, other=0.0)
+                ch_max = tl.max(vals, axis=0)
+                group_max = tl.maximum(group_max, ch_max)
+        is_active = (group_max > THRESHOLD).to(tl.int32)
+        mask = mask + is_active * (1 << g)
+
+    tl.store(ag_mask_ptr + tile_id + off1, mask)
+    if tl.sum(mask == ALL_ONES_MASK) > 0:
+        tl.store(tile_class_ptr + tile_id + off1,
+                 tl.full([1], 2, dtype=tl.int32))  # TILE_DENSEISH
+    else:
+        tl.store(tile_class_ptr + tile_id + off1,
+                 tl.full([1], 1, dtype=tl.int32))  # TILE_SPARSE
+
+
+@triton.jit
+def zero_candidate_refine_1x1_kernel(
+    x_ptr,
+    tile_class_ptr,
+    ag_mask_ptr,
+    N_val,
+    C_IN,
+    H_IN,
+    W_IN,
+    GH,
+    GW,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    GROUP_SIZE_C: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    THRESHOLD: tl.constexpr,
+    ALL_ONES_MASK: tl.constexpr,
+    ZERO_CANDIDATE_CLASS: tl.constexpr,
+):
+    """Stage 2a for 1x1: early-exit zero confirmation, fallback to bitmask."""
+    tile_id = tl.program_id(0)
+    total_tiles = N_val * GH * GW
+    if tile_id >= total_tiles:
+        return
+
+    off1 = tl.arange(0, 1)
+    tc = tl.load(tile_class_ptr + tile_id + off1)
+    if tl.sum(tc) != ZERO_CANDIDATE_CLASS:
+        return
+
+    gw_idx = tile_id % GW
+    tmp = tile_id // GW
+    gh_idx = tmp % GH
+    n_idx = tmp // GH
+
+    offs_m = tl.arange(0, BLOCK_M)
+    out_h = gh_idx * BLOCK_H + offs_m // BLOCK_W
+    out_w = gw_idx * BLOCK_W + offs_m % BLOCK_W
+    m_mask = (out_h < H_IN) & (out_w < W_IN)
+    HW = H_IN * W_IN
+
+    c_idx = 0
+    found_nz = tl.zeros([1], dtype=tl.int32)
+    while (c_idx < C_IN) & (tl.sum(found_nz) == 0):
+        addrs = (n_idx * C_IN + c_idx) * HW + out_h * W_IN + out_w
+        vals = tl.load(x_ptr + addrs, mask=m_mask, other=0.0)
+        ch_max = tl.max(vals, axis=0)
+        found_nz = found_nz + (ch_max > THRESHOLD).to(tl.int32)
+        c_idx += 1
+
+    if tl.sum(found_nz) == 0:
+        tl.store(tile_class_ptr + tile_id + off1,
+                 tl.zeros([1], dtype=tl.int32))
+        tl.store(ag_mask_ptr + tile_id + off1,
+                 tl.zeros([1], dtype=tl.int32))
+        return
+
+    mask = tl.zeros([1], dtype=tl.int32)
+    for g in range(NUM_GROUPS):
+        group_max = tl.zeros([1], dtype=tl.float32)
+        for c_off in range(GROUP_SIZE_C):
+            c = g * GROUP_SIZE_C + c_off
+            if c < C_IN:
+                addrs = (n_idx * C_IN + c) * HW + out_h * W_IN + out_w
+                vals = tl.load(x_ptr + addrs, mask=m_mask, other=0.0)
+                ch_max = tl.max(vals, axis=0)
+                group_max = tl.maximum(group_max, ch_max)
+        is_active = (group_max > THRESHOLD).to(tl.int32)
+        mask = mask + is_active * (1 << g)
+
+    tl.store(ag_mask_ptr + tile_id + off1, mask)
+    if tl.sum(mask == ALL_ONES_MASK) > 0:
+        tl.store(tile_class_ptr + tile_id + off1,
+                 tl.full([1], 2, dtype=tl.int32))
+    else:
+        tl.store(tile_class_ptr + tile_id + off1,
+                 tl.full([1], 1, dtype=tl.int32))
+
+
+# ===========================================================================
+# STAGE 2b: Exact group bitmask refinement — ONLY for UNCERTAIN tiles
+# ===========================================================================
+
+@triton.jit
+def group_bitmask_refine_kernel(
+    x_ptr,
+    tile_class_ptr,
+    ag_mask_ptr,
+    N_val,
+    C_IN,
+    H_IN,
+    W_IN,
+    H_OUT,
+    W_OUT,
+    GH,
+    GW,
+    BLOCK_H: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    KERNEL_SIZE: tl.constexpr,
+    STRIDE: tl.constexpr,
+    PAD: tl.constexpr,
+    GROUP_SIZE_C: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    RF_SIZE: tl.constexpr,
+    THRESHOLD: tl.constexpr,
+    ALL_ONES_MASK: tl.constexpr,
+    UNCERTAIN_CLASS: tl.constexpr,
+):
+    """Stage 2b: exact per-group bitmask for UNCERTAIN tiles only."""
+    tile_id = tl.program_id(0)
+    total_tiles = N_val * GH * GW
+    if tile_id >= total_tiles:
+        return
+
+    off1 = tl.arange(0, 1)
+    tc = tl.load(tile_class_ptr + tile_id + off1)
+    if tl.sum(tc) != UNCERTAIN_CLASS:
+        return
+
+    gw_idx = tile_id % GW
+    tmp = tile_id // GW
+    gh_idx = tmp % GH
+    n_idx = tmp // GH
+
+    rf_h_start = gh_idx * BLOCK_H * STRIDE - PAD
+    rf_w_start = gw_idx * BLOCK_W * STRIDE - PAD
+    RF_H: tl.constexpr = (BLOCK_H - 1) * STRIDE + KERNEL_SIZE
+    RF_W: tl.constexpr = (BLOCK_W - 1) * STRIDE + KERNEL_SIZE
+
+    flat_idx = tl.arange(0, RF_SIZE)
+    flat_row = flat_idx // RF_W
+    flat_col = flat_idx % RF_W
+    valid_mask = flat_idx < (RF_H * RF_W)
+
+    hh = rf_h_start + flat_row
+    ww = rf_w_start + flat_col
+    hw_mask = valid_mask & (hh >= 0) & (hh < H_IN) & (ww >= 0) & (ww < W_IN)
+
+    safe_h = tl.minimum(tl.maximum(hh, 0), H_IN - 1)
+    safe_w = tl.minimum(tl.maximum(ww, 0), W_IN - 1)
+    HW = H_IN * W_IN
+
     mask = tl.zeros([1], dtype=tl.int32)
     g = tl.zeros([1], dtype=tl.int32)
 
@@ -329,8 +502,7 @@ def group_bitmask_refine_kernel(
                 base = (n_idx * C_IN + c) * HW
                 vals = tl.load(
                     x_ptr + base + safe_h * W_IN + safe_w,
-                    mask=hw_mask,
-                    other=0.0,
+                    mask=hw_mask, other=0.0,
                 )
                 ch_max = tl.max(vals, axis=0)
                 group_max = tl.maximum(group_max, ch_max)
@@ -338,23 +510,19 @@ def group_bitmask_refine_kernel(
         is_active = (group_max > THRESHOLD).to(tl.int32)
         mask = mask + is_active * (1 << g_val)
 
-        # Early exit: all groups found active
         if tl.sum(mask == ALL_ONES_MASK) > 0:
             g = tl.full([1], NUM_GROUPS, dtype=tl.int32)
         else:
             g = g + 1
 
-    # ---- Store exact bitmask and final classification ----
     tl.store(ag_mask_ptr + tile_id + off1, mask)
 
     if tl.sum(mask) == 0:
-        # TILE_ZERO
         tl.store(tile_class_ptr + tile_id + off1,
-                 tl.zeros([1], dtype=tl.int32))
+                 tl.zeros([1], dtype=tl.int32))  # TILE_ZERO
     else:
         is_denseish = (mask == ALL_ONES_MASK).to(tl.int32)
-        # TILE_SPARSE=1, TILE_DENSEISH=2
-        tile_class = 1 + is_denseish
+        tile_class = 1 + is_denseish  # SPARSE=1, DENSEISH=2
         tl.store(tile_class_ptr + tile_id + off1, tile_class)
 
 
@@ -378,7 +546,7 @@ def group_bitmask_refine_1x1_kernel(
     ALL_ONES_MASK: tl.constexpr,
     UNCERTAIN_CLASS: tl.constexpr,
 ):
-    """Stage 2 for 1x1 conv: exact bitmask for UNCERTAIN tiles only."""
+    """Stage 2b for 1x1: exact bitmask for UNCERTAIN tiles only."""
     tile_id = tl.program_id(0)
     total_tiles = N_val * GH * GW
     if tile_id >= total_tiles:
@@ -400,7 +568,6 @@ def group_bitmask_refine_1x1_kernel(
     m_mask = (out_h < H_IN) & (out_w < W_IN)
     HW = H_IN * W_IN
 
-    # Full group scan with early exit
     mask = tl.zeros([1], dtype=tl.int32)
     g = tl.zeros([1], dtype=tl.int32)
 
@@ -427,127 +594,11 @@ def group_bitmask_refine_1x1_kernel(
 
     if tl.sum(mask) == 0:
         tl.store(tile_class_ptr + tile_id + off1,
-                 tl.zeros([1], dtype=tl.int32))  # TILE_ZERO
+                 tl.zeros([1], dtype=tl.int32))
     else:
         is_denseish = (mask == ALL_ONES_MASK).to(tl.int32)
         tile_class = 1 + is_denseish
         tl.store(tile_class_ptr + tile_id + off1, tile_class)
-
-
-# ---------------------------------------------------------------------------
-# Legacy Stage 1 kernels — kept for backward compat with fused_conv_lif
-# ---------------------------------------------------------------------------
-
-@triton.jit
-def tile_screen_kernel(
-    x_ptr,
-    tile_alive_ptr,
-    N_val,
-    C_IN,
-    H_IN,
-    W_IN,
-    GH,
-    GW,
-    BLOCK_H: tl.constexpr,
-    BLOCK_W: tl.constexpr,
-    KERNEL_SIZE: tl.constexpr,
-    STRIDE: tl.constexpr,
-    PAD: tl.constexpr,
-    RF_SIZE: tl.constexpr,
-    THRESHOLD: tl.constexpr,
-    C_BATCH: tl.constexpr,
-):
-    """Legacy compat: zero/alive classification with early exit."""
-    tile_id = tl.program_id(0)
-    total_tiles = N_val * GH * GW
-    if tile_id >= total_tiles:
-        return
-
-    gw_idx = tile_id % GW
-    tmp = tile_id // GW
-    gh_idx = tmp % GH
-    n_idx = tmp // GH
-
-    rf_h_start = gh_idx * BLOCK_H * STRIDE - PAD
-    rf_w_start = gw_idx * BLOCK_W * STRIDE - PAD
-    RF_H: tl.constexpr = (BLOCK_H - 1) * STRIDE + KERNEL_SIZE
-    RF_W: tl.constexpr = (BLOCK_W - 1) * STRIDE + KERNEL_SIZE
-
-    flat_idx = tl.arange(0, RF_SIZE)
-    flat_row = flat_idx // RF_W
-    flat_col = flat_idx % RF_W
-    valid_mask = flat_idx < (RF_H * RF_W)
-
-    hh = rf_h_start + flat_row
-    ww = rf_w_start + flat_col
-    hw_mask = valid_mask & (hh >= 0) & (hh < H_IN) & (ww >= 0) & (ww < W_IN)
-
-    safe_h = tl.minimum(tl.maximum(hh, 0), H_IN - 1)
-    safe_w = tl.minimum(tl.maximum(ww, 0), W_IN - 1)
-
-    HW = H_IN * W_IN
-    c_idx = 0
-    found = tl.zeros([1], dtype=tl.int32)
-
-    while (c_idx < C_IN) & (tl.sum(found) == 0):
-        base = (n_idx * C_IN + c_idx) * HW
-        vals = tl.load(
-            x_ptr + base + safe_h * W_IN + safe_w,
-            mask=hw_mask,
-            other=0.0,
-        )
-        ch_max = tl.max(vals, axis=0)
-        found = found + (ch_max > THRESHOLD).to(tl.int32)
-        c_idx += 1
-
-    off1 = tl.arange(0, 1)
-    tl.store(tile_alive_ptr + tile_id + off1, found)
-
-
-@triton.jit
-def tile_screen_1x1_kernel(
-    x_ptr,
-    tile_alive_ptr,
-    N_val,
-    C_IN,
-    H_IN,
-    W_IN,
-    GH,
-    GW,
-    BLOCK_H: tl.constexpr,
-    BLOCK_W: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    THRESHOLD: tl.constexpr,
-):
-    """Legacy compat: 1x1 zero/alive classification."""
-    tile_id = tl.program_id(0)
-    total_tiles = N_val * GH * GW
-    if tile_id >= total_tiles:
-        return
-
-    gw_idx = tile_id % GW
-    tmp = tile_id // GW
-    gh_idx = tmp % GH
-    n_idx = tmp // GH
-
-    offs_m = tl.arange(0, BLOCK_M)
-    out_h = gh_idx * BLOCK_H + offs_m // BLOCK_W
-    out_w = gw_idx * BLOCK_W + offs_m % BLOCK_W
-    m_mask = (out_h < H_IN) & (out_w < W_IN)
-    HW = H_IN * W_IN
-
-    c_idx = 0
-    found = tl.zeros([1], dtype=tl.int32)
-
-    while (c_idx < C_IN) & (tl.sum(found) == 0):
-        addrs = (n_idx * C_IN + c_idx) * HW + out_h * W_IN + out_w
-        vals = tl.load(x_ptr + addrs, mask=m_mask, other=0.0)
-        ch_max = tl.max(vals, axis=0)
-        found = found + (ch_max > THRESHOLD).to(tl.int32)
-        c_idx += 1
-
-    off1 = tl.arange(0, 1)
-    tl.store(tile_alive_ptr + tile_id + off1, found)
 
 
 # ---------------------------------------------------------------------------
@@ -571,29 +622,31 @@ def _build_two_stage_metadata(
     stride,
     padding,
     threshold,
-    tile_alive_buf,    # unused in v21 (kept for buffer compat)
     ag_mask_buf,
     tile_class_buf,
+    prescan_stats=None,
 ):
-    """Real two-stage prescan: cheap coarse classify → conditional exact refinement.
+    """Three-stage prescan pipeline:
+      Stage 1:  coarse classify → DENSEISH / ZERO_CANDIDATE / UNCERTAIN
+      Stage 2a: zero-candidate refine → confirm ZERO or fallback to bitmask
+      Stage 2b: uncertain bitmask refine → ZERO / SPARSE / DENSEISH
 
-    Stage 1: O(NUM_GROUPS × RF_SIZE) — classifies DENSEISH or UNCERTAIN
-    Stage 2: O(C_IN × RF_SIZE) — only for UNCERTAIN tiles
-
-    Returns (GROUP_SIZE_C, NUM_GROUPS).
+    Args:
+        prescan_stats: if not None, populated with intermediate stage counts
+                       (requires GPU→CPU sync — diagnostic path only).
+    Returns:
+        (GROUP_SIZE_C, NUM_GROUPS)
     """
     GROUP_SIZE_C = choose_group_size(C_IN)
     N_TILES = N * GH * GW
     NUM_GROUPS = triton.cdiv(C_IN, GROUP_SIZE_C)
     ALL_ONES_MASK = (1 << NUM_GROUPS) - 1
 
-    # --- Stage 1: coarse tile classification (cheap) ---
+    # --- Stage 1: coarse tile classification (3-way) ---
     if kernel_size == 1:
         BM = BH * BW
         tile_coarse_classify_1x1_kernel[(N_TILES,)](
-            x_f16,
-            tile_class_buf,
-            ag_mask_buf,
+            x_f16, tile_class_buf, ag_mask_buf,
             N, C_IN, H_IN, W_IN, GH, GW,
             BLOCK_H=BH, BLOCK_W=BW, BLOCK_M=BM,
             THRESHOLD=threshold,
@@ -601,6 +654,7 @@ def _build_two_stage_metadata(
             NUM_GROUPS=NUM_GROUPS,
             ALL_ONES_MASK=ALL_ONES_MASK,
             UNCERTAIN_CLASS=TILE_UNCERTAIN,
+            ZERO_CANDIDATE_CLASS=TILE_ZERO_CANDIDATE,
         )
     else:
         rf_h = (BH - 1) * stride + kernel_size
@@ -608,9 +662,7 @@ def _build_two_stage_metadata(
         RF_SIZE = triton.next_power_of_2(max(rf_h * rf_w, 1))
 
         tile_coarse_classify_kernel[(N_TILES,)](
-            x_f16,
-            tile_class_buf,
-            ag_mask_buf,
+            x_f16, tile_class_buf, ag_mask_buf,
             N, C_IN, H_IN, W_IN, GH, GW,
             BLOCK_H=BH, BLOCK_W=BW,
             KERNEL_SIZE=kernel_size, STRIDE=stride, PAD=padding,
@@ -619,15 +671,48 @@ def _build_two_stage_metadata(
             NUM_GROUPS=NUM_GROUPS,
             ALL_ONES_MASK=ALL_ONES_MASK,
             UNCERTAIN_CLASS=TILE_UNCERTAIN,
+            ZERO_CANDIDATE_CLASS=TILE_ZERO_CANDIDATE,
         )
 
-    # --- Stage 2: exact bitmask for UNCERTAIN tiles only ---
+    # Diagnostic snapshot after Stage 1 (only when requested)
+    if prescan_stats is not None:
+        tc = tile_class_buf[:N_TILES]
+        prescan_stats['stage1_zero_candidate'] = int((tc == TILE_ZERO_CANDIDATE).sum().item())
+        prescan_stats['stage1_denseish'] = int((tc == TILE_DENSEISH).sum().item())
+        prescan_stats['stage1_uncertain'] = int((tc == TILE_UNCERTAIN).sum().item())
+
+    # --- Stage 2a: zero-candidate refinement (cheap early-exit) ---
+    if kernel_size == 1:
+        BM = BH * BW
+        zero_candidate_refine_1x1_kernel[(N_TILES,)](
+            x_f16, tile_class_buf, ag_mask_buf,
+            N, C_IN, H_IN, W_IN, GH, GW,
+            BLOCK_H=BH, BLOCK_W=BW, BLOCK_M=BM,
+            GROUP_SIZE_C=GROUP_SIZE_C, NUM_GROUPS=NUM_GROUPS,
+            THRESHOLD=threshold, ALL_ONES_MASK=ALL_ONES_MASK,
+            ZERO_CANDIDATE_CLASS=TILE_ZERO_CANDIDATE,
+        )
+    else:
+        rf_h = (BH - 1) * stride + kernel_size
+        rf_w = (BW - 1) * stride + kernel_size
+        RF_SIZE = triton.next_power_of_2(max(rf_h * rf_w, 1))
+
+        zero_candidate_refine_kernel[(N_TILES,)](
+            x_f16, tile_class_buf, ag_mask_buf,
+            N, C_IN, H_IN, W_IN, H_OUT, W_OUT, GH, GW,
+            BLOCK_H=BH, BLOCK_W=BW,
+            KERNEL_SIZE=kernel_size, STRIDE=stride, PAD=padding,
+            GROUP_SIZE_C=GROUP_SIZE_C, NUM_GROUPS=NUM_GROUPS,
+            RF_SIZE=RF_SIZE, THRESHOLD=threshold,
+            ALL_ONES_MASK=ALL_ONES_MASK,
+            ZERO_CANDIDATE_CLASS=TILE_ZERO_CANDIDATE,
+        )
+
+    # --- Stage 2b: exact bitmask for UNCERTAIN tiles only ---
     if kernel_size == 1:
         BM = BH * BW
         group_bitmask_refine_1x1_kernel[(N_TILES,)](
-            x_f16,
-            tile_class_buf,
-            ag_mask_buf,
+            x_f16, tile_class_buf, ag_mask_buf,
             N, C_IN, H_IN, W_IN, GH, GW,
             BLOCK_H=BH, BLOCK_W=BW, BLOCK_M=BM,
             GROUP_SIZE_C=GROUP_SIZE_C, NUM_GROUPS=NUM_GROUPS,
@@ -640,9 +725,7 @@ def _build_two_stage_metadata(
         RF_SIZE = triton.next_power_of_2(max(rf_h * rf_w, 1))
 
         group_bitmask_refine_kernel[(N_TILES,)](
-            x_f16,
-            tile_class_buf,
-            ag_mask_buf,
+            x_f16, tile_class_buf, ag_mask_buf,
             N, C_IN, H_IN, W_IN, H_OUT, W_OUT, GH, GW,
             BLOCK_H=BH, BLOCK_W=BW,
             KERNEL_SIZE=kernel_size, STRIDE=stride, PAD=padding,
@@ -655,35 +738,39 @@ def _build_two_stage_metadata(
     return GROUP_SIZE_C, NUM_GROUPS
 
 
-# Backward-compat aliases for fused_conv_lif.py and other callers
+# ---------------------------------------------------------------------------
+# Compat shim for fused_conv_lif.py
+# ---------------------------------------------------------------------------
+
 def _build_active_group_bitmask(
     x_f16, N, C_IN, H_IN, W_IN, H_OUT, W_OUT,
     BH, BW, GH, GW, kernel_size, stride, padding,
     threshold, ag_mask_buf,
 ):
-    """Compat shim — allocates temp buffers and calls two-stage builder."""
+    """Compat shim — allocates temp tile_class_buf, calls full pipeline."""
     N_TILES = N * GH * GW
     device = x_f16.device
-    tile_alive_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
     tile_class_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
     return _build_two_stage_metadata(
         x_f16, N, C_IN, H_IN, W_IN, H_OUT, W_OUT,
         BH, BW, GH, GW, kernel_size, stride, padding,
-        threshold, tile_alive_buf, ag_mask_buf, tile_class_buf,
+        threshold, ag_mask_buf, tile_class_buf,
     )
 
 
-def _build_active_group_metadata(
-    x_f16, N, C_IN, H_IN, W_IN, H_OUT, W_OUT,
-    BH, BW, GH, GW, kernel_size, stride, padding,
-    threshold, ag_count_buf, ag_list_buf,
-):
-    """Legacy shim for fused_conv_lif.py."""
-    return _build_active_group_bitmask(
-        x_f16, N, C_IN, H_IN, W_IN, H_OUT, W_OUT,
-        BH, BW, GH, GW, kernel_size, stride, padding,
-        threshold, ag_count_buf,
-    )
+# ---------------------------------------------------------------------------
+# Popcount / fallback helpers
+# ---------------------------------------------------------------------------
+
+def _popcount_buf(ag_mask_buf, N_TILES):
+    """Vectorised popcount for int32 bitmask buffer (SWAR parallel bit-count)."""
+    v = ag_mask_buf[:N_TILES].int()
+    v = v - ((v >> 1) & 0x55555555)
+    v = (v & 0x33333333) + ((v >> 2) & 0x33333333)
+    v = (v + (v >> 4)) & 0x0F0F0F0F
+    v = v + (v >> 8)
+    v = v + (v >> 16)
+    return (v & 0x3F).to(torch.int32)
 
 
 def _check_dense_fallback(ag_mask_buf, N_TILES, NUM_GROUPS, fallback_ratio=FALLBACK_RATIO):
@@ -693,19 +780,6 @@ def _check_dense_fallback(ag_mask_buf, N_TILES, NUM_GROUPS, fallback_ratio=FALLB
     avg_active = pc.float().mean().item()
     threshold = fallback_ratio * NUM_GROUPS
     return avg_active > threshold
-
-
-def _popcount_buf(ag_mask_buf, N_TILES):
-    """Vectorised popcount for int32 bitmask buffer (parallel bit-count)."""
-    # Use the standard Hamming-weight (SWAR) approach — no Python loop.
-    # Works on int32 via standard bit manipulation constants.
-    v = ag_mask_buf[:N_TILES].int()
-    v = v - ((v >> 1) & 0x55555555)
-    v = (v & 0x33333333) + ((v >> 2) & 0x33333333)
-    v = (v + (v >> 4)) & 0x0F0F0F0F
-    v = v + (v >> 8)
-    v = v + (v >> 16)
-    return (v & 0x3F).to(torch.int32)
 
 
 # ---------------------------------------------------------------------------
@@ -719,12 +793,8 @@ def _make_configs(block_h, block_w):
         for nw in [4, 8]:
             configs.append(
                 Config(
-                    {
-                        "BLOCK_M": block_m,
-                        "BLOCK_N": bn,
-                        "BLOCK_H": block_h,
-                        "BLOCK_W": block_w,
-                    },
+                    {"BLOCK_M": block_m, "BLOCK_N": bn,
+                     "BLOCK_H": block_h, "BLOCK_W": block_w},
                     num_warps=nw,
                     num_stages=1,
                 )
@@ -737,21 +807,18 @@ _CONFIGS_8x16 = _make_configs(8, 16)
 
 
 # ===================================================================
-# Compute kernels — three tile execution paths:
+# Compute kernels — three tile execution paths per kernel:
 #
 #   TILE_ZERO (ag_mask==0):
 #     → bias-only early return
 #
 #   TILE_DENSEISH (ag_mask==ALL_ONES):
-#     → dense-like tile path
-#     → 3x3: spatial-outer / channel-inner loop order
-#       (spatial addresses & masks computed once per kh/kw, reused
-#        across all channel groups — eliminates redundant spatial math)
-#     → 1x1: pre-computed spatial base, flat channel iteration
-#     → Structurally distinct from the sparse bitmask-gated path
+#     → dense tile microkernel (flat channel iteration, no group abstraction)
+#     → 3x3: spatial-outer / flat-channel-inner
+#     → 1x1: pre-computed spatial base, flat channel loop
 #
 #   TILE_SPARSE (ag_mask is partial):
-#     → bitmask-gated group iteration (group-outer, spatial-inner)
+#     → bitmask-gated group iteration with true skip via `if g_active != 0:`
 # ===================================================================
 
 # ---- 1x1 / stride=1 ----
@@ -775,25 +842,21 @@ def sparse_conv1x1_bm_kernel_8x8(
     total_tiles = N_val * GH * GW
     if tile_id >= total_tiles:
         return
-
     gw_idx = tile_id % GW
     tmp = tile_id // GW
     gh_idx = tmp % GH
     n_idx = tmp // GH
-
     offs_n = pid_cout * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < C_OUT
     offs_m = tl.arange(0, BLOCK_M)
     out_h = gh_idx * BLOCK_H + offs_m // BLOCK_W
     out_w = gw_idx * BLOCK_W + offs_m % BLOCK_W
     m_mask = (out_h < H_OUT) & (out_w < W_OUT)
-
     HW_IN: tl.constexpr = H_IN * W_IN
     HW_OUT: tl.constexpr = H_OUT * W_OUT
 
     ag_mask = tl.load(ag_mask_ptr + tile_id)
 
-    # --- TILE_ZERO: bias-only ---
     if ag_mask == 0:
         acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         if HAS_BIAS:
@@ -804,30 +867,30 @@ def sparse_conv1x1_bm_kernel_8x8(
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
-    # --- TILE_DENSEISH: flat channel iteration, pre-computed spatial base ---
     if ag_mask == ALL_ONES_MASK:
-        x_spatial = n_idx * C_IN * HW_IN + out_h * W_IN + out_w  # [BLOCK_M]
-        for k_idx in range(NUM_GROUPS):
-            k_start = k_idx * GROUP_SIZE_C
-            offs_k = k_start + tl.arange(0, GROUP_SIZE_C)
-            k_mask = offs_k < C_IN
+        # Dense tile microkernel: pre-computed spatial, flat channel iteration
+        x_spatial = n_idx * C_IN * HW_IN + out_h * W_IN + out_w
+        for cin_base in range(0, NUM_GROUPS * GROUP_SIZE_C, GROUP_SIZE_C):
+            offs_k = cin_base + tl.arange(0, GROUP_SIZE_C)
+            k_valid = offs_k < C_IN
             x_addrs = x_ptr + x_spatial[:, None] + offs_k[None, :] * HW_IN
-            x_tile = tl.load(x_addrs, mask=k_mask[None, :] & m_mask[:, None], other=0.0).to(tl.float16)
+            x_tile = tl.load(x_addrs, mask=k_valid[None, :] & m_mask[:, None], other=0.0).to(tl.float16)
             w_addrs = w_cl_ptr + offs_n[None, :] * C_IN + offs_k[:, None]
-            w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+            w_tile = tl.load(w_addrs, mask=k_valid[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
             acc += tl.dot(x_tile, w_tile)
     else:
-        # --- TILE_SPARSE: bitmask-gated ---
+        # Sparse: bitmask-gated with true group skip
         for g in range(NUM_GROUPS):
             g_active = (ag_mask >> g) & 1
-            cin_start = g * GROUP_SIZE_C
-            offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
-            k_mask = (g_active != 0) & (offs_k < C_IN)
-            x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + out_h[:, None] * W_IN + out_w[:, None]
-            x_tile = tl.load(x_addrs, mask=k_mask[None, :] & m_mask[:, None], other=0.0).to(tl.float16)
-            w_addrs = w_cl_ptr + offs_n[None, :] * C_IN + offs_k[:, None]
-            w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
-            acc += tl.dot(x_tile, w_tile)
+            if g_active != 0:
+                cin_start = g * GROUP_SIZE_C
+                offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+                k_mask = offs_k < C_IN
+                x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + out_h[:, None] * W_IN + out_w[:, None]
+                x_tile = tl.load(x_addrs, mask=k_mask[None, :] & m_mask[:, None], other=0.0).to(tl.float16)
+                w_addrs = w_cl_ptr + offs_n[None, :] * C_IN + offs_k[:, None]
+                w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                acc += tl.dot(x_tile, w_tile)
 
     if HAS_BIAS:
         acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
@@ -854,19 +917,16 @@ def sparse_conv1x1_bm_kernel_8x16(
     total_tiles = N_val * GH * GW
     if tile_id >= total_tiles:
         return
-
     gw_idx = tile_id % GW
     tmp = tile_id // GW
     gh_idx = tmp % GH
     n_idx = tmp // GH
-
     offs_n = pid_cout * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < C_OUT
     offs_m = tl.arange(0, BLOCK_M)
     out_h = gh_idx * BLOCK_H + offs_m // BLOCK_W
     out_w = gw_idx * BLOCK_W + offs_m % BLOCK_W
     m_mask = (out_h < H_OUT) & (out_w < W_OUT)
-
     HW_IN: tl.constexpr = H_IN * W_IN
     HW_OUT: tl.constexpr = H_OUT * W_OUT
 
@@ -884,17 +944,15 @@ def sparse_conv1x1_bm_kernel_8x16(
 
     if ag_mask == ALL_ONES_MASK:
         x_spatial = n_idx * C_IN * HW_IN + out_h * W_IN + out_w
-        for k_idx in range(NUM_GROUPS):
-            k_start = k_idx * GROUP_SIZE_C
-            offs_k = k_start + tl.arange(0, GROUP_SIZE_C)
-            k_mask = offs_k < C_IN
+        for cin_base in range(0, NUM_GROUPS * GROUP_SIZE_C, GROUP_SIZE_C):
+            offs_k = cin_base + tl.arange(0, GROUP_SIZE_C)
+            k_valid = offs_k < C_IN
             x_addrs = x_ptr + x_spatial[:, None] + offs_k[None, :] * HW_IN
-            x_tile = tl.load(x_addrs, mask=k_mask[None, :] & m_mask[:, None], other=0.0).to(tl.float16)
+            x_tile = tl.load(x_addrs, mask=k_valid[None, :] & m_mask[:, None], other=0.0).to(tl.float16)
             w_addrs = w_cl_ptr + offs_n[None, :] * C_IN + offs_k[:, None]
-            w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+            w_tile = tl.load(w_addrs, mask=k_valid[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
             acc += tl.dot(x_tile, w_tile)
     else:
-        # TILE_SPARSE: bitmask-gated with true group skip
         for g in range(NUM_GROUPS):
             g_active = (ag_mask >> g) & 1
             if g_active != 0:
@@ -944,7 +1002,6 @@ def sparse_conv3x3s1_bm_kernel_8x8(
     out_h = gh_idx * BLOCK_H + offs_m // BLOCK_W
     out_w = gw_idx * BLOCK_W + offs_m % BLOCK_W
     m_mask = (out_h < H_OUT) & (out_w < W_OUT)
-
     HW_IN: tl.constexpr = H_IN * W_IN
     HW_OUT: tl.constexpr = H_OUT * W_OUT
     W_CS: tl.constexpr = C_IN
@@ -953,7 +1010,6 @@ def sparse_conv3x3s1_bm_kernel_8x8(
 
     ag_mask = tl.load(ag_mask_ptr + tile_id)
 
-    # --- TILE_ZERO ---
     if ag_mask == 0:
         acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         if HAS_BIAS:
@@ -964,8 +1020,8 @@ def sparse_conv3x3s1_bm_kernel_8x8(
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
-    # --- TILE_DENSEISH: spatial-outer, channel-inner ---
     if ag_mask == ALL_ONES_MASK:
+        # Dense tile microkernel: spatial-outer / flat-channel-inner
         for kh in tl.static_range(3):
             for kw in tl.static_range(3):
                 in_h = out_h + (kh - 1)
@@ -974,39 +1030,39 @@ def sparse_conv3x3s1_bm_kernel_8x8(
                 w_ok = (in_w >= 0) & (in_w < W_IN)
                 safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
                 safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
-                sp_ok = m_mask & h_ok & w_ok
+                hw_ok = m_mask & h_ok & w_ok
                 x_hw = safe_h * W_IN + safe_w
-                w_kpos = kh * W_KH + kw * W_CS
-                for k_idx in range(NUM_GROUPS):
-                    k_start = k_idx * GROUP_SIZE_C
-                    offs_k = k_start + tl.arange(0, GROUP_SIZE_C)
-                    k_mask = offs_k < C_IN
+                w_off = kh * W_KH + kw * W_CS
+                for cin_base in range(0, NUM_GROUPS * GROUP_SIZE_C, GROUP_SIZE_C):
+                    offs_k = cin_base + tl.arange(0, GROUP_SIZE_C)
+                    k_valid = offs_k < C_IN
                     x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + x_hw[:, None]
-                    x_tile = tl.load(x_addrs, mask=k_mask[None, :] & sp_ok[:, None], other=0.0).to(tl.float16)
-                    w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + w_kpos + offs_k[:, None]
-                    w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                    x_tile = tl.load(x_addrs, mask=k_valid[None, :] & hw_ok[:, None], other=0.0).to(tl.float16)
+                    w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + w_off + offs_k[:, None]
+                    w_tile = tl.load(w_addrs, mask=k_valid[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
                     acc += tl.dot(x_tile, w_tile)
     else:
-        # --- TILE_SPARSE: group-outer, bitmask-gated ---
+        # Sparse: bitmask-gated with true group skip
         for g in range(NUM_GROUPS):
             g_active = (ag_mask >> g) & 1
-            cin_start = g * GROUP_SIZE_C
-            offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
-            k_mask = (g_active != 0) & (offs_k < C_IN)
-            for kh in tl.static_range(3):
-                for kw in tl.static_range(3):
-                    in_h = out_h + (kh - 1)
-                    in_w = out_w + (kw - 1)
-                    h_ok = (in_h >= 0) & (in_h < H_IN)
-                    w_ok = (in_w >= 0) & (in_w < W_IN)
-                    safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
-                    safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
-                    x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + safe_h[:, None] * W_IN + safe_w[:, None]
-                    x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
-                    x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
-                    w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
-                    w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
-                    acc += tl.dot(x_tile, w_tile)
+            if g_active != 0:
+                cin_start = g * GROUP_SIZE_C
+                offs_k = cin_start + tl.arange(0, GROUP_SIZE_C)
+                k_mask = offs_k < C_IN
+                for kh in tl.static_range(3):
+                    for kw in tl.static_range(3):
+                        in_h = out_h + (kh - 1)
+                        in_w = out_w + (kw - 1)
+                        h_ok = (in_h >= 0) & (in_h < H_IN)
+                        w_ok = (in_w >= 0) & (in_w < W_IN)
+                        safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
+                        safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
+                        x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + safe_h[:, None] * W_IN + safe_w[:, None]
+                        x_m = k_mask[None, :] & m_mask[:, None] & h_ok[:, None] & w_ok[:, None]
+                        x_tile = tl.load(x_addrs, mask=x_m, other=0.0).to(tl.float16)
+                        w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + kh * W_KH + kw * W_CS + offs_k[:, None]
+                        w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                        acc += tl.dot(x_tile, w_tile)
 
     if HAS_BIAS:
         acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
@@ -1043,7 +1099,6 @@ def sparse_conv3x3s1_bm_kernel_8x16(
     out_h = gh_idx * BLOCK_H + offs_m // BLOCK_W
     out_w = gw_idx * BLOCK_W + offs_m % BLOCK_W
     m_mask = (out_h < H_OUT) & (out_w < W_OUT)
-
     HW_IN: tl.constexpr = H_IN * W_IN
     HW_OUT: tl.constexpr = H_OUT * W_OUT
     W_CS: tl.constexpr = C_IN
@@ -1071,20 +1126,18 @@ def sparse_conv3x3s1_bm_kernel_8x16(
                 w_ok = (in_w >= 0) & (in_w < W_IN)
                 safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
                 safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
-                sp_ok = m_mask & h_ok & w_ok
+                hw_ok = m_mask & h_ok & w_ok
                 x_hw = safe_h * W_IN + safe_w
-                w_kpos = kh * W_KH + kw * W_CS
-                for k_idx in range(NUM_GROUPS):
-                    k_start = k_idx * GROUP_SIZE_C
-                    offs_k = k_start + tl.arange(0, GROUP_SIZE_C)
-                    k_mask = offs_k < C_IN
+                w_off = kh * W_KH + kw * W_CS
+                for cin_base in range(0, NUM_GROUPS * GROUP_SIZE_C, GROUP_SIZE_C):
+                    offs_k = cin_base + tl.arange(0, GROUP_SIZE_C)
+                    k_valid = offs_k < C_IN
                     x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + x_hw[:, None]
-                    x_tile = tl.load(x_addrs, mask=k_mask[None, :] & sp_ok[:, None], other=0.0).to(tl.float16)
-                    w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + w_kpos + offs_k[:, None]
-                    w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                    x_tile = tl.load(x_addrs, mask=k_valid[None, :] & hw_ok[:, None], other=0.0).to(tl.float16)
+                    w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + w_off + offs_k[:, None]
+                    w_tile = tl.load(w_addrs, mask=k_valid[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
                     acc += tl.dot(x_tile, w_tile)
     else:
-        # TILE_SPARSE: bitmask-gated with true group skip
         for g in range(NUM_GROUPS):
             g_active = (ag_mask >> g) & 1
             if g_active != 0:
@@ -1162,7 +1215,6 @@ def sparse_conv3x3s2_bm_kernel_8x8(
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
     if ag_mask == ALL_ONES_MASK:
-        # Dense-ish: spatial-outer, channel-inner (stride=2)
         for kh in tl.static_range(3):
             for kw in tl.static_range(3):
                 in_h = out_h * 2 + (kh - 1)
@@ -1171,20 +1223,18 @@ def sparse_conv3x3s2_bm_kernel_8x8(
                 w_ok = (in_w >= 0) & (in_w < W_IN)
                 safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
                 safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
-                sp_ok = m_mask & h_ok & w_ok
+                hw_ok = m_mask & h_ok & w_ok
                 x_hw = safe_h * W_IN + safe_w
-                w_kpos = kh * W_KH + kw * W_CS
-                for k_idx in range(NUM_GROUPS):
-                    k_start = k_idx * GROUP_SIZE_C
-                    offs_k = k_start + tl.arange(0, GROUP_SIZE_C)
-                    k_mask = offs_k < C_IN
+                w_off = kh * W_KH + kw * W_CS
+                for cin_base in range(0, NUM_GROUPS * GROUP_SIZE_C, GROUP_SIZE_C):
+                    offs_k = cin_base + tl.arange(0, GROUP_SIZE_C)
+                    k_valid = offs_k < C_IN
                     x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + x_hw[:, None]
-                    x_tile = tl.load(x_addrs, mask=k_mask[None, :] & sp_ok[:, None], other=0.0).to(tl.float16)
-                    w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + w_kpos + offs_k[:, None]
-                    w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                    x_tile = tl.load(x_addrs, mask=k_valid[None, :] & hw_ok[:, None], other=0.0).to(tl.float16)
+                    w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + w_off + offs_k[:, None]
+                    w_tile = tl.load(w_addrs, mask=k_valid[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
                     acc += tl.dot(x_tile, w_tile)
     else:
-        # TILE_SPARSE: bitmask-gated with true group skip
         for g in range(NUM_GROUPS):
             g_active = (ag_mask >> g) & 1
             if g_active != 0:
@@ -1268,20 +1318,18 @@ def sparse_conv3x3s2_bm_kernel_8x16(
                 w_ok = (in_w >= 0) & (in_w < W_IN)
                 safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
                 safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
-                sp_ok = m_mask & h_ok & w_ok
+                hw_ok = m_mask & h_ok & w_ok
                 x_hw = safe_h * W_IN + safe_w
-                w_kpos = kh * W_KH + kw * W_CS
-                for k_idx in range(NUM_GROUPS):
-                    k_start = k_idx * GROUP_SIZE_C
-                    offs_k = k_start + tl.arange(0, GROUP_SIZE_C)
-                    k_mask = offs_k < C_IN
+                w_off = kh * W_KH + kw * W_CS
+                for cin_base in range(0, NUM_GROUPS * GROUP_SIZE_C, GROUP_SIZE_C):
+                    offs_k = cin_base + tl.arange(0, GROUP_SIZE_C)
+                    k_valid = offs_k < C_IN
                     x_addrs = x_ptr + (n_idx * C_IN + offs_k[None, :]) * HW_IN + x_hw[:, None]
-                    x_tile = tl.load(x_addrs, mask=k_mask[None, :] & sp_ok[:, None], other=0.0).to(tl.float16)
-                    w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + w_kpos + offs_k[:, None]
-                    w_tile = tl.load(w_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                    x_tile = tl.load(x_addrs, mask=k_valid[None, :] & hw_ok[:, None], other=0.0).to(tl.float16)
+                    w_addrs = w_cl_ptr + offs_n[None, :] * W_CO + w_off + offs_k[:, None]
+                    w_tile = tl.load(w_addrs, mask=k_valid[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
                     acc += tl.dot(x_tile, w_tile)
     else:
-        # TILE_SPARSE: bitmask-gated with true group skip
         for g in range(NUM_GROUPS):
             g_active = (ag_mask >> g) & 1
             if g_active != 0:
@@ -1317,7 +1365,6 @@ def sparse_conv2d_forward(
     x,
     weight,
     bias,
-    block_size=None,
     kernel_size=3,
     stride=1,
     padding=0,
@@ -1325,20 +1372,20 @@ def sparse_conv2d_forward(
     groups=1,
     threshold=1e-6,
     w_cl=None,
-    # Legacy params (kept for compat)
-    counts_buf=None,
-    tile_cin_buf=None,
-    group_flags_buf=None,
-    ag_count_buf=None,
-    ag_list_buf=None,
     ag_mask_buf=None,
-    # Two-stage buffers
-    tile_alive_buf=None,
     tile_class_buf=None,
     return_ms=False,
     fallback_ratio=FALLBACK_RATIO,
     return_avg_active_ratio=False,
     return_tile_stats=False,
+    # Legacy params — accepted but ignored for call-site compat
+    block_size=None,
+    counts_buf=None,
+    tile_cin_buf=None,
+    group_flags_buf=None,
+    ag_count_buf=None,
+    ag_list_buf=None,
+    tile_alive_buf=None,
 ):
     import torch.nn.functional as Fn
 
@@ -1353,7 +1400,7 @@ def sparse_conv2d_forward(
     if isinstance(dilation, tuple):
         dilation = dilation[0]
 
-    if groups != 1 or dilation != 1:
+    def _dense_fallback():
         y = Fn.conv2d(x, weight, bias, stride=stride, padding=padding,
                       dilation=dilation, groups=groups).float()
         ret = (y, 0.0)
@@ -1362,19 +1409,15 @@ def sparse_conv2d_forward(
         if return_tile_stats:
             ret = ret + (None,)
         return ret
+
+    if groups != 1 or dilation != 1:
+        return _dense_fallback()
 
     H_OUT = (H_IN + 2 * padding - dilation * (kernel_size - 1) - 1) // stride + 1
     W_OUT = (W_IN + 2 * padding - dilation * (kernel_size - 1) - 1) // stride + 1
 
     if H_OUT <= 0 or W_OUT <= 0:
-        y = Fn.conv2d(x, weight, bias, stride=stride, padding=padding,
-                      dilation=dilation, groups=groups).float()
-        ret = (y, 0.0)
-        if return_avg_active_ratio:
-            ret = ret + (1.0,)
-        if return_tile_stats:
-            ret = ret + (None,)
-        return ret
+        return _dense_fallback()
 
     supported = (
         (kernel_size == 1 and stride == 1 and padding == 0) or
@@ -1383,14 +1426,7 @@ def sparse_conv2d_forward(
         (kernel_size == 3 and stride == 2 and padding == 1)
     )
     if not supported:
-        y = Fn.conv2d(x, weight, bias, stride=stride, padding=padding,
-                      dilation=dilation, groups=groups).float()
-        ret = (y, 0.0)
-        if return_avg_active_ratio:
-            ret = ret + (1.0,)
-        if return_tile_stats:
-            ret = ret + (None,)
-        return ret
+        return _dense_fallback()
 
     # 1x1/s2 → subsample then 1x1/s1
     actual_kernel_1x1s2 = (kernel_size == 1 and stride == 2)
@@ -1421,19 +1457,19 @@ def sparse_conv2d_forward(
     x_f16 = x.half().contiguous()
 
     # Allocate buffers
-    if tile_alive_buf is None or tile_alive_buf.numel() < N_TILES:
-        tile_alive_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
     if ag_mask_buf is None or ag_mask_buf.numel() < N_TILES:
         ag_mask_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
     if tile_class_buf is None or tile_class_buf.numel() < N_TILES:
         tile_class_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
 
-    # Two-stage prescan
+    # Two-stage prescan with optional diagnostics
+    prescan_stats = {} if return_tile_stats else None
     _build_two_stage_metadata(
         x_f16, N, C_IN, H_IN, W_IN, H_OUT, W_OUT,
         BH, BW, GH, GW,
         kernel_size, stride, padding,
-        threshold, tile_alive_buf, ag_mask_buf, tile_class_buf,
+        threshold, ag_mask_buf, tile_class_buf,
+        prescan_stats=prescan_stats,
     )
 
     # Compute tile stats and AGR
@@ -1448,15 +1484,14 @@ def sparse_conv2d_forward(
 
         if return_tile_stats:
             tile_stats = {
-                'stage1_zero_tiles': 0,  # Stage 1 no longer classifies zeros
-                'stage1_denseish_tiles': -1,  # not tracked without extra sync
-                'stage2_tiles': zero_count + sparse_count,  # lower bound
                 'zero_tiles': zero_count,
                 'sparse_tiles': sparse_count,
                 'denseish_tiles': denseish_count,
                 'total_tiles': N_TILES,
-                'prescan_mode': 'two_stage_v21',
+                'prescan_mode': 'two_stage_v22',
             }
+            if prescan_stats:
+                tile_stats.update(prescan_stats)
 
         if NUM_GROUPS > 0:
             pc = _popcount_buf(ag_mask_buf, N_TILES)

@@ -132,6 +132,11 @@ def build_model(model_name, device, v_threshold=1.0, weight_init="random", sew_c
                 num_classes=None, seed=None):
     if weight_init not in ("random", "pretrained"):
         raise ValueError(f"Unknown weight_init: {weight_init}")
+
+    # Auto-default cnf='ADD' for SEW-ResNet models when not explicitly specified
+    if sew_cnf is None and model_name.startswith("sew_"):
+        sew_cnf = "ADD"
+
     builder = MODEL_BUILDERS[model_name]
     use_pretrained = (weight_init == "pretrained")
     builder_kwargs = {
@@ -438,6 +443,10 @@ def measure_group_sparsity(model, targets, loader, device, T, num_batches=5,
                 'prescan_mode': diag.get('prescan_mode', 'unknown'),
                 'metadata_kind': diag.get('metadata_kind', 'unknown'),
                 'kernel_type': diag.get('kernel_type', 'unknown'),
+                # v22 zero-candidate fields
+                'stage1_zero_candidate': diag.get('stage1_zero_candidate', -1),
+                'stage1_denseish': diag.get('stage1_denseish', -1),
+                'stage1_uncertain': diag.get('stage1_uncertain', -1),
             }
 
     for _, mod in model.named_modules():
@@ -814,7 +823,9 @@ def main():
     parser.add_argument("--weight_init", type=str, default="random",
                         choices=["random", "pretrained"])
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--sew_cnf", type=str, default=None)
+    parser.add_argument("--sew_cnf", type=str, default=None,
+                        help="SEW-ResNet connect function: ADD, AND, IAND. "
+                             "Auto-defaults to ADD for sew_* models.")
     parser.add_argument("--list_models", action="store_true")
     parser.add_argument("--power", type=float, default=250.0)
     parser.add_argument("--warmup", type=int, default=10)
@@ -903,7 +914,7 @@ def main():
     group_sparsity_data = {}
 
     if args.selective_sparse or args.collect_diag:
-        print(f"\n  [Diag] Measuring group/tile sparsity (v19 two-stage) ...")
+        print(f"\n  [Diag] Measuring group/tile sparsity (v22 two-stage) ...")
         _tmp_model = copy.deepcopy(model_baseline)
         replace_model(_tmp_model, targets, fused=False, static_zero_layers=set(), only_static_zero=False)
         group_sparsity_data = measure_group_sparsity(
@@ -938,7 +949,7 @@ def main():
                     total_group_count=_gd_existing.get('total_group_count', -1.0),
                     total_tile_count=_gd_existing.get('total_tile_count', -1.0))
 
-        # Print diagnostic table with v19 tile classification
+        # Print diagnostic table with v22 tile classification
         print(f"\n  {'Layer':<40} {'AGR':>8} {'TileZR':>8} {'Zero':>6} {'Sparse':>7} {'Dense':>7} {'Source':>10}")
         print(f"  {'-'*90}")
         for t in targets:
