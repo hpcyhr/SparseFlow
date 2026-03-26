@@ -1,51 +1,58 @@
-"""
-SparseLinear — conv-style sparse operator backend for Linear/GEMM.
-
-Key design:
-  - Drop-in replacement for nn.Linear
-  - No explicit for-T loop in multi-step mode
-  - Fold all leading dims into an effective batch N_eff, apply Linear on last dim
-  - Runtime dispatch: zero / sparse / dense
-  - Buffer reuse + profiling like SparseConv2d
-"""
-
-from __future__ import annotations
-
+import sys
 import time
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Tuple
+
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from Kernels.linear import sparse_linear_forward
-
 
 @dataclass
 class _ProfileStats:
     calls: int = 0
-    zero_check_ms: float = 0.0
-    policy_ms: float = 0.0
-    reshape_ms: float = 0.0
-    buffer_ms: float = 0.0
-    sparse_kernel_ms: float = 0.0
-    dense_fallback_ms: float = 0.0
-    output_pack_ms: float = 0.0
-    total_ms: float = 0.0
-
     zero_path_hits: int = 0
     sparse_path_hits: int = 0
     dense_path_hits: int = 0
     triton_supported_calls: int = 0
 
+    total_ms: float = 0.0
+    reshape_ms: float = 0.0
+    policy_ms: float = 0.0
+    buffer_ms: float = 0.0
+    sparse_kernel_ms: float = 0.0
+    dense_fallback_ms: float = 0.0
+    output_pack_ms: float = 0.0
+
     last_path: str = "none"
-    last_avg_active_ratio: float = -1.0
-    ema_active_ratio: float = -1.0
     last_total_ms: float = 0.0
+    last_reshape_ms: float = 0.0
+    last_policy_ms: float = 0.0
+    last_buffer_ms: float = 0.0
+    last_sparse_kernel_ms: float = 0.0
+    last_dense_fallback_ms: float = 0.0
+    last_output_pack_ms: float = 0.0
+    last_avg_active_ratio: float = -1.0
 
 
 class SparseLinear(nn.Module):
+    """
+    Grouped tile-level Dynamic-K sparse Linear.
+
+    Compared with the earlier CSR-style linear version, this module mirrors the
+    Conv path more closely:
+      - grouped bitmask metadata instead of exact per-channel lists
+      - three-stage prescan (zero-candidate / uncertain / denseish)
+      - three execution paths (zero / sparse / denseish)
+      - EMA-based dense fallback and zero promotion
+      - optional diagnostics and runtime profiling
+    """
+
     def __init__(
         self,
         in_features: int,
@@ -53,7 +60,7 @@ class SparseLinear(nn.Module):
         bias: bool = True,
         threshold: float = 1e-6,
         return_ms: bool = False,
-        dense_threshold: float = 0.25,
+        dense_threshold: float = 0.85,
         warmup_steps: int = 8,
         calib_every: int = 32,
         ema_decay: float = 0.9,
@@ -61,38 +68,31 @@ class SparseLinear(nn.Module):
         profile_runtime: bool = False,
     ):
         super().__init__()
-        self.in_features = int(in_features)
-        self.out_features = int(out_features)
-        self.threshold = float(threshold)
-        self.return_ms = bool(return_ms)
+        self.in_features = in_features
+        self.out_features = out_features
+        self.threshold = threshold
+        self.return_ms = return_ms
 
-        self.weight = nn.Parameter(torch.empty(self.out_features, self.in_features))
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
         if bias:
-            self.bias = nn.Parameter(torch.empty(self.out_features))
+            self.bias = nn.Parameter(torch.empty(out_features))
         else:
-            self.register_parameter("bias", None)
+            self.register_parameter('bias', None)
 
-        # runtime / capability
+        self._last_sparse_ms = 0.0
+        self._last_dense_ms = 0.0
         self._triton_available = False
         try:
             import triton  # noqa: F401
             self._triton_available = True
-        except Exception:
+        except ImportError:
             pass
 
-        # cached transposed weight [Cin, Cout]
         self._w_t = None
         self._w_t_version = -1
+        self._ag_mask_buf = None
+        self._tile_class_buf = None
 
-        # reusable buffers
-        self._counts_buf = None
-        self._tile_cin_buf = None
-
-        # last timings
-        self._last_sparse_ms = 0.0
-        self._last_dense_ms = 0.0
-
-        # routing policy
         self._force_zero = False
         self._force_dense = False
         self._warmup_left = int(max(0, warmup_steps))
@@ -105,13 +105,11 @@ class SparseLinear(nn.Module):
         self._ema_active_ratio: Optional[float] = None
         self._last_avg_active_ratio = -1.0
 
-        # profiling
-        self.profile_runtime = bool(profile_runtime)
+        self.collect_diag = False
+        self._last_diag = {}
+        self.profile_runtime = profile_runtime
         self._profile = _ProfileStats()
 
-    # ------------------------------------------------------------------
-    # construction
-    # ------------------------------------------------------------------
     @classmethod
     def from_dense(
         cls,
@@ -120,7 +118,7 @@ class SparseLinear(nn.Module):
         return_ms: bool = False,
         **kwargs,
     ) -> "SparseLinear":
-        mod = cls(
+        sparse = cls(
             in_features=linear.in_features,
             out_features=linear.out_features,
             bias=linear.bias is not None,
@@ -128,50 +126,32 @@ class SparseLinear(nn.Module):
             return_ms=return_ms,
             **kwargs,
         )
-        mod.weight.data.copy_(linear.weight.data)
+        sparse = sparse.to(linear.weight.device)
+        sparse.weight.data.copy_(linear.weight.data)
         if linear.bias is not None:
-            mod.bias.data.copy_(linear.bias.data)
-        return mod.to(linear.weight.device)
+            sparse.bias.data.copy_(linear.bias.data)
+        return sparse
 
-    # ------------------------------------------------------------------
-    # public helpers
-    # ------------------------------------------------------------------
-    def set_runtime_profiling(self, enabled: bool = True):
-        self.profile_runtime = bool(enabled)
-        return self
-
-    def reset_runtime_profile(self):
-        self._profile = _ProfileStats()
-
-    def get_runtime_profile(self) -> Dict[str, Any]:
-        return asdict(self._profile)
-
-    def get_runtime_profile_pretty(self) -> str:
+    def get_profile_summary(self) -> str:
         p = self._profile
         if p.calls == 0:
-            return f"SparseLinear({self.in_features}->{self.out_features}) runtime profile: no calls"
-        avg = lambda x: x / max(1, p.calls)
+            return "SparseLinear runtime profile: no calls"
+
+        def avg(x: float) -> float:
+            return x / max(1, p.calls)
+
         return (
-            f"SparseLinear({self.in_features}->{self.out_features})\n"
-            f"  calls={p.calls}\n"
-            f"  last_path={p.last_path}\n"
-            f"  last_avg_active_ratio={p.last_avg_active_ratio:.6f}\n"
-            f"  ema_active_ratio={p.ema_active_ratio:.6f}\n"
-            f"  zero_path_hits={p.zero_path_hits}\n"
-            f"  sparse_path_hits={p.sparse_path_hits}\n"
-            f"  dense_path_hits={p.dense_path_hits}\n"
-            f"  zero_check_ms={avg(p.zero_check_ms):.4f}\n"
-            f"  policy_ms={avg(p.policy_ms):.4f}\n"
-            f"  reshape_ms={avg(p.reshape_ms):.4f}\n"
-            f"  buffer_ms={avg(p.buffer_ms):.4f}\n"
-            f"  sparse_kernel_ms={avg(p.sparse_kernel_ms):.4f}\n"
-            f"  dense_fallback_ms={avg(p.dense_fallback_ms):.4f}\n"
-            f"  output_pack_ms={avg(p.output_pack_ms):.4f}\n"
-            f"  total_ms={avg(p.total_ms):.4f}\n"
+            f"SparseLinear runtime profile\n"
+            f"  calls={p.calls}, last_path={p.last_path}\n"
+            f"  hits: zero={p.zero_path_hits}, sparse={p.sparse_path_hits}, dense={p.dense_path_hits}\n"
+            f"  avg total={avg(p.total_ms):.4f} ms, last total={p.last_total_ms:.4f} ms\n"
+            f"  avg reshape={avg(p.reshape_ms):.4f} ms\n"
+            f"  avg buffer={avg(p.buffer_ms):.4f} ms\n"
+            f"  avg sparse_kernel={avg(p.sparse_kernel_ms):.4f} ms\n"
+            f"  avg dense_fallback={avg(p.dense_fallback_ms):.4f} ms\n"
+            f"  last avg_active_ratio={p.last_avg_active_ratio:.6f}"
         )
 
-    # ------------------------------------------------------------------
-    # internal timing
     # ------------------------------------------------------------------
     def _stamp(self) -> float:
         if self.profile_runtime and torch.cuda.is_available():
@@ -187,56 +167,76 @@ class SparseLinear(nn.Module):
         if self.profile_runtime:
             setattr(self._profile, field, getattr(self._profile, field) + ms)
 
+    def _profile_set_last(self, field: str, ms: float):
+        if self.profile_runtime:
+            setattr(self._profile, field, ms)
+
     # ------------------------------------------------------------------
-    # support / cache / buffers
-    # ------------------------------------------------------------------
-    def _supports_sparse_kernel(self) -> bool:
+    def _supports_triton(self) -> bool:
         return self._triton_available
 
     def _get_w_t(self) -> torch.Tensor:
         ver = self.weight._version
-        if self._w_t is None or self._w_t_version != ver or self._w_t.device != self.weight.device:
+        if self._w_t is None or self._w_t_version != ver:
             self._w_t = self.weight.data.half().t().contiguous()
             self._w_t_version = ver
         return self._w_t
 
+    def _flatten_input(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple]:
+        if x.dim() < 2:
+            raise ValueError(f"Expected at least 2D input, got {x.dim()}D")
+
+        if x.shape[-1] == self.in_features:
+            return x.reshape(-1, self.in_features), ('lastdim', x.shape[:-1])
+
+        if x.dim() == 5 and x.shape[2] * x.shape[3] * x.shape[4] == self.in_features:
+            t, b, c, h, w = x.shape
+            return x.reshape(t * b, c * h * w), ('tbchw', t, b)
+
+        raise ValueError(
+            f"Input shape {tuple(x.shape)} is incompatible with in_features={self.in_features}. "
+            f"Need x.shape[-1] == in_features, or for 5D input C*H*W == in_features."
+        )
+
+    def _restore_output(self, y2d: torch.Tensor, meta: Tuple) -> torch.Tensor:
+        mode = meta[0]
+        if mode == 'lastdim':
+            prefix_shape = meta[1]
+            return y2d.reshape(*prefix_shape, self.out_features)
+        if mode == 'tbchw':
+            t, b = meta[1], meta[2]
+            return y2d.reshape(t, b, self.out_features)
+        raise RuntimeError(f"Unknown restore mode: {mode}")
+
     def _ensure_buffers(self, x2d: torch.Tensor):
-        N, C_IN = x2d.shape
-        if N >= 1024:
-            block_m = 128
-        elif N >= 256:
-            block_m = 64
-        else:
-            block_m = 32
+        from Kernels.linear import _select_linear_block_m
+        import triton
 
-        n_tiles = (N + block_m - 1) // block_m
+        n_rows = x2d.shape[0]
+        block_m = _select_linear_block_m(n_rows)
+        n_tiles = triton.cdiv(n_rows, block_m)
 
         if (
-            self._counts_buf is None
-            or self._counts_buf.numel() < n_tiles
-            or self._counts_buf.device != x2d.device
+            self._ag_mask_buf is None
+            or self._ag_mask_buf.numel() < n_tiles
+            or self._ag_mask_buf.device != x2d.device
         ):
-            self._counts_buf = torch.empty(n_tiles, dtype=torch.int32, device=x2d.device)
+            self._ag_mask_buf = torch.empty(n_tiles, dtype=torch.int32, device=x2d.device)
 
-        needed_tile_cin = n_tiles * C_IN
         if (
-            self._tile_cin_buf is None
-            or self._tile_cin_buf.numel() < needed_tile_cin
-            or self._tile_cin_buf.device != x2d.device
+            self._tile_class_buf is None
+            or self._tile_class_buf.numel() < n_tiles
+            or self._tile_class_buf.device != x2d.device
         ):
-            self._tile_cin_buf = torch.empty(needed_tile_cin, dtype=torch.int32, device=x2d.device)
+            self._tile_class_buf = torch.empty(n_tiles, dtype=torch.int32, device=x2d.device)
 
-        return self._counts_buf, self._tile_cin_buf
+        return self._ag_mask_buf, self._tile_class_buf
 
-    # ------------------------------------------------------------------
-    # policy
-    # ------------------------------------------------------------------
-    def _maybe_zero_fast_path(self, x2d: torch.Tensor) -> bool:
-        return bool(torch.count_nonzero(x2d).item() == 0)
-
-    def _estimate_active_ratio(self, x2d: torch.Tensor) -> float:
-        nnz = torch.count_nonzero(x2d).item()
-        return float(nnz) / float(max(1, x2d.numel()))
+    def _zero_output_2d(self, x2d: torch.Tensor) -> torch.Tensor:
+        y = torch.zeros(x2d.shape[0], self.out_features, dtype=torch.float32, device=x2d.device)
+        if self.bias is not None:
+            y = y + self.bias.detach().float().view(1, -1)
+        return y
 
     def _should_collect_ratio(self) -> bool:
         if self._warmup_left > 0:
@@ -247,165 +247,260 @@ class SparseLinear(nn.Module):
         if avg_active_ratio is None:
             return
 
-        self._last_avg_active_ratio = float(avg_active_ratio)
+        self._last_avg_active_ratio = avg_active_ratio
+        if self._warmup_left > 0:
+            self._warmup_left -= 1
+            self._ema_active_ratio = avg_active_ratio
+            return
+
         if self._ema_active_ratio is None:
-            self._ema_active_ratio = float(avg_active_ratio)
+            self._ema_active_ratio = avg_active_ratio
         else:
             self._ema_active_ratio = (
                 self._ema_decay * self._ema_active_ratio
-                + (1.0 - self._ema_decay) * float(avg_active_ratio)
+                + (1.0 - self._ema_decay) * avg_active_ratio
             )
 
         if avg_active_ratio == 0.0:
             self._zero_streak += 1
         else:
             self._zero_streak = 0
+            self._force_zero = False
 
-        self._force_zero = self._zero_streak >= self._zero_streak_needed
-        self._force_dense = (self._ema_active_ratio is not None) and (
-            self._ema_active_ratio > self._dense_threshold
-        )
+        if self._zero_streak >= self._zero_streak_needed:
+            self._force_zero = True
 
-        if self._warmup_left > 0:
-            self._warmup_left -= 1
-
-        if self.profile_runtime:
-            self._profile.last_avg_active_ratio = self._last_avg_active_ratio
-            self._profile.ema_active_ratio = -1.0 if self._ema_active_ratio is None else float(self._ema_active_ratio)
+        if self._ema_active_ratio is not None and self._ema_active_ratio > self._dense_threshold:
+            self._force_dense = True
+        else:
+            self._force_dense = False
 
     # ------------------------------------------------------------------
-    # folded execution
-    # ------------------------------------------------------------------
-    def _dense_fallback(self, x2d: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x2d.float(), self.weight.float(), None if self.bias is None else self.bias.float())
-        return y
-
-    def _zero_output(self, x2d: torch.Tensor) -> torch.Tensor:
-        y = torch.zeros(x2d.shape[0], self.out_features, dtype=torch.float32, device=x2d.device)
-        if self.bias is not None:
-            y += self.bias.detach().to(dtype=torch.float32, device=x2d.device).view(1, -1)
-        self._last_sparse_ms = 0.0
-        self._last_dense_ms = 0.0
-        return y
-
-    def _forward_folded_2d(self, x2d: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.profile_runtime:
             self._profile.calls += 1
             t_total = self._stamp()
-        else:
-            t_total = 0.0
 
-        # zero check
+        if self.collect_diag:
+            self._last_diag = {'sparse_path_executed': False}
+
         if self.profile_runtime:
             t0 = self._stamp()
-        is_all_zero = self._force_zero or self._maybe_zero_fast_path(x2d)
+        x2d, restore_meta = self._flatten_input(x)
         if self.profile_runtime:
-            self._profile_add("zero_check_ms", self._elapsed_ms(t0))
+            ms = self._elapsed_ms(t0)
+            self._profile_add('reshape_ms', ms)
+            self._profile_set_last('last_reshape_ms', ms)
 
-        if is_all_zero:
+        if self._force_zero:
+            y2d = self._zero_output_2d(x2d)
             if self.profile_runtime:
                 self._profile.zero_path_hits += 1
-                self._profile.last_path = "zero"
-            y = self._zero_output(x2d)
-            if self.profile_runtime:
+                self._profile.last_path = 'zero(force)'
                 total_ms = self._elapsed_ms(t_total)
-                self._profile.total_ms += total_ms
-                self._profile.last_total_ms = total_ms
-            return y
+                self._profile_add('total_ms', total_ms)
+                self._profile_set_last('last_total_ms', total_ms)
+            return self._restore_output(y2d, restore_meta)
 
-        # policy
+        use_triton = self._supports_triton() and x2d.is_cuda
+        if self.profile_runtime and use_triton:
+            self._profile.triton_supported_calls += 1
+
         if self.profile_runtime:
             t0 = self._stamp()
-        need_ratio = self._should_collect_ratio()
-        avg_active_ratio = self._estimate_active_ratio(x2d) if need_ratio else self._last_avg_active_ratio
-        self._update_policy(avg_active_ratio)
-        use_sparse = self._supports_sparse_kernel() and not self._force_dense
+        avg_active_ratio = None
+        need_ratio = use_triton and self._should_collect_ratio() and (not self._force_dense)
         if self.profile_runtime:
-            self._profile_add("policy_ms", self._elapsed_ms(t0))
-            if self._supports_sparse_kernel():
-                self._profile.triton_supported_calls += 1
+            ms = self._elapsed_ms(t0)
+            self._profile_add('policy_ms', ms)
+            self._profile_set_last('last_policy_ms', ms)
 
-        # sparse path
-        if use_sparse:
-            if self.profile_runtime:
-                t0 = self._stamp()
-            counts_buf, tile_cin_buf = self._ensure_buffers(x2d)
-            if self.profile_runtime:
-                self._profile_add("buffer_ms", self._elapsed_ms(t0))
+        self._forward_count += 1
 
+        if use_triton and not self._force_dense:
+            y2d, avg_active_ratio = self._triton_forward(x2d, need_ratio=need_ratio)
+            path = 'sparse'
             if self.profile_runtime:
-                t0 = self._stamp()
-            y, sparse_ms = sparse_linear_forward(
-                x=x2d,
+                self._profile.sparse_path_hits += 1
+        else:
+            y2d = self._fallback_forward(x2d)
+            path = 'dense'
+            if self.profile_runtime:
+                self._profile.dense_path_hits += 1
+
+        if self.profile_runtime:
+            self._profile.last_avg_active_ratio = self._last_avg_active_ratio
+
+        if self.profile_runtime:
+            t0 = self._stamp()
+        self._update_policy(avg_active_ratio)
+        if self.profile_runtime:
+            ms = self._elapsed_ms(t0)
+            self._profile_add('policy_ms', ms)
+            self._profile_set_last('last_policy_ms', self._profile.last_policy_ms + ms)
+
+        if self._force_zero and avg_active_ratio == 0.0:
+            y2d = self._zero_output_2d(x2d)
+            path = 'zero(promoted)'
+
+        if self.profile_runtime:
+            t0 = self._stamp()
+        y = self._restore_output(y2d, restore_meta)
+        if self.profile_runtime:
+            ms = self._elapsed_ms(t0)
+            self._profile_add('output_pack_ms', ms)
+            self._profile_set_last('last_output_pack_ms', ms)
+            self._profile.last_path = path
+            total_ms = self._elapsed_ms(t_total)
+            self._profile_add('total_ms', total_ms)
+            self._profile_set_last('last_total_ms', total_ms)
+        return y
+
+    # ------------------------------------------------------------------
+    def _triton_forward(self, x2d: torch.Tensor, need_ratio: bool = False):
+        from Kernels.linear import sparse_linear_forward
+
+        if self.profile_runtime:
+            t0 = self._stamp()
+
+        w_t = self._get_w_t()
+        ag_mask_buf, tile_class_buf = self._ensure_buffers(x2d)
+        x_f16 = x2d if (x2d.dtype == torch.float16 and x2d.is_contiguous()) else x2d.half().contiguous()
+
+        if self.profile_runtime:
+            ms = self._elapsed_ms(t0)
+            self._profile_add('buffer_ms', ms)
+            self._profile_set_last('last_buffer_ms', ms)
+
+        collect_tiles = self.collect_diag
+        if need_ratio or collect_tiles:
+            result = sparse_linear_forward(
+                x=x_f16,
                 weight=self.weight,
                 bias=self.bias,
                 threshold=self.threshold,
-                w_t=self._get_w_t(),
-                counts_buf=counts_buf,
-                tile_cin_buf=tile_cin_buf,
+                w_t=w_t,
+                ag_mask_buf=ag_mask_buf,
+                tile_class_buf=tile_class_buf,
                 return_ms=self.return_ms,
+                return_avg_active_ratio=True,
+                return_tile_stats=collect_tiles,
             )
-            self._last_sparse_ms = float(sparse_ms)
-            self._last_dense_ms = 0.0
-            if self.profile_runtime:
-                # include full sparse kernel path wall time, not only CUDA event ms
-                self._profile_add("sparse_kernel_ms", self._elapsed_ms(t0))
-                self._profile.sparse_path_hits += 1
-                self._profile.last_path = "sparse"
+            if collect_tiles:
+                y2d, sparse_ms, avg_active_ratio, tile_stats = result
+            else:
+                y2d, sparse_ms, avg_active_ratio = result
+                tile_stats = None
         else:
-            # dense fallback
-            if self.profile_runtime:
-                t0 = self._stamp()
-            y = self._dense_fallback(x2d)
-            self._last_sparse_ms = 0.0
-            self._last_dense_ms = 0.0
-            if self.profile_runtime:
-                self._profile_add("dense_fallback_ms", self._elapsed_ms(t0))
-                self._profile.dense_path_hits += 1
-                self._profile.last_path = "dense"
-
-        if self.profile_runtime:
-            total_ms = self._elapsed_ms(t_total)
-            self._profile.total_ms += total_ms
-            self._profile.last_total_ms = total_ms
-
-        return y
-
-    # ------------------------------------------------------------------
-    # public forward
-    # ------------------------------------------------------------------
-    def forward(self, x: torch.Tensor):
-        """
-        Supported:
-          - 2D: [B, Cin]
-          - 3D: [T, B, Cin]
-          - generic >=2D: [..., Cin]
-        We always apply Linear on the last dimension and fold all prefix dims.
-        """
-        if x.dim() < 2:
-            raise ValueError(f"Expected input dim >= 2, got shape {tuple(x.shape)}")
-        if x.shape[-1] != self.in_features:
-            raise ValueError(
-                f"Expected last dim == in_features ({self.in_features}), got {x.shape[-1]}"
+            out = sparse_linear_forward(
+                x=x_f16,
+                weight=self.weight,
+                bias=self.bias,
+                threshold=self.threshold,
+                w_t=w_t,
+                ag_mask_buf=ag_mask_buf,
+                tile_class_buf=tile_class_buf,
+                return_ms=self.return_ms,
+                return_avg_active_ratio=False,
+                return_tile_stats=False,
             )
+            y2d, sparse_ms = out
+            avg_active_ratio = None
+            tile_stats = None
 
+        self._last_sparse_ms = float(sparse_ms)
+        self._last_dense_ms = 0.0
+        if self.profile_runtime:
+            self._profile_add('sparse_kernel_ms', self._last_sparse_ms)
+            self._profile_set_last('last_sparse_kernel_ms', self._last_sparse_ms)
+            self._profile_set_last('last_dense_fallback_ms', 0.0)
+
+        if self.collect_diag:
+            self._collect_tile_group_diag(x_f16, ag_mask_buf, tile_class_buf, sparse_ms, avg_active_ratio, tile_stats)
+        return y2d, avg_active_ratio
+
+    def _collect_tile_group_diag(
+        self,
+        x2d: torch.Tensor,
+        ag_mask_buf: torch.Tensor,
+        tile_class_buf: torch.Tensor,
+        sparse_ms: float,
+        avg_active_ratio: Optional[float],
+        tile_stats,
+    ):
+        from Kernels.linear import _select_linear_block_m, choose_group_size, _popcount_buf, TILE_ZERO, TILE_SPARSE, TILE_DENSEISH
+        import triton
+
+        n_rows, c_in = x2d.shape
+        group_size = choose_group_size(c_in)
+        num_groups = triton.cdiv(c_in, group_size)
+        block_m = _select_linear_block_m(n_rows)
+        n_tiles = triton.cdiv(n_rows, block_m)
+
+        if tile_stats is not None:
+            zt = tile_stats.get('zero_tiles', -1)
+            st = tile_stats.get('sparse_tiles', -1)
+            dt = tile_stats.get('denseish_tiles', -1)
+        else:
+            tc = tile_class_buf[:n_tiles].cpu()
+            zt = int((tc == TILE_ZERO).sum().item())
+            st = int((tc == TILE_SPARSE).sum().item())
+            dt = int((tc == TILE_DENSEISH).sum().item())
+
+        pc = _popcount_buf(ag_mask_buf, n_tiles)
+        total_g = float(n_tiles * num_groups)
+        active_g = float(pc.sum().item())
+        agr = active_g / max(total_g, 1.0)
+
+        self._last_diag = {
+            'sparse_path_executed': True,
+            'metadata_kind': 'three_stage_grouped_linear_v2',
+            'group_size': group_size,
+            'num_groups': num_groups,
+            'nonzero_group_count': active_g,
+            'total_group_count': total_g,
+            'active_group_ratio': agr,
+            'tile_zero_count': zt,
+            'total_tile_count': int(n_tiles),
+            'tile_zero_ratio': zt / max(int(n_tiles), 1),
+            'effective_k_ratio': agr,
+            'sparse_compute_ms': float(sparse_ms),
+            'sparse_total_ms': float(sparse_ms),
+            'avg_active_ratio': float(avg_active_ratio) if avg_active_ratio is not None else -1.0,
+            'zero_tiles': zt,
+            'sparse_tiles': st,
+            'denseish_tiles': dt,
+            'prescan_mode': 'three_stage_grouped_linear_v2',
+            'kernel_type': 'linear',
+            'block_m': int(block_m),
+        }
+        if tile_stats is not None:
+            for key in (
+                'stage1_zero_candidate', 'stage1_denseish', 'stage1_uncertain',
+                'final_zero', 'final_sparse', 'final_denseish',
+                'stage2_zero_refine_tiles', 'stage2_uncertain_tiles',
+            ):
+                if key in tile_stats:
+                    self._last_diag[key] = tile_stats[key]
+
+    def _fallback_forward(self, x2d: torch.Tensor) -> torch.Tensor:
         if self.profile_runtime:
             t0 = self._stamp()
-
-        prefix_shape = tuple(x.shape[:-1])
-        x2d = x.reshape(-1, self.in_features)
-
+        y = F.linear(x2d, self.weight, self.bias)
+        self._last_sparse_ms = 0.0
         if self.profile_runtime:
-            self._profile_add("reshape_ms", self._elapsed_ms(t0))
-
-        y2d = self._forward_folded_2d(x2d)
-
-        if self.profile_runtime:
-            t0 = self._stamp()
-
-        y = y2d.reshape(*prefix_shape, self.out_features)
-
-        if self.profile_runtime:
-            self._profile_add("output_pack_ms", self._elapsed_ms(t0))
-
+            self._last_dense_ms = self._elapsed_ms(t0)
+            self._profile_add('dense_fallback_ms', self._last_dense_ms)
+            self._profile_set_last('last_dense_fallback_ms', self._last_dense_ms)
+            self._profile_set_last('last_sparse_kernel_ms', 0.0)
+        else:
+            self._last_dense_ms = 0.0
         return y
+
+    def extra_repr(self) -> str:
+        return (
+            f"{self.in_features}, {self.out_features}, bias={self.bias is not None}, "
+            f"sparse=True, dense_threshold={self._dense_threshold}, "
+            f"warmup_left={self._warmup_left}, calib_every={self._calib_every}, "
+            f"profile_runtime={self.profile_runtime}"
+        )

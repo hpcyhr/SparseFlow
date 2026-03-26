@@ -10,6 +10,9 @@ import copy
 import json
 import math
 from collections import OrderedDict, defaultdict
+import os
+from PIL import Image
+from torch.utils.data import Dataset
 
 import torch
 import torch.nn as nn
@@ -27,6 +30,7 @@ from Ops.sparse_conv2d import SparseConv2d
 from Ops.sparse_fused_conv_lif import FusedSparseConvLIF
 from Ops.static_zero_conv2d import StaticZeroConv2d, make_synthetic_zero_diag
 from Utils.layer_logger import LayerLogger
+from Utils.dispatch_model import dispatch_all_layers, decisions_to_sets
 
 
 DEVICE = None
@@ -156,16 +160,76 @@ def build_model(model_name, device, v_threshold=1.0, weight_init="random", sew_c
     sj_func.set_step_mode(model, 'm')
     return model
 
+class FlatImageFolderDataset(Dataset):
+    def __init__(
+        self,
+        root,
+        transform=None,
+        exts=(".jpg", ".jpeg", ".png", ".JPEG", ".JPG", ".PNG"),
+    ):
+        self.root = root
+        self.transform = transform
+        self.samples = []
+
+        if not os.path.isdir(root):
+            raise RuntimeError(f"Dataset directory does not exist: {root}")
+
+        for name in sorted(os.listdir(root)):
+            if name.endswith(exts):
+                self.samples.append(os.path.join(root, name))
+
+        if not self.samples:
+            raise RuntimeError(f"No image files found in: {root}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path = self.samples[idx]
+        img = Image.open(path).convert("RGB")
+        if self.transform is not None:
+            img = self.transform(img)
+
+        # 这里只做推理性能测试，所以标签给 dummy=0 即可
+        return img, 0
 
 def build_dataset(dataset_name, data_root, spike_mode="normalized_bernoulli"):
     if dataset_name == "cifar10":
-        transform = transforms.Compose([transforms.ToTensor()])
-        ds = datasets.CIFAR10(root=data_root, train=False, download=True, transform=transform)
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+        ds = datasets.CIFAR10(
+            root=data_root,
+            train=False,
+            download=True,
+            transform=transform,
+        )
+
     elif dataset_name == "cifar100":
-        transform = transforms.Compose([transforms.ToTensor()])
-        ds = datasets.CIFAR100(root=data_root, train=False, download=True, transform=transform)
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+        ds = datasets.CIFAR100(
+            root=data_root,
+            train=False,
+            download=True,
+            transform=transform,
+        )
+
+    elif dataset_name == "imagenet_val_flat":
+        transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+        ])
+        ds = FlatImageFolderDataset(
+            root=data_root,
+            transform=transform,
+        )
+
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
+
     return ds
 
 
@@ -686,10 +750,23 @@ def measure_layer_timing(model, loader, device, T, target_names,
     return result
 
 
-def print_layer_profile(baseline_timing, sparse_timing, targets, e2e_ms=None):
+def print_layer_profile(baseline_timing, sparse_timing, targets, e2e_baseline_ms=None,
+                        e2e_sparse_ms=None, label="Sparse"):
+    """Print per-layer timing comparison between baseline and a sparse variant.
+
+    Args:
+        baseline_timing: dict layer_name -> avg ms (dense baseline)
+        sparse_timing:   dict layer_name -> avg ms (sparse variant)
+        targets:         list of target info dicts
+        e2e_baseline_ms: optional end-to-end baseline latency for percentage calc
+        e2e_sparse_ms:   optional end-to-end sparse latency for percentage calc
+        label:           label string for the sparse variant column header
+    """
     target_names = [t["name"] for t in targets]
-    print(f"\n  {'Layer':<40} {'Base(ms)':>9} {'Sparse(ms)':>11} {'Speedup':>8}")
-    print(f"  {'-'*72}")
+
+    col_sparse = f"{label}(ms)"
+    print(f"\n  {'Layer':<40} {'Base(ms)':>9} {col_sparse:>14} {'Speedup':>8}")
+    print(f"  {'-'*75}")
     total_base = 0.0; total_sparse = 0.0
     bucket = defaultdict(lambda: {"count": 0, "base": 0.0, "sparse": 0.0})
     target_map = {t["name"]: t for t in targets}
@@ -699,22 +776,30 @@ def print_layer_profile(baseline_timing, sparse_timing, targets, e2e_ms=None):
         total_base += b; total_sparse += s
         sp = f"{b / s:.3f}x" if s > 1e-6 else "inf"
         short = name if len(name) <= 39 else "..." + name[-36:]
-        print(f"  {short:<40} {b:>9.3f} {s:>11.3f} {sp:>8}")
+        print(f"  {short:<40} {b:>9.3f} {s:>14.3f} {sp:>8}")
         kind = classify_target_type(target_map[name])
         bucket[kind]["count"] += 1; bucket[kind]["base"] += b; bucket[kind]["sparse"] += s
 
-    print(f"  {'-'*72}")
+    print(f"  {'-'*75}")
     sp = f"{total_base / total_sparse:.3f}x" if total_sparse > 1e-6 else "inf"
-    print(f"  {'[REPLACED TOTAL]':<40} {total_base:>9.3f} {total_sparse:>11.3f} {sp:>8}")
-    if e2e_ms is not None and e2e_ms > 1e-6:
-        print(f"\n  replaced layers 占 baseline e2e: {100.0 * total_base / e2e_ms:.2f}%")
+    print(f"  {'[REPLACED TOTAL]':<40} {total_base:>9.3f} {total_sparse:>14.3f} {sp:>8}")
 
-    print(f"\n  {'Bucket':<12} {'Count':>6} {'Base(ms)':>10} {'Sparse(ms)':>11} {'Speedup':>8}")
+    if e2e_baseline_ms is not None and e2e_baseline_ms > 1e-6:
+        print(f"\n  替换层占 baseline e2e: {100.0 * total_base / e2e_baseline_ms:.2f}%")
+    if e2e_sparse_ms is not None and e2e_sparse_ms > 1e-6:
+        print(f"  替换层占 {label} e2e:   {100.0 * total_sparse / e2e_sparse_ms:.2f}%")
+
+    saved_ms = total_base - total_sparse
+    print(f"  替换层节省: {saved_ms:.3f} ms/batch")
+
+    print(f"\n  {'Bucket':<12} {'Count':>6} {'Base(ms)':>10} {col_sparse:>14} {'Speedup':>8}")
     print(f"  {'-'*58}")
     for kind in ["1x1/s1", "1x1/s2", "3x3/s1", "3x3/s2"]:
         c = bucket[kind]["count"]; b = bucket[kind]["base"]; s = bucket[kind]["sparse"]
+        if c == 0:
+            continue
         sp = f"{b / s:.3f}x" if s > 1e-6 else "inf"
-        print(f"  {kind:<12} {c:>6} {b:>10.3f} {s:>11.3f} {sp:>8}")
+        print(f"  {kind:<12} {c:>6} {b:>10.3f} {s:>14.3f} {sp:>8}")
 
 
 def verify_consistency(model_baseline, model_sparse, loader, device, T,
@@ -752,7 +837,16 @@ def verify_consistency(model_baseline, model_sparse, loader, device, T,
     return cosine_sum / n, agree_sum / n, global_max_abs
 
 
-def print_fourway_route_report(targets, sparsity_data, static_zero_layers):
+def route_label_from_backend(info, backend):
+    kind = classify_target_type(info)
+    if backend == "staticzero":
+        return f"StaticZeroConv2d[{kind}]"
+    if backend == "dense":
+        return f"DenseKeep[{kind}]"
+    return f"SparseConv2d[{kind}]"
+
+
+def print_fourway_route_report(targets, sparsity_data, hybrid_decisions=None):
     print(f"\n  {'Layer':<40} {'Sparsity':>10} {'StaticZeroOnly':>24} {'SparseOnly':>24} {'Hybrid':>24}")
     print(f"  {'-'*132}")
     sparsity_values = []
@@ -761,14 +855,36 @@ def print_fourway_route_report(targets, sparsity_data, static_zero_layers):
         sd = sparsity_data[name]
         sp = sd["zeros"] / sd["total"] * 100 if sd["total"] > 0 else 0.0
         sparsity_values.append(sp)
-        sz_route = route_label(t, static_zero_layers=static_zero_layers, disable_static_zero=False, only_static_zero=True)
-        sp_route = route_label(t, static_zero_layers=set(), disable_static_zero=True, only_static_zero=False)
-        hy_route = route_label(t, static_zero_layers=static_zero_layers, disable_static_zero=False, only_static_zero=False)
+        sz_route = route_label_from_backend(t, "staticzero") if sp >= 99.9999 else route_label_from_backend(t, "dense")
+        sp_route = route_label_from_backend(t, "sparse")
+        hy_backend = hybrid_decisions[name].backend if hybrid_decisions and name in hybrid_decisions else "sparse"
+        hy_route = route_label_from_backend(t, hy_backend)
         short = name if len(name) <= 39 else "..." + name[-36:]
         print(f"  {short:<40} {sp:>9.2f}% {sz_route:>24} {sp_route:>24} {hy_route:>24}")
     avg_sparsity = sum(sparsity_values) / max(len(sparsity_values), 1)
     print(f"  {'[平均]':<40} {avg_sparsity:>9.2f}%")
     return avg_sparsity
+
+
+def print_dispatch_decision_report(targets, group_sparsity_data, dispatch_decisions):
+    print(f"\n  {'Layer':<40} {'AGR':>8} {'TileZR':>8} {'Decision':>12} {'Score':>9} {'Reason':>28}")
+    print(f"  {'-'*112}")
+    for t in targets:
+        name = t["name"]
+        gd = group_sparsity_data.get(name, {})
+        dec = dispatch_decisions.get(name)
+        agr = gd.get('active_group_ratio', dec.agr if dec is not None else -1.0)
+        tzr = gd.get('tile_zero_ratio', dec.tzr if dec is not None else -1.0)
+        score = dec.score_sparse if dec is not None else 0.0
+        reason = dec.reason if dec is not None else 'n/a'
+        backend = dec.backend if dec is not None else 'n/a'
+        short = name if len(name) <= 39 else "..." + name[-36:]
+        agr_s = f"{agr:.4f}" if agr >= 0 else "n/a"
+        tzr_s = f"{tzr:.4f}" if tzr >= 0 else "n/a"
+        score_s = f"{score:.4f}" if dec is not None else "n/a"
+        if len(reason) > 28:
+            reason = reason[:25] + '...'
+        print(f"  {short:<40} {agr_s:>8} {tzr_s:>8} {backend:>12} {score_s:>9} {reason:>28}")
 
 
 def measure_mode(model, loader, device, T, warmup, spike_mode, power, label):
@@ -783,22 +899,27 @@ def print_mode_result(res):
     print(f"    {res['label']:<24}{res['avg_ms']:.2f} ms/batch  (total={res['total_ms']:.1f} ms, {res['num_batches']} batches)")
 
 
-def build_fourway_models(model_baseline, targets, static_zero_layers, selective_sparse_set=None):
+def build_fourway_models(model_baseline, targets, hybrid_static_zero_layers, hybrid_sparse_set=None):
+    if hybrid_static_zero_layers is None:
+        hybrid_static_zero_layers = set()
+    if hybrid_sparse_set is None:
+        hybrid_sparse_set = set()
+
     model_static_zero_only = copy.deepcopy(model_baseline)
     _, sz_sp, _, sz_sz, sz_dk = replace_model(
         model_static_zero_only, targets, fused=False,
-        static_zero_layers=set(static_zero_layers), only_static_zero=True)
+        static_zero_layers=set(hybrid_static_zero_layers), only_static_zero=True)
 
     model_sparse_only = copy.deepcopy(model_baseline)
     _, so_sp, _, so_sz, so_dk = replace_model(
         model_sparse_only, targets, fused=False, static_zero_layers=set(),
-        only_static_zero=False, selective_sparse_set=selective_sparse_set)
+        only_static_zero=False, selective_sparse_set=None)
 
     model_hybrid = copy.deepcopy(model_baseline)
     _, hy_sp, _, hy_sz, hy_dk = replace_model(
         model_hybrid, targets, fused=False,
-        static_zero_layers=set(static_zero_layers), only_static_zero=False,
-        selective_sparse_set=selective_sparse_set)
+        static_zero_layers=set(hybrid_static_zero_layers), only_static_zero=False,
+        selective_sparse_set=set(hybrid_sparse_set))
 
     counts = {
         "static_zero_only": {"num_sparse_conv": sz_sp, "num_static_zero": sz_sz, "num_dense_keep": sz_dk},
@@ -812,11 +933,11 @@ def main():
     global DEVICE
 
     parser = argparse.ArgumentParser(
-        description="SparseFlow four-way E2E benchmark v19")
+        description="SparseFlow four-way E2E benchmark v21-conservative-dispatch")
     parser.add_argument("--model", type=str, default="spiking_resnet18",
                         choices=list(MODEL_BUILDERS.keys()))
-    parser.add_argument("--dataset", type=str, default="cifar10",
-                        choices=["cifar10", "cifar100"])
+    parser.add_argument("--dataset",type=str,default="cifar10",
+                        choices=["cifar10", "cifar100", "imagenet_val_flat"],)
     parser.add_argument("--T", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--v_threshold", type=float, default=1.0)
@@ -833,7 +954,8 @@ def main():
     parser.add_argument("--gpu", type=int, default=-1)
     parser.add_argument("--verify_batches", type=int, default=10)
     parser.add_argument("--sparsity_batches", type=int, default=20)
-    parser.add_argument("--save_json", type=str, default="")
+    parser.add_argument("--out_json", type=str, default="", help="Output JSON path")
+    parser.add_argument("--save_json", type=str, default="", help=argparse.SUPPRESS)
     parser.add_argument("--spike_mode", type=str, default="normalized_bernoulli",
                         choices=["normalized_bernoulli", "raw_bernoulli", "raw_repeat"])
     parser.add_argument("--collect_diag", action="store_true")
@@ -844,6 +966,13 @@ def main():
     parser.add_argument("--max_agr_for_sparse", type=float, default=0.5)
     parser.add_argument("--no_sparse_1x1", action="store_true")
     parser.add_argument("--min_spatial_size", type=int, default=4)
+    # ── NEW: layer-level profiling ──
+    parser.add_argument("--layer_profile", action="store_true",
+                        help="Measure per-layer timing for baseline vs each sparse variant")
+    parser.add_argument("--layer_profile_warmup", type=int, default=5,
+                        help="Warmup batches for layer profiling")
+    parser.add_argument("--layer_profile_batches", type=int, default=20,
+                        help="Measurement batches for layer profiling")
 
     args = parser.parse_args()
 
@@ -866,9 +995,9 @@ def main():
     torch.cuda.set_device(DEVICE)
     device = DEVICE
 
-    title = f"{args.model} | {args.dataset.upper()} | T={args.T} | Four-Way v19"
+    title = f"{args.model} | {args.dataset.upper()} | T={args.T} | Four-Way v21-conservative-dispatch"
     print(f"\n{'='*80}")
-    print(f"{'SparseFlow Four-Way Benchmark v19':^80}")
+    print(f"{'SparseFlow Four-Way Benchmark v21-conservative-dispatch':^80}")
     print(f"{title:^80}")
     print(f"{'='*80}")
     print(f"  GPU:          {gpu_id} ({torch.cuda.get_device_name(gpu_id)})")
@@ -878,21 +1007,30 @@ def main():
     print(f"  Seed:         {args.seed}")
     print(f"  Power (TDP):  {args.power} W")
     print(f"  Min spatial:  {args.min_spatial_size}x{args.min_spatial_size}")
+    print(f"  Layer profile: {'ON' if args.layer_profile else 'OFF'}")
     print()
 
-    print(f"[1/6] 构建 {args.model} ...")
-    num_classes = 10 if args.dataset == "cifar10" else 100
+    print(f"[1/7] 构建 {args.model} ...")
+    if args.dataset == "cifar10":
+        num_classes = 10
+    elif args.dataset == "cifar100":
+        num_classes = 100
+    elif args.dataset == "imagenet_val_flat":
+        num_classes = 1000
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
     model_baseline = build_model(
         args.model, device, args.v_threshold,
         weight_init=args.weight_init, sew_cnf=args.sew_cnf,
         num_classes=num_classes, seed=args.seed)
 
-    print(f"[2/6] 加载 {args.dataset} 测试集 ...")
+    print(f"[2/7] 加载 {args.dataset} 测试集 ...")
     ds = build_dataset(args.dataset, args.data_root, spike_mode=args.spike_mode)
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    # loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=True)
     print(f"  测试集: {len(ds)} 张, {len(loader)} batches, {num_classes} classes")
 
-    print(f"[3/6] 分析网络拓扑 ...")
+    print(f"[3/7] 分析网络拓扑 ...")
     imgs_s, _ = next(iter(loader))
     sample_input = make_spike_input(imgs_s[:4], args.T, device, spike_mode=args.spike_mode)
     targets, skipped = analyze_targets(
@@ -902,95 +1040,117 @@ def main():
     if not targets:
         print("\n  未找到可替换的目标层，退出。"); return
 
-    print(f"\n[4/6] 统计稀疏率 ({args.sparsity_batches} batches) ...")
+    print(f"\n[4/7] 统计稀疏率与调度特征 ({args.sparsity_batches} batches) ...")
     sparsity_data = measure_sparsity(
         model_baseline, targets, loader, device, args.T,
         num_batches=args.sparsity_batches, spike_mode=args.spike_mode)
     zero_layers = collect_static_zero_layers(targets, sparsity_data)
     print(f"\n  检测到 {len(zero_layers)} 个全零输入层。")
-    avg_sparsity = print_fourway_route_report(targets, sparsity_data, zero_layers)
 
-    selective_sparse_set = None
-    group_sparsity_data = {}
+    print(f"\n  [Dispatch] Measuring group/tile sparsity for hybrid routing ...")
+    _tmp_model = copy.deepcopy(model_baseline)
+    replace_model(_tmp_model, targets, fused=False, static_zero_layers=set(), only_static_zero=False)
+    group_sparsity_data = measure_group_sparsity(
+        _tmp_model, targets, loader, device, args.T,
+        num_batches=min(args.sparsity_batches, 5), spike_mode=args.spike_mode)
+    del _tmp_model
 
-    if args.selective_sparse or args.collect_diag:
-        print(f"\n  [Diag] Measuring group/tile sparsity (v22 two-stage) ...")
-        _tmp_model = copy.deepcopy(model_baseline)
-        replace_model(_tmp_model, targets, fused=False, static_zero_layers=set(), only_static_zero=False)
-        group_sparsity_data = measure_group_sparsity(
-            _tmp_model, targets, loader, device, args.T,
-            num_batches=min(args.sparsity_batches, 5), spike_mode=args.spike_mode)
-        del _tmp_model
+    for _t in targets:
+        _n = _t["name"]
+        if _n in zero_layers:
+            _gd_existing = group_sparsity_data.get(_n, {})
+            group_sparsity_data[_n] = make_synthetic_zero_diag(
+                layer_name=_n, source='staticzero',
+                total_group_count=_gd_existing.get('total_group_count', -1.0),
+                total_tile_count=_gd_existing.get('total_tile_count', -1.0))
 
-        # Synthetic diag for StaticZero layers (unified zero backend)
-        for _t in targets:
-            _n = _t["name"]
-            if _n in zero_layers:
-                _gd_existing = group_sparsity_data.get(_n, {})
-                group_sparsity_data[_n] = make_synthetic_zero_diag(
-                    layer_name=_n, source='staticzero',
-                    total_group_count=_gd_existing.get('total_group_count', -1.0),
-                    total_tile_count=_gd_existing.get('total_tile_count', -1.0))
+    for _t in targets:
+        _n = _t["name"]
+        if _n in zero_layers:
+            continue
+        _gd = group_sparsity_data.get(_n, {})
+        if _gd.get('active_group_ratio', -1.0) >= 0:
+            continue
+        _sd = sparsity_data.get(_n, {"zeros": 0, "total": 1})
+        _elem_sp = _sd["zeros"] / max(_sd["total"], 1)
+        if _elem_sp >= 0.9999:
+            _gd_existing = group_sparsity_data.get(_n, {})
+            group_sparsity_data[_n] = make_synthetic_zero_diag(
+                layer_name=_n, source='zero_fastpath',
+                total_group_count=_gd_existing.get('total_group_count', -1.0),
+                total_tile_count=_gd_existing.get('total_tile_count', -1.0))
 
-        # Catch-all for near-100% sparsity layers that took zero fast-path
-        for _t in targets:
-            _n = _t["name"]
-            if _n in zero_layers:
-                continue
-            _gd = group_sparsity_data.get(_n, {})
-            if _gd.get('active_group_ratio', -1.0) >= 0:
-                continue
-            _sd = sparsity_data.get(_n, {"zeros": 0, "total": 1})
-            _elem_sp = _sd["zeros"] / max(_sd["total"], 1)
-            if _elem_sp >= 0.9999:
-                _gd_existing = group_sparsity_data.get(_n, {})
-                group_sparsity_data[_n] = make_synthetic_zero_diag(
-                    layer_name=_n, source='zero_fastpath',
-                    total_group_count=_gd_existing.get('total_group_count', -1.0),
-                    total_tile_count=_gd_existing.get('total_tile_count', -1.0))
-
-        # Print diagnostic table with v22 tile classification
-        print(f"\n  {'Layer':<40} {'AGR':>8} {'TileZR':>8} {'Zero':>6} {'Sparse':>7} {'Dense':>7} {'Source':>10}")
-        print(f"  {'-'*90}")
+    legacy_sparse_candidate_set = None
+    if args.selective_sparse:
+        legacy_sparse_candidate_set = set()
         for t in targets:
             name = t["name"]
-            gd = group_sparsity_data.get(name, {})
-            agr = gd.get('active_group_ratio', -1.0)
-            tzr = gd.get('tile_zero_ratio', -1.0)
-            zt = gd.get('zero_tiles', -1)
-            st = gd.get('sparse_tiles', -1)
-            dt = gd.get('denseish_tiles', -1)
-            _synth = gd.get('_synthetic', False)
-            _src = gd.get('_diag_path', 'measured') if _synth else ('measured' if agr >= 0 else 'unavail')
-            short = name if len(name) <= 39 else "..." + name[-36:]
-            agr_s = f"{agr:.4f}" if agr >= 0 else "n/a"
-            tzr_s = f"{tzr:.4f}" if tzr >= 0 else "n/a"
-            zt_s = str(zt) if zt >= 0 else "n/a"
-            st_s = str(st) if st >= 0 else "n/a"
-            dt_s = str(dt) if dt >= 0 else "n/a"
-            print(f"  {short:<40} {agr_s:>8} {tzr_s:>8} {zt_s:>6} {st_s:>7} {dt_s:>7} {_src:>10}")
+            if name in zero_layers:
+                continue
+            if should_use_sparse_selective(
+                t, group_sparsity_data,
+                min_cin=args.min_cin_for_sparse,
+                max_agr=args.max_agr_for_sparse,
+                no_1x1=args.no_sparse_1x1):
+                legacy_sparse_candidate_set.add(name)
+        print(f"\n  [Legacy selective filter] {len(legacy_sparse_candidate_set)}/{len(targets)} layers allowed for sparse")
 
-        if args.selective_sparse:
-            selective_sparse_set = set()
-            for t in targets:
-                name = t["name"]
-                if name in zero_layers:
-                    continue
-                if should_use_sparse_selective(
-                    t, group_sparsity_data,
-                    min_cin=args.min_cin_for_sparse,
-                    max_agr=args.max_agr_for_sparse,
-                    no_1x1=args.no_sparse_1x1):
-                    selective_sparse_set.add(name)
-            print(f"\n  [Selective] {len(selective_sparse_set)}/{len(targets)} layers selected")
+    dispatch_decisions = dispatch_all_layers(targets, group_sparsity_data, zero_layers=set(zero_layers))
+
+    hybrid_static_zero_layers, hybrid_sparse_set = decisions_to_sets(dispatch_decisions)
+
+    # Safety net: StaticZero must remain exact-zero only. If a non-exact layer somehow
+    # slips through as staticzero, remap it to sparse instead of producing wrong zeros.
+    invalid_static_zero_layers = set(hybrid_static_zero_layers) - set(zero_layers)
+    if invalid_static_zero_layers:
+        for _name in sorted(invalid_static_zero_layers):
+            _dec = dispatch_decisions[_name]
+            _dec.backend = 'sparse'
+            _dec.reason = 'bench_safety_remap_nonexact_staticzero_to_sparse'
+        hybrid_static_zero_layers -= invalid_static_zero_layers
+        hybrid_sparse_set |= invalid_static_zero_layers
+
+    if legacy_sparse_candidate_set is not None:
+        hybrid_sparse_set &= legacy_sparse_candidate_set
+        for _name, _dec in dispatch_decisions.items():
+            if _dec.backend == 'sparse' and _name not in hybrid_sparse_set:
+                _dec.backend = 'dense'
+                _dec.reason = 'legacy_selective_filter_keep_dense'
+
+    # Re-sync sets from final decisions after all remaps / legacy filters.
+    hybrid_static_zero_layers, hybrid_sparse_set = decisions_to_sets(dispatch_decisions)
+
+    avg_sparsity = print_fourway_route_report(targets, sparsity_data, hybrid_decisions=dispatch_decisions)
+
+    print(f"\n  {'Layer':<40} {'AGR':>8} {'TileZR':>8} {'Zero':>6} {'Sparse':>7} {'Dense':>7} {'Source':>10}")
+    print(f"  {'-'*90}")
+    for t in targets:
+        name = t["name"]
+        gd = group_sparsity_data.get(name, {})
+        agr = gd.get('active_group_ratio', -1.0)
+        tzr = gd.get('tile_zero_ratio', -1.0)
+        zt = gd.get('zero_tiles', -1)
+        st = gd.get('sparse_tiles', -1)
+        dt = gd.get('denseish_tiles', -1)
+        _synth = gd.get('_synthetic', False)
+        _src = gd.get('_diag_path', 'measured') if _synth else ('measured' if agr >= 0 else 'unavail')
+        short = name if len(name) <= 39 else "..." + name[-36:]
+        agr_s = f"{agr:.4f}" if agr >= 0 else "n/a"
+        tzr_s = f"{tzr:.4f}" if tzr >= 0 else "n/a"
+        zt_s = str(zt) if zt >= 0 else "n/a"
+        st_s = str(st) if st >= 0 else "n/a"
+        dt_s = str(dt) if dt >= 0 else "n/a"
+        print(f"  {short:<40} {agr_s:>8} {tzr_s:>8} {zt_s:>6} {st_s:>7} {dt_s:>7} {_src:>10}")
+
+    print_dispatch_decision_report(targets, group_sparsity_data, dispatch_decisions)
 
     model_static_zero_only, model_sparse_only, model_hybrid, route_counts = build_fourway_models(
-        model_baseline, targets, zero_layers, selective_sparse_set=selective_sparse_set)
+        model_baseline, targets, hybrid_static_zero_layers, hybrid_sparse_set=hybrid_sparse_set)
     print(f"\n  替换完成:")
     for mode_name, rc in route_counts.items():
         print(f"    {mode_name}: {rc['num_sparse_conv']} Sparse + {rc['num_static_zero']} StaticZero + {rc['num_dense_keep']} DenseKeep")
 
-    print(f"\n[5/6] 端到端延迟 (warmup={args.warmup}) ...")
+    print(f"\n[5/7] 端到端延迟 (warmup={args.warmup}) ...")
     dense_res = measure_mode(model_baseline, loader, device, args.T, args.warmup, args.spike_mode, args.power, "Dense cuDNN")
     sz_res = measure_mode(model_static_zero_only, loader, device, args.T, args.warmup, args.spike_mode, args.power, "StaticZero only")
     so_res = measure_mode(model_sparse_only, loader, device, args.T, args.warmup, args.spike_mode, args.power, "SparseConv only")
@@ -1008,7 +1168,75 @@ def main():
     print(f"\n  Speedup SZ-only: {sz_speedup:.3f}x  Sparse-only: {so_speedup:.3f}x  Hybrid: {hy_speedup:.3f}x")
     print(f"  Energy  SZ-only: {sz_esave:.2f}%  Sparse-only: {so_esave:.2f}%  Hybrid: {hy_esave:.2f}%")
 
-    print(f"\n[6/6] 一致性验证 ({args.verify_batches} batches) ...")
+    # ══════════════════════════════════════════════════════════════════════
+    # [6/7] 逐层加速分析 (Layer-level profiling)
+    # ══════════════════════════════════════════════════════════════════════
+    layer_profile_data = {}
+    if args.layer_profile:
+        lp_warmup = args.layer_profile_warmup
+        lp_batches = args.layer_profile_batches
+        target_names = [t["name"] for t in targets]
+
+        print(f"\n[6/7] 逐层加速分析 (warmup={lp_warmup}, batches={lp_batches}) ...")
+
+        # 6a) Baseline (Dense cuDNN) per-layer timing
+        print(f"  Measuring baseline (Dense cuDNN) per-layer timing ...")
+        baseline_layer_timing = measure_layer_timing(
+            model_baseline, loader, device, args.T, target_names,
+            warmup=lp_warmup, num_batches=lp_batches, spike_mode=args.spike_mode)
+
+        # 6b) SparseConv-only per-layer timing
+        print(f"  Measuring SparseConv-only per-layer timing ...")
+        # For sparse models, the replaced layer names still exist but the module
+        # type is now SparseConv2d / StaticZeroConv2d — hooks work the same way.
+        sparse_only_layer_timing = measure_layer_timing(
+            model_sparse_only, loader, device, args.T, target_names,
+            warmup=lp_warmup, num_batches=lp_batches, spike_mode=args.spike_mode)
+
+        # 6c) Hybrid per-layer timing
+        print(f"  Measuring Hybrid per-layer timing ...")
+        hybrid_layer_timing = measure_layer_timing(
+            model_hybrid, loader, device, args.T, target_names,
+            warmup=lp_warmup, num_batches=lp_batches, spike_mode=args.spike_mode)
+
+        # Print SparseConv-only layer profile
+        print(f"\n  ╔{'═'*77}╗")
+        print(f"  ║{'逐层对比: Dense cuDNN  vs  SparseConv-only':^77}║")
+        print(f"  ╚{'═'*77}╝")
+        print_layer_profile(baseline_layer_timing, sparse_only_layer_timing, targets,
+                            e2e_baseline_ms=dense_res["avg_ms"],
+                            e2e_sparse_ms=so_res["avg_ms"],
+                            label="SparseOnly")
+
+        # Print Hybrid layer profile
+        print(f"\n  ╔{'═'*77}╗")
+        print(f"  ║{'逐层对比: Dense cuDNN  vs  Hybrid (Sparse+StaticZero)':^77}║")
+        print(f"  ╚{'═'*77}╝")
+        print_layer_profile(baseline_layer_timing, hybrid_layer_timing, targets,
+                            e2e_baseline_ms=dense_res["avg_ms"],
+                            e2e_sparse_ms=hy_res["avg_ms"],
+                            label="Hybrid")
+
+        # Store for JSON output
+        layer_profile_data = {
+            "baseline_layer_ms": {k: round(v, 4) for k, v in baseline_layer_timing.items()},
+            "sparse_only_layer_ms": {k: round(v, 4) for k, v in sparse_only_layer_timing.items()},
+            "hybrid_layer_ms": {k: round(v, 4) for k, v in hybrid_layer_timing.items()},
+            "per_layer_speedup_sparse_only": {},
+            "per_layer_speedup_hybrid": {},
+        }
+        for name in target_names:
+            b = baseline_layer_timing.get(name, 0.0)
+            s_so = sparse_only_layer_timing.get(name, 0.0)
+            s_hy = hybrid_layer_timing.get(name, 0.0)
+            layer_profile_data["per_layer_speedup_sparse_only"][name] = (
+                round(b / s_so, 4) if s_so > 1e-6 else float("inf"))
+            layer_profile_data["per_layer_speedup_hybrid"][name] = (
+                round(b / s_hy, 4) if s_hy > 1e-6 else float("inf"))
+    else:
+        print(f"\n[6/7] 逐层加速分析 ... SKIPPED (use --layer_profile to enable)")
+
+    print(f"\n[7/7] 一致性验证 ({args.verify_batches} batches) ...")
     sz_cos, sz_agr, sz_mabs = verify_consistency(model_baseline, model_static_zero_only, loader, device, args.T, num_batches=args.verify_batches, spike_mode=args.spike_mode)
     so_cos, so_agr, so_mabs = verify_consistency(model_baseline, model_sparse_only, loader, device, args.T, num_batches=args.verify_batches, spike_mode=args.spike_mode)
     hy_cos, hy_agr, hy_mabs = verify_consistency(model_baseline, model_hybrid, loader, device, args.T, num_batches=args.verify_batches, spike_mode=args.spike_mode)
@@ -1020,7 +1248,7 @@ def main():
     print(f"  Hybrid:   cos={hy_cos:.8f}  agree={hy_agr*100:.2f}%  max_abs={hy_mabs:.6f}  {'PASS' if hy_ok else 'FAIL'}")
 
     print(f"\n{'='*96}")
-    print(f"{'FOUR-WAY SUMMARY v19':^96}")
+    print(f"{'FOUR-WAY SUMMARY v21-conservative-dispatch':^96}")
     print(f"{'='*96}")
     print(f"  Model: {args.model}  Dataset: {args.dataset}  T={args.T}  Spike: {args.spike_mode}")
     print(f"  Avg Sparsity: {avg_sparsity:.2f}%  Targets: {len(targets)}  Skipped: {len(skipped)}")
@@ -1033,6 +1261,7 @@ def main():
     print(f"{'='*96}\n")
 
     results = {
+        "script_version": "v21-conservative-dispatch",
         "model": args.model, "dataset": args.dataset, "T": args.T,
         "batch_size": args.batch_size, "gpu": torch.cuda.get_device_name(gpu_id),
         "spike_mode": args.spike_mode, "weight_init": args.weight_init, "seed": args.seed,
@@ -1041,16 +1270,25 @@ def main():
         "num_zero_layers": len(zero_layers),
         "static_zero_layers": sorted(list(zero_layers)),
         "route_counts": route_counts,
+        "hybrid_static_zero_layers": sorted(list(hybrid_static_zero_layers)),
+        "hybrid_sparse_layers": sorted(list(hybrid_sparse_set)),
+        "hybrid_dense_keep_layers": sorted([t["name"] for t in targets if t["name"] not in hybrid_static_zero_layers and t["name"] not in hybrid_sparse_set]),
+        "dispatch_decisions": {name: dec.to_dict() for name, dec in dispatch_decisions.items()},
+        "dispatch_invalid_staticzero_remapped_layers": sorted(list(invalid_static_zero_layers)) if "invalid_static_zero_layers" in locals() else [],
         "dense": {"ms_per_batch": round(dense_res["avg_ms"], 2), "energy_j": round(dense_res["energy_j"], 4)},
         "static_zero_only": {"ms_per_batch": round(sz_res["avg_ms"], 2), "speedup": round(sz_speedup, 4), "energy_saving_pct": round(sz_esave, 2), "cosine_sim": round(sz_cos, 8), "consistency": "PASS" if sz_ok else "FAIL"},
         "sparse_only": {"ms_per_batch": round(so_res["avg_ms"], 2), "speedup": round(so_speedup, 4), "energy_saving_pct": round(so_esave, 2), "cosine_sim": round(so_cos, 8), "consistency": "PASS" if so_ok else "FAIL"},
         "hybrid": {"ms_per_batch": round(hy_res["avg_ms"], 2), "speedup": round(hy_speedup, 4), "energy_saving_pct": round(hy_esave, 2), "cosine_sim": round(hy_cos, 8), "consistency": "PASS" if hy_ok else "FAIL"},
     }
+    # ── NEW: include layer profile data in JSON ──
+    if layer_profile_data:
+        results["layer_profile"] = layer_profile_data
+
     if group_sparsity_data:
         results["group_sparsity"] = group_sparsity_data
 
     if args.collect_diag and (args.diag_json or args.diag_csv):
-        run_id = f"{args.model}_{args.dataset}_T{args.T}_fourway_v19"
+        run_id = f"{args.model}_{args.dataset}_T{args.T}_fourway_v21_conservative_dispatch"
         layer_logger = LayerLogger(run_id=run_id, model=args.model, dataset=args.dataset, T=args.T)
         for t in targets:
             name = t["name"]
@@ -1059,7 +1297,7 @@ def main():
             gd = group_sparsity_data.get(name, {})
             ishape = t.get("input_shape")
             _is_sz = (name in zero_layers)
-            _is_dk = (selective_sparse_set is not None and name not in selective_sparse_set and not _is_sz)
+            _is_dk = (name not in hybrid_sparse_set and not _is_sz)
 
             if _is_sz:
                 layer_logger.log_static_zero(layer_name=name, input_shape=ishape)
@@ -1089,7 +1327,7 @@ def main():
             print(f"  诊断 CSV: {args.diag_csv}")
         layer_logger.print_summary()
 
-    out_path = args.save_json or f"results_fourway_{args.model}_{args.dataset}_T{args.T}_bs{args.batch_size}_{args.weight_init}.json"
+    out_path = args.out_json or args.save_json or f"results_fourway_{args.model}_{args.dataset}_T{args.T}_bs{args.batch_size}_{args.weight_init}.json"
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"  结果: {out_path}")
