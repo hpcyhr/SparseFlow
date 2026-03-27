@@ -31,7 +31,6 @@ from Ops.sparse_fused_conv_lif import FusedSparseConvLIF
 from Ops.static_zero_conv2d import StaticZeroConv2d, make_synthetic_zero_diag
 from Utils.layer_logger import LayerLogger
 from Utils.dispatch_model import dispatch_all_layers, decisions_to_sets
-from Utils.timing_utils import prepare_for_timing, set_launch_mode, count_sync_state
 
 
 DEVICE = None
@@ -975,16 +974,6 @@ def main():
     parser.add_argument("--layer_profile_batches", type=int, default=20,
                         help="Measurement batches for layer profiling")
 
-
-    # --- v25: sync-gating and A/B tile launch ---
-    parser.add_argument("--launch_all_tiles", action="store_true",
-                        help="Mode B: launch all tiles, zero tiles early-return. "
-                             "Default Mode A: build active tile IDs.")
-    parser.add_argument("--inference_mode", action="store_true",
-                        help="Disable periodic calibration syncs during timing.")
-    parser.add_argument("--ab_compare", action="store_true",
-                        help="Run both Mode A and Mode B and report comparison.")
-
     args = parser.parse_args()
 
     if args.list_models:
@@ -1161,24 +1150,6 @@ def main():
     for mode_name, rc in route_counts.items():
         print(f"    {mode_name}: {rc['num_sparse_conv']} Sparse + {rc['num_static_zero']} StaticZero + {rc['num_dense_keep']} DenseKeep")
 
-
-    # ── v25: timing preparation ──
-    if args.inference_mode:
-        n_so = prepare_for_timing(model_sparse_only)
-        n_hy = prepare_for_timing(model_hybrid)
-        print(f"  [v25] inference_mode: {n_so} sparse_only + {n_hy} hybrid modules configured")
-
-    if args.launch_all_tiles:
-        set_launch_mode(model_sparse_only, launch_all=True)
-        set_launch_mode(model_hybrid, launch_all=True)
-        print(f"  [v25] launch_all_tiles=True (Mode B)")
-
-    _so_state = count_sync_state(model_sparse_only)
-    _hy_state = count_sync_state(model_hybrid)
-    print(f"  [v25] sparse_only sync state: {_so_state}")
-    print(f"  [v25] hybrid sync state: {_hy_state}")
-
-
     print(f"\n[5/7] 端到端延迟 (warmup={args.warmup}) ...")
     dense_res = measure_mode(model_baseline, loader, device, args.T, args.warmup, args.spike_mode, args.power, "Dense cuDNN")
     sz_res = measure_mode(model_static_zero_only, loader, device, args.T, args.warmup, args.spike_mode, args.power, "StaticZero only")
@@ -1288,32 +1259,6 @@ def main():
     print(f"  {'SparseConv only':<28} {so_res['avg_ms']:>12.2f} {so_speedup:>9.3f}x {so_esave:>11.2f}% {('PASS' if so_ok else 'FAIL'):>12}")
     print(f"  {'SparseConv + StaticZero':<28} {hy_res['avg_ms']:>12.2f} {hy_speedup:>9.3f}x {hy_esave:>11.2f}% {('PASS' if hy_ok else 'FAIL'):>12}")
     print(f"{'='*96}\n")
-
-
-    # ── v25: A/B tile launch comparison ──
-    if args.ab_compare:
-        print(f"\n[A/B] Tile launch mode comparison ...")
-        prepare_for_timing(model_sparse_only)
-        prepare_for_timing(model_hybrid)
-
-        set_launch_mode(model_sparse_only, launch_all=False)
-        set_launch_mode(model_hybrid, launch_all=False)
-        so_a = measure_mode(model_sparse_only, loader, device, args.T, args.warmup, args.spike_mode, args.power, "Sparse ModeA")
-        hy_a = measure_mode(model_hybrid, loader, device, args.T, args.warmup, args.spike_mode, args.power, "Hybrid ModeA")
-
-        set_launch_mode(model_sparse_only, launch_all=True)
-        set_launch_mode(model_hybrid, launch_all=True)
-        so_b = measure_mode(model_sparse_only, loader, device, args.T, args.warmup, args.spike_mode, args.power, "Sparse ModeB")
-        hy_b = measure_mode(model_hybrid, loader, device, args.T, args.warmup, args.spike_mode, args.power, "Hybrid ModeB")
-
-        print(f"\n  {'Config':<28} {'Latency(ms)':>12}")
-        print(f"  {'-'*44}")
-        for r in [so_a, so_b, hy_a, hy_b]:
-            print_mode_result(r)
-        so_diff = so_a["avg_ms"] - so_b["avg_ms"]
-        hy_diff = hy_a["avg_ms"] - hy_b["avg_ms"]
-        print(f"\n  Sparse: ModeA - ModeB = {so_diff:+.2f} ms  (positive = ModeB faster)")
-        print(f"  Hybrid: ModeA - ModeB = {hy_diff:+.2f} ms  (positive = ModeB faster)")
 
     results = {
         "script_version": "v21-conservative-dispatch",
