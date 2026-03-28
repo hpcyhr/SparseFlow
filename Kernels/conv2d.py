@@ -1107,12 +1107,28 @@ def sparse_conv2d_forward(
     def _dense_fallback(reason="dense_fallback", avg_active_ratio_val=1.0, tile_stats_val=None, backend_meta_extra=None):
         dense_ms = 0.0
         if return_ms:
-            se = torch.cuda.Event(enable_timing=True); ee = torch.cuda.Event(enable_timing=True); se.record()
-        y = Fn.conv2d(x, weight, bias, stride=stride, padding=padding, dilation=dilation, groups=groups).float()
+            se = torch.cuda.Event(enable_timing=True)
+            ee = torch.cuda.Event(enable_timing=True)
+            se.record()
+
+        # dtype-align for fallback path
+        x_dense = x.float()
+        w_dense = weight.float()
+        b_dense = bias.float() if bias is not None else None
+
+        y = Fn.conv2d(
+            x_dense, w_dense, b_dense,
+            stride=stride, padding=padding, dilation=dilation, groups=groups
+        ).float()
+
         if return_ms:
-            ee.record(); torch.cuda.synchronize(device); dense_ms = se.elapsed_time(ee)
+            ee.record()
+            torch.cuda.synchronize(device)
+            dense_ms = se.elapsed_time(ee)
+
         bm = {"backend": "dense_fallback", "reason": reason}
-        if backend_meta_extra: bm.update(backend_meta_extra)
+        if backend_meta_extra:
+            bm.update(backend_meta_extra)
         return _finalize_return(y, dense_ms, avg_active_ratio_val, tile_stats_val, bm)
 
     def _zero_tiles_output(reason, tile_stats_val=None, backend_meta_extra=None):
