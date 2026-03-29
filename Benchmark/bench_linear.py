@@ -1,22 +1,3 @@
-"""
-SparseFlow Benchmark — Sparse Linear on Spiking-ResNet
-
-比较对象：SparseFlow sparse Linear (tile-level Dynamic-K) vs PyTorch F.linear
-验证内容：
-  1. 逐层算子验证：Sparse Linear 输出 vs F.linear 输出的数值误差
-  2. 性能测试：稀疏率、延迟、加速比
-
-用法：
-    cd ~/SparseFlow
-    python Benchmark/bench_linear.py --model resnet34 --dataset cifar10
-    python Benchmark/bench_linear.py --model resnet50 --dataset cifar100 --T 32
-    python Benchmark/bench_linear.py --model resnet50 --dataset cifar10 --batch_size 64
-
-说明：
-    ResNet 中 Linear 层只有最后的分类头 (fc)，但 LIF 输出的脉冲数据
-    展平后具有高稀疏性，是验证 tile-level Dynamic-K 效果的理想场景。
-"""
-
 import sys
 from pathlib import Path
 
@@ -25,126 +6,280 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 import argparse
+import copy
+import json
+import math
+import time
+from collections import OrderedDict
+import os
+from PIL import Image
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 from torchvision import datasets, transforms
 
-from spikingjelly.activation_based.model import spiking_resnet
 from spikingjelly.activation_based import functional as sj_func
 from spikingjelly.activation_based import neuron as sj_neuron
 
-from Kernels.linear import sparse_linear_forward
+from Ops.sparse_linear import SparseLinear
 
-# =============================================================================
-# 注册表
-# =============================================================================
-SPIKE_OUTPUT_OPS = (
-    sj_neuron.LIFNode,
-    sj_neuron.IFNode,
-    sj_neuron.ParametricLIFNode,
-)
 
 DEVICE = None
+SPIKE_OPS = (sj_neuron.LIFNode, sj_neuron.IFNode, sj_neuron.ParametricLIFNode)
+
+
+# =========================================================
+# Utils
+# =========================================================
 
 def sync():
     torch.cuda.synchronize(DEVICE)
 
+
 def make_event():
     return torch.cuda.Event(enable_timing=True)
 
-# =============================================================================
-# Benchmark 函数
-# =============================================================================
 
-def run_sparse_linear(feat, linear_module):
-    """SparseFlow 稀疏 Linear benchmark"""
-    feat = feat.contiguous()
-    y, sparse_ms = sparse_linear_forward(
-        x=feat,
-        weight=linear_module.weight.contiguous(),
-        bias=linear_module.bias,
-        threshold=1e-6,
-        return_ms=True,
-    )
-    return y, sparse_ms
+def set_random_seed(seed):
+    if seed is None:
+        return
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
-def run_dense_linear(feat, linear_module):
-    """PyTorch F.linear 基准"""
-    start, end = make_event(), make_event()
-    start.record()
-    with torch.no_grad():
-        y = F.linear(feat, linear_module.weight, linear_module.bias)
-    end.record()
-    sync()
-    return y, start.elapsed_time(end)
+class FlatImageFolderDataset(Dataset):
+    def __init__(
+        self,
+        root,
+        transform=None,
+        exts=(".jpg", ".jpeg", ".png", ".JPEG", ".JPG", ".PNG"),
+    ):
+        self.root = root
+        self.transform = transform
+        self.samples = []
+
+        if not os.path.isdir(root):
+            raise RuntimeError(f"Dataset directory does not exist: {root}")
+
+        for name in sorted(os.listdir(root)):
+            if name.endswith(exts):
+                self.samples.append(os.path.join(root, name))
+
+        if not self.samples:
+            raise RuntimeError(f"No image files found in: {root}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path = self.samples[idx]
+        img = Image.open(path).convert("RGB")
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, 0
 
 
-# =============================================================================
-# 逐层数值验证
-# =============================================================================
+def build_dataset(dataset_name, data_root):
+    if dataset_name == "cifar10":
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+        ds = datasets.CIFAR10(root=data_root, train=False, download=True, transform=transform)
+        num_classes = 10
 
-def verify_layer(feat, linear_module, layer_name):
-    """验证单层：Sparse 输出 vs F.linear 输出的数值差异"""
-    feat = feat.contiguous()
+    elif dataset_name == "cifar100":
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+        ds = datasets.CIFAR100(root=data_root, train=False, download=True, transform=transform)
+        num_classes = 100
 
-    with torch.no_grad():
-        y_dense = F.linear(feat, linear_module.weight, linear_module.bias)
+    elif dataset_name == "imagenet_val_flat":
+        transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+        ])
+        ds = FlatImageFolderDataset(root=data_root, transform=transform)
+        num_classes = 1000
 
-    y_sparse, _ = sparse_linear_forward(
-        x=feat,
-        weight=linear_module.weight.contiguous(),
-        bias=linear_module.bias,
-        threshold=1e-6,
-    )
-
-    diff = (y_sparse - y_dense).float()
-    y_ref = y_dense.float()
-
-    max_abs = diff.abs().max().item()
-    mean_abs = diff.abs().mean().item()
-
-    denom = y_ref.abs().clamp(min=1.0)
-    max_rel = (diff.abs() / denom).max().item()
-
-    flat_s = y_sparse.flatten().float()
-    flat_c = y_dense.flatten().float()
-    norm_s = flat_s.norm()
-    norm_c = flat_c.norm()
-    if norm_s < 1e-8 and norm_c < 1e-8:
-        cos = 1.0
-    elif norm_s < 1e-8 or norm_c < 1e-8:
-        cos = 0.0
     else:
-        cos = F.cosine_similarity(flat_s.unsqueeze(0), flat_c.unsqueeze(0)).item()
+        raise ValueError(f"Unknown dataset: {dataset_name}")
 
-    return max_abs, mean_abs, max_rel, cos
-
-
-# =============================================================================
-# 网络分析：识别 LIF 后继的 Linear 层
-# =============================================================================
-
-class LayerInfo:
-    def __init__(self, name, module, H=0, W=0):
-        self.name = name
-        self.module = module
-        self.H, self.W = H, W
-        self.total_sparse_ms = 0.0
-        self.total_dense_ms = 0.0
-        self.total_zeros = 0
-        self.total_elems = 0
-        self.verify_max_abs = 0.0
-        self.verify_mean_abs = 0.0
-        self.verify_max_rel = 0.0
-        self.verify_cos_sum = 0.0
-        self.verify_count = 0
+    return ds, num_classes
 
 
-def analyze_network(model, sample_input, device):
-    """分析网络，识别脉冲后继的 Linear 层"""
+def make_spike_input(imgs, T, device, spike_mode="normalized_bernoulli"):
+    imgs = imgs.to(device)
+    if spike_mode in ("normalized_bernoulli", "raw_bernoulli"):
+        rates = imgs.clamp(0, 1)
+        return torch.bernoulli(rates.unsqueeze(0).repeat(T, 1, 1, 1, 1))
+    elif spike_mode == "raw_repeat":
+        return imgs.unsqueeze(0).repeat(T, 1, 1, 1, 1)
+    else:
+        raise ValueError(f"Unknown spike_mode: {spike_mode}")
+
+
+def _set_module_by_name(model, name, new_module):
+    parts = name.split(".")
+    parent = model
+    for part in parts[:-1]:
+        if part.isdigit():
+            parent = parent[int(part)]
+        else:
+            parent = getattr(parent, part)
+    last = parts[-1]
+    if last.isdigit():
+        parent[int(last)] = new_module
+    else:
+        setattr(parent, last, new_module)
+
+
+def _get_module_by_name(model, name):
+    parts = name.split(".")
+    cur = model
+    for part in parts:
+        if part.isdigit():
+            cur = cur[int(part)]
+        else:
+            cur = getattr(cur, part)
+    return cur
+
+
+# =========================================================
+# Linear-dominant spiking network
+# =========================================================
+
+class PatchEmbed(nn.Module):
+    def __init__(self, img_size=32, patch_size=4, in_chans=3, embed_dim=256):
+        super().__init__()
+        assert img_size % patch_size == 0
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.in_chans = in_chans
+        self.embed_dim = embed_dim
+        self.num_patches = (img_size // patch_size) * (img_size // patch_size)
+        patch_dim = in_chans * patch_size * patch_size
+        self.proj = nn.Linear(patch_dim, embed_dim)
+
+    def forward(self, x):
+        # x: [T, B, C, H, W]
+        T, B, C, H, W = x.shape
+        P = self.patch_size
+        gh = H // P
+        gw = W // P
+
+        x = x.reshape(T, B, C, gh, P, gw, P)
+        x = x.permute(0, 1, 3, 5, 2, 4, 6).contiguous()   # [T, B, gh, gw, C, P, P]
+        x = x.reshape(T, B, gh * gw, C * P * P)           # [T, B, N, patch_dim]
+        x = self.proj(x)                                  # [T, B, N, embed_dim]
+        return x
+
+
+class SpikingMLPBlock(nn.Module):
+    def __init__(self, dim, mlp_ratio=4.0, v_threshold=1.0):
+        super().__init__()
+        hidden_dim = int(dim * mlp_ratio)
+
+        self.fc1 = nn.Linear(dim, hidden_dim)
+        self.lif1 = sj_neuron.LIFNode(v_threshold=v_threshold)
+
+        self.fc2 = nn.Linear(hidden_dim, dim)
+        self.lif2 = sj_neuron.LIFNode(v_threshold=v_threshold)
+
+    def forward(self, x):
+        # x: [T, B, N, C]
+        x = self.fc1(x)
+        x = self.lif1(x)
+        x = self.fc2(x)
+        x = self.lif2(x)
+        return x
+
+
+class SpikingPatchMLP(nn.Module):
+    def __init__(
+        self,
+        img_size=32,
+        patch_size=4,
+        in_chans=3,
+        num_classes=10,
+        embed_dim=256,
+        depth=4,
+        mlp_ratio=4.0,
+        v_threshold=1.0,
+    ):
+        super().__init__()
+        self.patch_embed = PatchEmbed(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=in_chans,
+            embed_dim=embed_dim,
+        )
+        self.patch_lif = sj_neuron.LIFNode(v_threshold=v_threshold)
+
+        self.blocks = nn.ModuleList([
+            SpikingMLPBlock(embed_dim, mlp_ratio=mlp_ratio, v_threshold=v_threshold)
+            for _ in range(depth)
+        ])
+
+        self.head = nn.Linear(embed_dim, num_classes)
+
+    def forward(self, x):
+        # x: [T, B, C, H, W]
+        x = self.patch_embed(x)       # [T, B, N, C]
+        x = self.patch_lif(x)
+
+        for blk in self.blocks:
+            x = blk(x)
+
+        # token average pool
+        x = x.mean(dim=2)             # [T, B, C]
+        x = self.head(x)              # [T, B, num_classes]
+        return x
+
+
+def build_model(
+    dataset_name,
+    num_classes,
+    device,
+    v_threshold=1.0,
+    embed_dim=256,
+    depth=4,
+    mlp_ratio=4.0,
+    patch_size=4,
+    seed=42,
+):
+    if dataset_name in ("cifar10", "cifar100"):
+        img_size = 32
+    elif dataset_name == "imagenet_val_flat":
+        img_size = 224
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+
+    set_random_seed(seed)
+
+    model = SpikingPatchMLP(
+        img_size=img_size,
+        patch_size=patch_size,
+        in_chans=3,
+        num_classes=num_classes,
+        embed_dim=embed_dim,
+        depth=depth,
+        mlp_ratio=mlp_ratio,
+        v_threshold=v_threshold,
+    ).to(device).eval()
+
+    sj_func.set_step_mode(model, "m")
+    return model
+
+
+# =========================================================
+# Analyze / replace Linear
+# =========================================================
+
+def analyze_linear_targets(model, sample_input):
     input_shapes = {}
     hooks = []
 
@@ -156,301 +291,590 @@ def analyze_network(model, sample_input, device):
                     input_shapes[name] = tuple(x.shape)
         return hook
 
-    module_list = list(model.named_modules())
-    for name, module in module_list:
+    for name, module in model.named_modules():
         hooks.append(module.register_forward_hook(make_hook(name)))
+
     sj_func.reset_net(model)
     with torch.no_grad():
         _ = model(sample_input)
+
     for h in hooks:
         h.remove()
 
-    layer_infos = {}
-    visited = set()
-
-    TRANSPARENT_TYPES = (nn.BatchNorm2d, nn.BatchNorm1d,
-                         nn.Dropout, nn.Dropout2d,
-                         nn.Identity, nn.Flatten,
-                         nn.AdaptiveAvgPool2d, nn.AvgPool2d, nn.MaxPool2d,
-                         nn.ReLU, nn.ReLU6, nn.LeakyReLU)
-
-    for i, (name, module) in enumerate(module_list):
-        if not isinstance(module, SPIKE_OUTPUT_OPS):
+    targets = []
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
             continue
 
-        for j in range(i + 1, min(i + 20, len(module_list))):
-            next_name, next_module = module_list[j]
-            if next_name in visited:
-                continue
-            if isinstance(next_module, SPIKE_OUTPUT_OPS):
-                break
-            if isinstance(next_module, TRANSPARENT_TYPES):
-                continue
+        ishape = input_shapes.get(name, None)
+        if ishape is None:
+            continue
 
-            if isinstance(next_module, nn.Linear):
-                layer_infos[next_name] = LayerInfo(next_name, next_module)
-                visited.add(next_name)
-                in_f = next_module.in_features
-                out_f = next_module.out_features
-                print(f"  [LINEAR] LIF={name:<30} -> {next_name:<30} "
-                      f"({in_f}→{out_f})")
-                continue
+        info = {
+            "name": name,
+            "module": module,
+            "in_features": module.in_features,
+            "out_features": module.out_features,
+            "input_shape": ishape,
+        }
+        targets.append(info)
 
-    return layer_infos
+    return targets
 
 
-# =============================================================================
-# 模型构建
-# =============================================================================
-
-MODEL_BUILDERS = {
-    "resnet34": spiking_resnet.spiking_resnet34,
-    "resnet50": spiking_resnet.spiking_resnet50,
-    "resnet101": spiking_resnet.spiking_resnet101,
-    "resnet152": spiking_resnet.spiking_resnet152,
-}
-
-def build_model(model_name, device, v_threshold=0.5):
-    builder = MODEL_BUILDERS[model_name]
-    model = builder(
-        pretrained=True,
-        spiking_neuron=sj_neuron.LIFNode,
-        surrogate_function=sj_neuron.LIFNode().surrogate_function,
-        detach_reset=True,
-    )
-    for m in model.modules():
-        if isinstance(m, sj_neuron.LIFNode):
-            m.v_threshold = v_threshold
-    sj_func.set_step_mode(model, step_mode="m")
-    model.to(device).eval()
-    return model
+def print_analysis_report(targets):
+    print(f"\n  ┌{'─'*108}┐")
+    print(f"  │{'Linear 候选层分析报告':^106}│")
+    print(f"  ├{'─'*108}┤")
+    print(f"  │ {'Layer':<42} {'InFeat':>8} {'OutFeat':>8} {'InputShape':<40} │")
+    print(f"  ├{'─'*108}┤")
+    for t in targets:
+        name = t["name"]
+        short = name if len(name) <= 41 else "..." + name[-38:]
+        ishape = str(t["input_shape"])
+        if len(ishape) > 40:
+            ishape = ishape[:37] + "..."
+        print(f"  │ {short:<42} {t['in_features']:>8} {t['out_features']:>8} {ishape:<40} │")
+    print(f"  └{'─'*108}┘")
+    print(f"\n  汇总: total_linear={len(targets)}")
 
 
-def build_dataset(dataset_name, data_root):
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
-    if dataset_name == "cifar10":
-        ds = datasets.CIFAR10(root=data_root, train=False, download=True, transform=transform)
-    elif dataset_name == "cifar100":
-        ds = datasets.CIFAR100(root=data_root, train=False, download=True, transform=transform)
-    else:
-        raise ValueError(f"Unsupported dataset: {dataset_name}")
-    return ds
+def replace_linears(model, targets):
+    replaced = 0
+    for t in targets:
+        name = t["name"]
+        dense_linear = t["module"]
+        sparse_linear = SparseLinear.from_dense(dense_linear)
+        _set_module_by_name(model, name, sparse_linear)
+        replaced += 1
+    return replaced
 
 
-# =============================================================================
-# 主流程
-# =============================================================================
+# =========================================================
+# Sparsity / diag
+# =========================================================
 
-def main():
-    global DEVICE
+def measure_linear_input_sparsity(model, targets, loader, device, T, num_batches=10,
+                                  spike_mode="normalized_bernoulli"):
+    sparsity_data = {t["name"]: {"zeros": 0, "total": 0} for t in targets}
 
-    parser = argparse.ArgumentParser(description="SparseFlow Benchmark — Sparse Linear")
-    parser.add_argument("--model", type=str, default="resnet34",
-                        choices=list(MODEL_BUILDERS.keys()))
-    parser.add_argument("--dataset", type=str, default="cifar10",
-                        choices=["cifar10", "cifar100"])
-    parser.add_argument("--T", type=int, default=16)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--v_threshold", type=float, default=0.5)
-    parser.add_argument("--power", type=float, default=250.0)
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--data_root", type=str, default="../data")
-    parser.add_argument("--gpu", type=int, default=-1)
-    args = parser.parse_args()
-
-    # ---- GPU 选择 ----
-    if args.gpu >= 0:
-        gpu_id = args.gpu
-    else:
-        gpu_id = 0
-        num_gpus = torch.cuda.device_count()
-        if num_gpus > 1:
-            max_free = 0
-            for i in range(num_gpus):
-                free, total = torch.cuda.mem_get_info(i)
-                print(f"  GPU {i}: {free / 1024**3:.1f} GB free / {total / 1024**3:.1f} GB total")
-                if free > max_free:
-                    max_free = free
-                    gpu_id = i
-        print(f"  → 自动选择 GPU {gpu_id}")
-
-    DEVICE = torch.device(f"cuda:{gpu_id}")
-    torch.cuda.set_device(DEVICE)
-    device = DEVICE
-    title = f"Spiking-{args.model.upper()} Linear on {args.dataset.upper()}"
-
-    # ---- 构建模型 ----
-    print(f"\n[1/5] 构建 {title} (on {device}) ...")
-    model = build_model(args.model, device, args.v_threshold)
-
-    # ---- 数据集 ----
-    print(f"[2/5] 加载 {args.dataset} 测试集 ...")
-    ds = build_dataset(args.dataset, args.data_root)
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
-                        num_workers=8, pin_memory=True)
-    print(f"  测试集共 {len(ds)} 张，{len(loader)} 个 batch")
-
-    # ---- 分析网络 ----
-    print(f"[3/5] 分析网络，识别脉冲后继 Linear 层 ...")
-    imgs_s, _ = next(iter(loader))
-    sample_input = torch.bernoulli(
-        imgs_s[:4].to(device).unsqueeze(0).repeat(args.T, 1, 1, 1, 1).clamp(0, 1)
-    )
-    layer_infos = analyze_network(model, sample_input, device)
-
-    if not layer_infos:
-        print("  未找到脉冲后继的 Linear 层，退出。")
-        return
-    print(f"\n  共找到 {len(layer_infos)} 个目标 Linear 层\n")
-
-    # ---- Hook 捕获 Linear 输入特征 ----
-    captured = {}
-
-    def make_capture_hook(name):
+    def make_hook(name):
         def hook(m, inp, out):
             x = inp[0]
-            if isinstance(x, torch.Tensor):
-                x = x.detach()
-                # Linear 输入可能是 5D/3D/2D，统一 flatten 到 2D
-                if x.dim() == 5:
-                    T, B, C, H, W = x.shape
-                    x = x.reshape(T * B, C * H * W)
-                elif x.dim() == 3:
-                    T, B, C = x.shape
-                    x = x.reshape(T * B, C)
-                captured[name] = x.to(device).contiguous().clone()
+            if not isinstance(x, torch.Tensor):
+                return
+            with torch.no_grad():
+                xd = x.detach()
+                sparsity_data[name]["zeros"] += (xd.abs() <= 1e-6).sum().item()
+                sparsity_data[name]["total"] += xd.numel()
         return hook
 
-    hook_handles = []
-    for name, info in layer_infos.items():
-        h = info.module.register_forward_hook(make_capture_hook(name))
-        hook_handles.append(h)
+    handles = []
+    for t in targets:
+        name = t["name"]
+        mod = _get_module_by_name(model, name)
+        handles.append(mod.register_forward_hook(make_hook(name)))
 
-    # ---- 逐层正确性验证 ----
-    print(f"[4/5] 逐层算子正确性验证 ...")
-    verify_batches = 3
-    verify_count = 0
+    count = 0
     for imgs, _ in loader:
-        if verify_count >= verify_batches:
+        if count >= num_batches:
             break
-        inp = torch.bernoulli(
-            imgs.to(device).unsqueeze(0).repeat(args.T, 1, 1, 1, 1).clamp(0, 1)
-        )
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
         sj_func.reset_net(model)
         with torch.no_grad():
             _ = model(inp)
+        count += 1
 
-        for name, info in layer_infos.items():
-            feat = captured.get(name)
-            if feat is None:
-                continue
-            max_abs, mean_abs, max_rel, cos = verify_layer(feat, info.module, name)
-            info.verify_max_abs = max(info.verify_max_abs, max_abs)
-            info.verify_mean_abs += mean_abs
-            info.verify_max_rel = max(info.verify_max_rel, max_rel)
-            info.verify_cos_sum += cos
-            info.verify_count += 1
+    for h in handles:
+        h.remove()
 
-        verify_count += 1
+    return sparsity_data
 
-    print(f"\n  {'Layer':<35} {'max_abs':>10} {'mean_abs':>10} {'max_rel':>10} {'cosine':>12} {'Status':>8}")
-    print(f"  {'-'*87}")
-    for name, info in layer_infos.items():
-        if info.verify_count == 0:
-            continue
-        avg_mean = info.verify_mean_abs / info.verify_count
-        avg_cos = info.verify_cos_sum / info.verify_count
-        ok = info.verify_max_abs < 0.1 and avg_cos > 0.999
-        status = "✓ PASS" if ok else "✗ FAIL"
-        print(f"  {name:<35} {info.verify_max_abs:>10.6f} {avg_mean:>10.6f} "
-              f"{info.verify_max_rel:>10.6f} {avg_cos:>12.8f} {status:>8}")
 
-    # ---- 预热 + 性能测试 ----
-    print(f"\n[5/5] 性能基准测试 (warmup={args.warmup}) ...")
-    for i, (imgs, _) in enumerate(loader):
-        if i >= args.warmup:
+def measure_group_sparsity_linear(model, targets, loader, device, T, num_batches=5,
+                                  spike_mode="normalized_bernoulli"):
+    for _, mod in model.named_modules():
+        if isinstance(mod, SparseLinear):
+            mod.collect_diag = True
+
+    count = 0
+    for imgs, _ in loader:
+        if count >= num_batches:
             break
-        inp = torch.bernoulli(
-            imgs.to(device).unsqueeze(0).repeat(args.T, 1, 1, 1, 1).clamp(0, 1)
-        )
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
         sj_func.reset_net(model)
         with torch.no_grad():
             _ = model(inp)
-    print(f"  预热 {args.warmup} batch 完成")
+        count += 1
 
-    for batch_idx, (imgs, _) in enumerate(loader):
-        inp = torch.bernoulli(
-            imgs.to(device).unsqueeze(0).repeat(args.T, 1, 1, 1, 1).clamp(0, 1)
-        )
+    target_names = {t["name"] for t in targets}
+    group_data = {}
+    for name, mod in model.named_modules():
+        if isinstance(mod, SparseLinear) and name in target_names:
+            diag = getattr(mod, "_last_diag", {})
+            group_data[name] = {
+                "active_group_ratio": diag.get("active_group_ratio", -1.0),
+                "tile_zero_ratio": diag.get("tile_zero_ratio", -1.0),
+                "nonzero_group_count": diag.get("nonzero_group_count", -1.0),
+                "total_group_count": diag.get("total_group_count", -1.0),
+                "tile_zero_count": diag.get("tile_zero_count", -1.0),
+                "total_tile_count": diag.get("total_tile_count", -1.0),
+                "sparse_compute_ms": diag.get("sparse_compute_ms", -1.0),
+                "avg_active_ratio": diag.get("avg_active_ratio", -1.0),
+                "zero_tiles": diag.get("zero_tiles", -1),
+                "sparse_tiles": diag.get("sparse_tiles", -1),
+                "denseish_tiles": diag.get("denseish_tiles", -1),
+                "group_size": diag.get("group_size", -1),
+                "num_groups": diag.get("num_groups", -1),
+            }
+
+    for _, mod in model.named_modules():
+        if isinstance(mod, SparseLinear):
+            mod.collect_diag = False
+
+    return group_data
+
+
+def print_route_report(targets, sparsity_data, group_sparsity_data):
+    print(f"\n  {'Layer':<42} {'ElemSparse':>11} {'AGR':>8} {'TileZR':>8} {'Zero':>6} {'Sparse':>7} {'Dense':>7}")
+    print(f"  {'-'*100}")
+    avg_sparse = 0.0
+    for t in targets:
+        name = t["name"]
+        sd = sparsity_data[name]
+        sp = sd["zeros"] / max(sd["total"], 1) * 100.0
+        avg_sparse += sp
+        gd = group_sparsity_data.get(name, {})
+        agr = gd.get("active_group_ratio", -1.0)
+        tzr = gd.get("tile_zero_ratio", -1.0)
+        zt = gd.get("zero_tiles", -1)
+        st = gd.get("sparse_tiles", -1)
+        dt = gd.get("denseish_tiles", -1)
+        short = name if len(name) <= 41 else "..." + name[-38:]
+        agr_s = f"{agr:.4f}" if agr >= 0 else "n/a"
+        tzr_s = f"{tzr:.4f}" if tzr >= 0 else "n/a"
+        print(f"  {short:<42} {sp:>10.2f}% {agr_s:>8} {tzr_s:>8} {str(zt):>6} {str(st):>7} {str(dt):>7}")
+
+    avg_sparse /= max(len(targets), 1)
+    print(f"\n  平均输入元素稀疏率: {avg_sparse:.2f}%")
+    return avg_sparse
+
+
+# =========================================================
+# Timing / verification
+# =========================================================
+
+def measure_e2e_latency(model, loader, device, T, warmup=10, max_batches=None,
+                        spike_mode="normalized_bernoulli"):
+    warmup_count = 0
+    for imgs, _ in loader:
+        if warmup_count >= warmup:
+            break
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
         sj_func.reset_net(model)
         with torch.no_grad():
             _ = model(inp)
+        warmup_count += 1
+    sync()
 
-        for name, info in layer_infos.items():
-            feat = captured.get(name)
-            if feat is None:
-                continue
+    total_ms = 0.0
+    num_batches = 0
+    for imgs, _ in loader:
+        if max_batches is not None and num_batches >= max_batches:
+            break
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        sj_func.reset_net(model)
+        sync()
+        start_evt = make_event()
+        end_evt = make_event()
+        start_evt.record()
+        with torch.no_grad():
+            _ = model(inp)
+        end_evt.record()
+        sync()
+        total_ms += start_evt.elapsed_time(end_evt)
+        num_batches += 1
 
-            info.total_zeros += (feat.abs() <= 1e-6).sum().item()
-            info.total_elems += feat.numel()
+    avg_ms = total_ms / max(num_batches, 1)
+    return avg_ms, total_ms, num_batches
 
-            _, sparse_ms = run_sparse_linear(feat, info.module)
-            _, dense_ms = run_dense_linear(feat, info.module)
-            info.total_sparse_ms += sparse_ms
-            info.total_dense_ms += dense_ms
 
-        if (batch_idx + 1) % 100 == 0:
-            pct = (batch_idx + 1) / len(loader) * 100
-            print(f"  [{pct:5.1f}%] batch {batch_idx+1}/{len(loader)}")
+def measure_mode(model, loader, device, T, warmup, spike_mode, power, label):
+    avg_ms, total_ms, num_batches = measure_e2e_latency(
+        model, loader, device, T, warmup=warmup, spike_mode=spike_mode
+    )
+    energy_j = (total_ms / 1000.0) * power
+    return {
+        "label": label,
+        "avg_ms": avg_ms,
+        "total_ms": total_ms,
+        "num_batches": num_batches,
+        "energy_j": energy_j,
+    }
+
+
+def print_mode_result(res):
+    print(f"    {res['label']:<20}{res['avg_ms']:.2f} ms/batch  (total={res['total_ms']:.1f} ms, {res['num_batches']} batches)")
+
+
+def verify_consistency(model_baseline, model_sparse, loader, device, T,
+                       num_batches=5, spike_mode="normalized_bernoulli"):
+    cosine_sum = 0.0
+    agree_sum = 0.0
+    global_max_abs = 0.0
+    count = 0
+
+    for imgs, _ in loader:
+        if count >= num_batches:
+            break
+
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+
+        sj_func.reset_net(model_baseline)
+        with torch.no_grad():
+            out_base = model_baseline(inp)
+
+        sj_func.reset_net(model_sparse)
+        with torch.no_grad():
+            out_sparse = model_sparse(inp)
+
+        if out_base.dim() == 3:
+            out_base = out_base.mean(dim=0)
+        if out_sparse.dim() == 3:
+            out_sparse = out_sparse.mean(dim=0)
+
+        diff = (out_sparse - out_base).float()
+        max_abs = diff.abs().max().item()
+        global_max_abs = max(global_max_abs, max_abs)
+
+        flat_s = out_sparse.flatten().float()
+        flat_b = out_base.flatten().float()
+
+        if flat_s.norm() < 1e-8 and flat_b.norm() < 1e-8:
+            cos = 1.0
+        elif flat_s.norm() < 1e-8 or flat_b.norm() < 1e-8:
+            cos = 0.0
+        else:
+            cos = F.cosine_similarity(flat_s.unsqueeze(0), flat_b.unsqueeze(0)).item()
+
+        cosine_sum += cos
+
+        pred_base = out_base.argmax(dim=-1)
+        pred_sparse = out_sparse.argmax(dim=-1)
+        agree_sum += (pred_base == pred_sparse).float().mean().item()
+        count += 1
+
+    n = max(count, 1)
+    return cosine_sum / n, agree_sum / n, global_max_abs
+
+
+def measure_layer_timing(model, loader, device, T, target_names,
+                         warmup=5, num_batches=20, spike_mode="normalized_bernoulli"):
+    name_to_module = {}
+    for name, module in model.named_modules():
+        if name in target_names:
+            name_to_module[name] = module
+
+    timing = {name: {"total_ms": 0.0, "count": 0} for name in target_names}
+    pre_events = {}
+    post_events = {}
+    hook_handles = []
+
+    def make_pre_hook(layer_name):
+        def hook(m, inp):
+            evt = torch.cuda.Event(enable_timing=True)
+            evt.record()
+            pre_events[layer_name] = evt
+        return hook
+
+    def make_post_hook(layer_name):
+        def hook(m, inp, out):
+            evt = torch.cuda.Event(enable_timing=True)
+            evt.record()
+            post_events[layer_name] = evt
+        return hook
+
+    for name in target_names:
+        if name in name_to_module:
+            mod = name_to_module[name]
+            hook_handles.append(mod.register_forward_pre_hook(make_pre_hook(name)))
+            hook_handles.append(mod.register_forward_hook(make_post_hook(name)))
+
+    warmup_count = 0
+    for imgs, _ in loader:
+        if warmup_count >= warmup:
+            break
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        sj_func.reset_net(model)
+        with torch.no_grad():
+            _ = model(inp)
+        warmup_count += 1
+    sync()
+
+    batch_count = 0
+    for imgs, _ in loader:
+        if batch_count >= num_batches:
+            break
+        pre_events.clear()
+        post_events.clear()
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        sj_func.reset_net(model)
+        with torch.no_grad():
+            _ = model(inp)
+        sync()
+
+        for name in target_names:
+            if name in pre_events and name in post_events:
+                ms = pre_events[name].elapsed_time(post_events[name])
+                timing[name]["total_ms"] += ms
+                timing[name]["count"] += 1
+
+        batch_count += 1
 
     for h in hook_handles:
         h.remove()
 
-    # ---- 输出性能报告 ----
-    print(f"\n{'='*90}")
-    print(f"{'SparseFlow Benchmark — ' + title:^90}")
-    print(f"{'T=' + str(args.T) + '  BS=' + str(args.batch_size) + '  Power=' + str(args.power) + 'W':^90}")
-    print(f"{'='*90}")
-    print(f"{'Layer':<35} {'In':>6} {'Out':>6} "
-          f"{'Sparsity':>9} {'Sparse(ms)':>11} {'Dense(ms)':>10} {'Speedup':>9}")
-    print("-" * 90)
+    result = {}
+    for name in target_names:
+        t = timing[name]
+        result[name] = t["total_ms"] / t["count"] if t["count"] > 0 else 0.0
+    return result
 
-    for name, info in layer_infos.items():
-        if info.total_elems == 0:
-            continue
-        sparsity = info.total_zeros / info.total_elems * 100
-        in_f = info.module.in_features
-        out_f = info.module.out_features
 
-        if info.total_sparse_ms < 1e-6:
-            speedup_str = "      inf"
-        else:
-            speedup = info.total_dense_ms / info.total_sparse_ms
-            speedup_str = f"{speedup:>8.2f}x"
+def print_layer_profile(baseline_timing, sparse_timing, targets, e2e_baseline_ms=None, e2e_sparse_ms=None):
+    print(f"\n  {'Layer':<42} {'Dense(ms)':>10} {'Sparse(ms)':>11} {'Speedup':>9}")
+    print(f"  {'-'*78}")
+    total_base = 0.0
+    total_sparse = 0.0
 
-        sname = name if len(name) <= 34 else "..." + name[-31:]
-        print(f"{sname:<35} {in_f:>6} {out_f:>6} "
-              f"{sparsity:>8.2f}% {info.total_sparse_ms:>10.2f} "
-              f"{info.total_dense_ms:>10.2f} {speedup_str}")
+    for t in targets:
+        name = t["name"]
+        b = baseline_timing.get(name, 0.0)
+        s = sparse_timing.get(name, 0.0)
+        total_base += b
+        total_sparse += s
+        sp = f"{b / s:.3f}x" if s > 1e-6 else "inf"
+        short = name if len(name) <= 41 else "..." + name[-38:]
+        print(f"  {short:<42} {b:>10.3f} {s:>11.3f} {sp:>9}")
 
-    print("-" * 90)
-    all_s = sum(i.total_sparse_ms for i in layer_infos.values())
-    all_d = sum(i.total_dense_ms for i in layer_infos.values())
-    if all_s > 1e-6:
-        print(f"{'[TOTAL]':<35} {'':>6} {'':>6} {'':>9} "
-              f"{all_s:>10.2f} {all_d:>10.2f} {all_d/all_s:>8.2f}x")
+    print(f"  {'-'*78}")
+    sp = f"{total_base / total_sparse:.3f}x" if total_sparse > 1e-6 else "inf"
+    print(f"  {'[LINEAR TOTAL]':<42} {total_base:>10.3f} {total_sparse:>11.3f} {sp:>9}")
 
-    es = (all_s / 1000.0) * args.power
-    ed = (all_d / 1000.0) * args.power
-    print(f"\n  F.linear Energy : {ed:.4f} J")
-    print(f"  Sparse   Energy : {es:.4f} J")
-    saving = (1 - es / max(ed, 1e-9)) * 100
-    print(f"  Energy Saving   : {saving:.2f}%")
-    print("=" * 90)
+    if e2e_baseline_ms is not None and e2e_baseline_ms > 1e-6:
+        print(f"\n  Linear layers 占 Dense e2e:  {100.0 * total_base / e2e_baseline_ms:.2f}%")
+    if e2e_sparse_ms is not None and e2e_sparse_ms > 1e-6:
+        print(f"  Linear layers 占 Sparse e2e: {100.0 * total_sparse / e2e_sparse_ms:.2f}%")
+
+    print(f"  Linear layers 节省: {total_base - total_sparse:.3f} ms/batch")
+
+
+# =========================================================
+# Main
+# =========================================================
+
+def main():
+    global DEVICE
+
+    parser = argparse.ArgumentParser(description="SparseFlow SparseLinear benchmark")
+    parser.add_argument("--dataset", type=str, default="cifar10",
+                        choices=["cifar10", "cifar100", "imagenet_val_flat"])
+    parser.add_argument("--data_root", type=str, default="../data")
+    parser.add_argument("--T", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--v_threshold", type=float, default=1.0)
+    parser.add_argument("--spike_mode", type=str, default="normalized_bernoulli",
+                        choices=["normalized_bernoulli", "raw_bernoulli", "raw_repeat"])
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--power", type=float, default=250.0)
+
+    parser.add_argument("--embed_dim", type=int, default=256)
+    parser.add_argument("--depth", type=int, default=4)
+    parser.add_argument("--mlp_ratio", type=float, default=4.0)
+    parser.add_argument("--patch_size", type=int, default=4)
+
+    parser.add_argument("--verify_batches", type=int, default=10)
+    parser.add_argument("--sparsity_batches", type=int, default=10)
+
+    parser.add_argument("--layer_profile", action="store_true")
+    parser.add_argument("--layer_profile_warmup", type=int, default=5)
+    parser.add_argument("--layer_profile_batches", type=int, default=20)
+
+    parser.add_argument("--out_json", type=str, default="")
+    args = parser.parse_args()
+
+    DEVICE = torch.device(f"cuda:{args.gpu}")
+    torch.cuda.set_device(DEVICE)
+    device = DEVICE
+
+    print(f"\n{'='*88}")
+    print(f"{'SparseFlow SparseLinear Benchmark':^88}")
+    print(f"{'='*88}")
+    print(f"  GPU:         {args.gpu} ({torch.cuda.get_device_name(args.gpu)})")
+    print(f"  Dataset:     {args.dataset}")
+    print(f"  Batch size:  {args.batch_size}")
+    print(f"  T:           {args.T}")
+    print(f"  Spike mode:  {args.spike_mode}")
+    print(f"  Embed dim:   {args.embed_dim}")
+    print(f"  Depth:       {args.depth}")
+    print(f"  MLP ratio:   {args.mlp_ratio}")
+    print(f"  Patch size:  {args.patch_size}")
+    print(f"  Layer prof:  {'ON' if args.layer_profile else 'OFF'}")
+    print()
+
+    print("[1/6] 加载数据集 ...")
+    ds, num_classes = build_dataset(args.dataset, args.data_root)
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=True)
+    print(f"  测试集: {len(ds)} 张, {len(loader)} batches, {num_classes} classes")
+
+    print("[2/6] 构建 linear-dominant SpikingPatchMLP ...")
+    model_dense = build_model(
+        dataset_name=args.dataset,
+        num_classes=num_classes,
+        device=device,
+        v_threshold=args.v_threshold,
+        embed_dim=args.embed_dim,
+        depth=args.depth,
+        mlp_ratio=args.mlp_ratio,
+        patch_size=args.patch_size,
+        seed=args.seed,
+    )
+
+    imgs_s, _ = next(iter(loader))
+    sample_input = make_spike_input(imgs_s[:4], args.T, device, spike_mode=args.spike_mode)
+
+    print("[3/6] 分析 Linear 候选层 ...")
+    targets = analyze_linear_targets(model_dense, sample_input)
+    print_analysis_report(targets)
+    if not targets:
+        print("未找到可替换的 Linear 层，退出。")
+        return
+
+    print(f"[4/6] 收集 Linear 输入稀疏率 / grouped diag ({args.sparsity_batches} batches) ...")
+    sparsity_data = measure_linear_input_sparsity(
+        model_dense, targets, loader, device, args.T,
+        num_batches=args.sparsity_batches, spike_mode=args.spike_mode
+    )
+
+    model_sparse = copy.deepcopy(model_dense)
+    replaced = replace_linears(model_sparse, targets)
+    print(f"  已替换 {replaced} 个 Linear -> SparseLinear")
+
+    group_sparsity_data = measure_group_sparsity_linear(
+        model_sparse, targets, loader, device, args.T,
+        num_batches=min(args.sparsity_batches, 5), spike_mode=args.spike_mode
+    )
+
+    avg_sparsity = print_route_report(targets, sparsity_data, group_sparsity_data)
+
+    print(f"\n[5/6] 端到端延迟 (warmup={args.warmup}) ...")
+    dense_res = measure_mode(model_dense, loader, device, args.T, args.warmup, args.spike_mode, args.power, "Dense Linear")
+    sparse_res = measure_mode(model_sparse, loader, device, args.T, args.warmup, args.spike_mode, args.power, "SparseLinear")
+    print_mode_result(dense_res)
+    print_mode_result(sparse_res)
+
+    speedup = dense_res["avg_ms"] / sparse_res["avg_ms"] if sparse_res["avg_ms"] > 1e-6 else float("inf")
+    esave = (1 - sparse_res["energy_j"] / max(dense_res["energy_j"], 1e-9)) * 100.0
+
+    if args.layer_profile:
+        print(f"\n  [Layer profile] Measuring per-layer timing ...")
+        target_names = [t["name"] for t in targets]
+        dense_layer_timing = measure_layer_timing(
+            model_dense, loader, device, args.T, target_names,
+            warmup=args.layer_profile_warmup,
+            num_batches=args.layer_profile_batches,
+            spike_mode=args.spike_mode
+        )
+        sparse_layer_timing = measure_layer_timing(
+            model_sparse, loader, device, args.T, target_names,
+            warmup=args.layer_profile_warmup,
+            num_batches=args.layer_profile_batches,
+            spike_mode=args.spike_mode
+        )
+        print_layer_profile(
+            dense_layer_timing, sparse_layer_timing, targets,
+            e2e_baseline_ms=dense_res["avg_ms"],
+            e2e_sparse_ms=sparse_res["avg_ms"]
+        )
+    else:
+        dense_layer_timing = {}
+        sparse_layer_timing = {}
+
+    print(f"\n[6/6] 一致性验证 ({args.verify_batches} batches) ...")
+    cos, agree, max_abs = verify_consistency(
+        model_dense, model_sparse, loader, device, args.T,
+        num_batches=args.verify_batches, spike_mode=args.spike_mode
+    )
+    ok = cos > 0.999 and max_abs < 0.1
+    print(f"  SparseLinear: cos={cos:.8f}  agree={agree*100:.2f}%  max_abs={max_abs:.6f}  {'PASS' if ok else 'FAIL'}")
+
+    print(f"\n{'='*96}")
+    print(f"{'SPARSELINEAR SUMMARY':^96}")
+    print(f"{'='*96}")
+    print(f"  Dataset: {args.dataset}  T={args.T}  Spike: {args.spike_mode}")
+    print(f"  Avg Input Sparsity: {avg_sparsity:.2f}%  Targets: {len(targets)}")
+    print(f"\n  {'Mode':<24} {'Latency(ms)':>12} {'Speedup':>10} {'EnergySave':>12} {'Consistency':>12}")
+    print(f"  {'-'*80}")
+    print(f"  {'Dense Linear':<24} {dense_res['avg_ms']:>12.2f} {'1.000x':>10} {'0.00%':>12} {'REF':>12}")
+    print(f"  {'SparseLinear':<24} {sparse_res['avg_ms']:>12.2f} {speedup:>9.3f}x {esave:>11.2f}% {('PASS' if ok else 'FAIL'):>12}")
+    print(f"{'='*96}\n")
+
+    results = {
+        "script_version": "bench_sparse_linear_v1",
+        "dataset": args.dataset,
+        "T": args.T,
+        "batch_size": args.batch_size,
+        "gpu": torch.cuda.get_device_name(args.gpu),
+        "spike_mode": args.spike_mode,
+        "seed": args.seed,
+        "embed_dim": args.embed_dim,
+        "depth": args.depth,
+        "mlp_ratio": args.mlp_ratio,
+        "patch_size": args.patch_size,
+        "num_targets": len(targets),
+        "avg_input_sparsity_pct": round(avg_sparsity, 2),
+        "dense": {
+            "ms_per_batch": round(dense_res["avg_ms"], 2),
+            "energy_j": round(dense_res["energy_j"], 4),
+        },
+        "sparse": {
+            "ms_per_batch": round(sparse_res["avg_ms"], 2),
+            "speedup": round(speedup, 4),
+            "energy_saving_pct": round(esave, 2),
+            "cosine_sim": round(cos, 8),
+            "pred_agreement": round(agree, 8),
+            "max_abs": round(max_abs, 8),
+            "consistency": "PASS" if ok else "FAIL",
+        },
+        "targets": [
+            {
+                "name": t["name"],
+                "in_features": t["in_features"],
+                "out_features": t["out_features"],
+                "input_shape": str(t["input_shape"]),
+            }
+            for t in targets
+        ],
+        "group_sparsity": group_sparsity_data,
+    }
+
+    if args.layer_profile:
+        results["layer_profile"] = {
+            "dense_layer_ms": {k: round(v, 4) for k, v in dense_layer_timing.items()},
+            "sparse_layer_ms": {k: round(v, 4) for k, v in sparse_layer_timing.items()},
+            "per_layer_speedup": {
+                k: (round(dense_layer_timing[k] / sparse_layer_timing[k], 4)
+                    if sparse_layer_timing.get(k, 0.0) > 1e-6 else float("inf"))
+                for k in dense_layer_timing
+            }
+        }
+
+    out_path = args.out_json or f"results_sparse_linear_{args.dataset}_T{args.T}_bs{args.batch_size}.json"
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"  结果: {out_path}")
 
 
 if __name__ == "__main__":

@@ -392,15 +392,73 @@ def sparse_linear_forward(
     return_ms=False,
     return_avg_active_ratio=False,
     return_tile_stats=False,
+    return_backend_meta=False,
 ):
+    import torch.nn.functional as Fn
+
     N, C_IN = x.shape
     C_OUT = weight.shape[0]
     device = x.device
 
+    need_stats = return_avg_active_ratio or return_tile_stats
+
+    def _finalize_return(
+        y,
+        ms,
+        avg_active_ratio_val=None,
+        tile_stats_val=None,
+        backend_meta_val=None,
+    ):
+        ret = (y, ms)
+        if return_avg_active_ratio:
+            ret = ret + (avg_active_ratio_val,)
+        if return_tile_stats:
+            ret = ret + (tile_stats_val,)
+        if return_backend_meta:
+            ret = ret + (backend_meta_val,)
+        return ret
+
+    def _dense_fallback(
+        reason="dense_fallback",
+        avg_active_ratio_val=1.0,
+        tile_stats_val=None,
+        backend_meta_extra=None,
+    ):
+        dense_ms = 0.0
+        if return_ms:
+            se = torch.cuda.Event(enable_timing=True)
+            ee = torch.cuda.Event(enable_timing=True)
+            se.record()
+
+        y = Fn.linear(
+            x.float(),
+            weight.float(),
+            bias.float() if bias is not None else None,
+        ).float()
+
+        if return_ms:
+            ee.record()
+            torch.cuda.synchronize(device)
+            dense_ms = se.elapsed_time(ee)
+
+        bm = {"backend": "dense_fallback", "reason": reason}
+        if backend_meta_extra:
+            bm.update(backend_meta_extra)
+        return _finalize_return(y, dense_ms, avg_active_ratio_val, tile_stats_val, bm)
+
+    # shape / support guards
+    if x.dim() != 2:
+        return _dense_fallback(reason="expected_2d_input")
+
+    if C_IN <= 0 or C_OUT <= 0 or N <= 0:
+        y = torch.zeros(max(N, 0), max(C_OUT, 0), dtype=torch.float32, device=device)
+        bm = {"backend": "zero_tiles_only", "reason": "empty_shape"}
+        return _finalize_return(y, 0.0, 0.0, None, bm)
+
     BLOCK_M = _select_linear_block_m(N)
     N_TILES = triton.cdiv(N, BLOCK_M)
 
-    x_f16 = x.half().contiguous()
+    x_f16 = x if (x.dtype == torch.float16 and x.is_contiguous()) else x.half().contiguous()
     w_t_f16 = w_t if w_t is not None else weight.half().t().contiguous()
 
     if ag_mask_buf is None or ag_mask_buf.numel() < N_TILES:
@@ -410,8 +468,14 @@ def sparse_linear_forward(
 
     tile_stats = {} if return_tile_stats else None
     group_size_c, num_groups = _build_linear_metadata(
-        x_f16, N, C_IN, BLOCK_M, N_TILES, threshold,
-        ag_mask_buf, tile_class_buf,
+        x_f16,
+        N,
+        C_IN,
+        BLOCK_M,
+        N_TILES,
+        threshold,
+        ag_mask_buf,
+        tile_class_buf,
         prescan_stats=tile_stats,
     )
 
@@ -426,14 +490,21 @@ def sparse_linear_forward(
         start_evt.record()
 
     def _grid(META):
-        return (N_TILES, triton.cdiv(C_OUT, META['BLOCK_N']))
+        return (N_TILES, triton.cdiv(C_OUT, META["BLOCK_N"]))
 
     sparse_linear_grouped_kernel[_grid](
-        x_f16, w_t_f16, bias_f32,
-        tile_class_buf, ag_mask_buf,
+        x_f16,
+        w_t_f16,
+        bias_f32,
+        tile_class_buf,
+        ag_mask_buf,
         y,
         N,
-        C_IN, C_OUT, N_TILES, BLOCK_M, group_size_c,
+        C_IN,
+        C_OUT,
+        N_TILES,
+        BLOCK_M,
+        group_size_c,
         HAS_BIAS=has_bias,
         BLOCK_M=BLOCK_M,
         GROUP_SIZE_C=group_size_c,
@@ -450,21 +521,30 @@ def sparse_linear_forward(
         pc = _popcount_buf(ag_mask_buf, N_TILES)
         avg_active_ratio = float(pc.float().mean().item()) / max(float(num_groups), 1.0)
 
+    backend_meta = {
+        "backend": "sparse_triton",
+        "reason": "three_stage_grouped_linear",
+        "total_tiles": int(N_TILES),
+    }
+
     if return_tile_stats:
         tc = tile_class_buf[:N_TILES]
-        tile_stats['final_zero'] = int((tc == TILE_ZERO).sum().item())
-        tile_stats['final_sparse'] = int((tc == TILE_SPARSE).sum().item())
-        tile_stats['final_denseish'] = int((tc == TILE_DENSEISH).sum().item())
-        tile_stats['zero_tiles'] = tile_stats['final_zero']
-        tile_stats['sparse_tiles'] = tile_stats['final_sparse']
-        tile_stats['denseish_tiles'] = tile_stats['final_denseish']
-        tile_stats['stage2_zero_refine_tiles'] = tile_stats.get('stage1_zero_candidate', 0)
-        tile_stats['stage2_uncertain_tiles'] = tile_stats.get('stage1_uncertain', 0)
+        tile_stats["final_zero"] = int((tc == TILE_ZERO).sum().item())
+        tile_stats["final_sparse"] = int((tc == TILE_SPARSE).sum().item())
+        tile_stats["final_denseish"] = int((tc == TILE_DENSEISH).sum().item())
+        tile_stats["zero_tiles"] = tile_stats["final_zero"]
+        tile_stats["sparse_tiles"] = tile_stats["final_sparse"]
+        tile_stats["denseish_tiles"] = tile_stats["final_denseish"]
+        tile_stats["stage2_zero_refine_tiles"] = tile_stats.get("stage1_zero_candidate", 0)
+        tile_stats["stage2_uncertain_tiles"] = tile_stats.get("stage1_uncertain", 0)
 
-    if return_avg_active_ratio and return_tile_stats:
-        return y, sparse_ms, avg_active_ratio, tile_stats
-    if return_avg_active_ratio:
-        return y, sparse_ms, avg_active_ratio
-    if return_tile_stats:
-        return y, sparse_ms, tile_stats
-    return y, sparse_ms
+        if tile_stats["final_zero"] == N_TILES:
+            backend_meta = {
+                "backend": "zero_tiles_only",
+                "reason": "all_tiles_zero_after_prescan",
+                "total_tiles": int(N_TILES),
+            }
+        else:
+            backend_meta["active_tiles"] = int(N_TILES - tile_stats["final_zero"])
+
+    return _finalize_return(y, sparse_ms, avg_active_ratio, tile_stats, backend_meta)

@@ -1,14 +1,41 @@
 """
-Utils/dispatch_model.py — conservative AGR / TZR / denseish-tile based Conv dispatch model.
+Utils/dispatch_model.py — Execution-Grounded Dispatch (EGD), v28.
 
 Decides per-layer backend: "dense", "sparse", or "staticzero".
-Important semantic rule:
-  - Only exact zero-input layers should become "staticzero".
-  - Non-exact layers are classified only between "dense" and "sparse".
 
-This version makes the policy more conservative on early / dense-ish layers,
-and uses dense-ish tile ratio explicitly to avoid over-routing front layers to
-SparseConv.
+Design principle:
+  The dispatch score is derived directly from what SparseFlow's sparse kernel
+  does at runtime, not from a hand-crafted cost model with many coefficients.
+
+SparseFlow execution semantics:
+  1. Zero tiles → early return (cost ≈ 0)
+  2. Non-zero tiles → iterate groups, skip inactive groups via bitmask
+
+Therefore, the fraction of dense work saved by sparse execution is:
+
+    R_l = z_l + (1 - z_l) × (1 - a_l)
+
+  where z_l = TZR (tile-zero ratio) and a_l = AGR_nz (active group ratio
+  over non-zero tiles).  Algebraically, R_l = 1 - AGR_overall.
+
+Per-tile compute intensity (how much dense work each tile represents):
+
+    I_l = M_l / N_l
+
+  where M_l = dense MACs and N_l = total tile count.
+
+Dispatch score (saved MACs per tile):
+
+    S_l = R_l × I_l
+
+Decision:
+  - exact-zero input → staticzero
+  - R_l < R_min → dense  (savings too thin for per-group bitmask overhead)
+  - S_l > τ_k → sparse   (saved MACs per tile exceed prescan/metadata cost)
+  - else → dense
+
+Only 3 constants: R_min, τ_3x3, τ_1x1.
+All have direct physical meaning tied to the sparse kernel's execution cost.
 """
 
 from __future__ import annotations
@@ -18,40 +45,39 @@ from dataclasses import dataclass, asdict
 from typing import Any, Dict, Optional, Tuple
 
 # =============================================================================
-# Constants — conservative routing thresholds
+# Dispatch constants  (3 total)
 # =============================================================================
+#
+# τ_3x3 (TAU_3x3):
+#   Minimum saved MACs per tile for 3×3 (and larger) kernels.
+#   Physical meaning: the per-tile cost of prescan + metadata + bitmask
+#   dispatch.  Prescan reads ~C_in × BLOCK_M values per tile and performs
+#   per-group activity classification.  For typical layers (C_in=64-256,
+#   BLOCK_M=16-64), this is ~200K-1M MACs equivalent in memory + compute
+#   overhead.  500K is a mid-range estimate.
+#   Calibrate: profile prescan latency on representative layers, convert to
+#   MACs at GPU peak throughput, and set τ_3x3 to that value.
+TAU_3x3 = 500_000
 
-# Exact-zero layers are handled outside this file via dispatch_all_layers(zero_layers=...).
-# For non-exact layers, ultra-sparse patterns should prefer SparseConv, not StaticZero.
-ULTRA_SPARSE_AGR_MAX = 0.03
-ULTRA_SPARSE_TZR_MIN = 0.97
+# τ_1x1 (TAU_1x1):
+#   Minimum saved MACs per tile for 1×1 kernels.
+#   Higher than τ_3x3 because cuDNN reduces 1×1 conv to a highly-optimized
+#   GEMM call with near-peak throughput.  The sparse kernel must save
+#   proportionally more to overcome this stronger baseline.
+#   Calibrate: same procedure as τ_3x3 but comparing against cuDNN 1×1 perf.
+TAU_1x1 = 1_000_000
 
-DENSE_AGR_MIN = 0.72
-DENSE_TZR_MAX = 0.18
+# R_min (R_MIN):
+#   Minimum saved work fraction for sparse to be viable.
+#   Physical meaning: at very low R_l (high AGR), the sparse kernel iterates
+#   almost all groups with per-group bitmask checks, and the savings from
+#   the few skipped groups are consumed by this overhead.  Below R_min=0.15,
+#   the sparse kernel does ≥85% of the dense kernel's work plus bitmask
+#   overhead — guaranteed slower.
+#   Calibrate: find the AGR at which sparse kernel latency equals dense
+#   kernel latency on a compute-heavy layer; R_min = 1 - that AGR.
+R_MIN = 0.15
 
-# Additional conservative dense gates
-DENSEISH_RATIO_HIGH = 0.20
-DENSEISH_RATIO_MID = 0.12
-FRONT_DENSE_AGR_MIN = 0.35
-FRONT_DENSE_TZR_MAX = 0.45
-CONV1x1_DENSE_AGR_MIN = 0.20
-CONV1x1_DENSEISH_MIN = 0.08
-CONV1x1_TZR_MAX = 0.35
-
-MIN_MACS_FOR_SPARSE = 8e5
-
-# Sparse score threshold — raised vs previous version to force real DenseKeep.
-SPARSE_SCORE_THRESHOLD = 1.05
-
-# Sparse score weights
-SPARSE_W_BIAS = -0.22
-SPARSE_W_INACTIVE = 1.05
-SPARSE_W_TZR = 0.85
-SPARSE_W_INTER = 0.45
-SPARSE_W_LOGMACS = 0.22
-SPARSE_W_GROUP_PRESSURE = -1.05
-SPARSE_W_SMALL = -0.28
-SPARSE_W_DENSEISH = -1.10
 
 # =============================================================================
 # Utilities
@@ -59,6 +85,9 @@ SPARSE_W_DENSEISH = -1.10
 
 def clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
+
+
+_EPS = 1e-6
 
 
 def _pair(x) -> Tuple[int, int]:
@@ -98,6 +127,22 @@ def estimate_conv_macs(
     return float(batch_size * h_out * w_out * c_out * kh * kw * cin_per_group)
 
 
+def _estimate_block_m(h_out: int, w_out: int) -> int:
+    """Estimate BLOCK_M (output pixels per tile) from output spatial size.
+
+    Matches the kernel's _select_block_sizes logic approximately.
+    Only used when total_tile_count is not available from diagnostics.
+    """
+    pixels = h_out * w_out
+    if pixels >= 512:
+        return 64
+    if pixels >= 128:
+        return 32
+    if pixels >= 32:
+        return 16
+    return max(pixels, 1)
+
+
 # =============================================================================
 # Data structures
 # =============================================================================
@@ -124,11 +169,42 @@ class ConvMeta:
 class DispatchDecision:
     backend: str = "dense"
     reason: str = ""
-    score_sparse: float = 0.0
 
-    agr: float = -1.0
-    tzr: float = -1.0
+    # ── Core dispatch score fields (v28) ──
+    R_l: float = 0.0           # saved work fraction: TZR + (1-TZR)(1-AGR_nz)
+    I_l: float = 0.0           # per-tile intensity: MACs / N_tiles
+    S_l: float = 0.0           # dispatch score: R_l × I_l (saved MACs per tile)
+    agr_nz: float = 0.0        # AGR over non-zero tiles: AGR / (1 - TZR)
+    n_tiles: float = 0.0       # total tile count (measured or estimated)
+    tau: float = 0.0           # threshold used for this layer's kernel family
+
+    # ── Backward-compatible fields ──
+    score_sparse: float = 0.0  # S_l / tau (normalized: >1 → sparse)
+
+    effective_benefit: float = 0.0   # alias for R_l
+    total_overhead: float = 0.0      # tau / I_l (overhead as fraction of work)
+    net_benefit: float = 0.0         # R_l - tau/I_l
+
+    # ── Input measurements ──
+    agr: float = -1.0          # overall AGR (active_group_ratio from kernel)
+    tzr: float = -1.0          # tile zero ratio
     macs: float = 0.0
+    denseish_ratio: float = -1.0
+    sparse_tile_ratio: float = -1.0
+    active_groups: float = 0.0
+    total_groups: float = 0.0
+
+    # ── Derived features for backward compat with bench reports ──
+    efficiency: float = 0.0
+    nz_fraction: float = 0.0
+    denseish_among_nz: float = 0.0
+    variable_overhead: float = 0.0
+    divergence_overhead: float = 0.0
+    fixed_overhead: float = 0.0
+    eta_base: float = 0.0
+    denseish_is_fallback: bool = False
+    hysteresis_threshold: float = 0.0
+    prior_backend: str = ""
 
     x_inactive: float = 0.0
     x_tzr: float = 0.0
@@ -137,11 +213,6 @@ class DispatchDecision:
     x_group_pressure: float = 0.0
     x_small: float = 0.0
     x_denseish: float = 0.0
-
-    active_groups: float = 0.0
-    total_groups: float = 0.0
-    denseish_ratio: float = -1.0
-    sparse_tile_ratio: float = -1.0
 
     layer_name: str = ""
     groups: int = 1
@@ -238,6 +309,12 @@ def conv_meta_from_target(target: Dict[str, Any]) -> ConvMeta:
 # =============================================================================
 
 def _map_diag_to_agr_tzr(diag: Dict[str, Any]) -> Tuple[float, float, float, float]:
+    """Extract AGR (overall) and TZR from kernel diagnostics.
+
+    AGR = nonzero_group_count / total_group_count.
+    This is the overall active group ratio across ALL tiles (including zero
+    tiles that contribute 0 active groups).
+    """
     agr = diag.get('active_group_ratio', -1.0)
     tzr = diag.get('tile_zero_ratio', -1.0)
     active_groups = diag.get('nonzero_group_count', -1.0)
@@ -270,18 +347,52 @@ def _map_diag_tile_mix(diag: Dict[str, Any]) -> Tuple[float, float]:
     return denseish_ratio, sparse_tile_ratio
 
 
+def _get_n_tiles(diag: Dict[str, Any], meta: ConvMeta) -> float:
+    """Get total tile count from diagnostics, or estimate from geometry.
+
+    Prefers the measured value from kernel diagnostics (total_tile_count).
+    Falls back to a geometric estimate using output spatial size and an
+    approximate BLOCK_M.
+    """
+    n = diag.get('total_tile_count', -1.0)
+    if n > 0:
+        return float(n)
+
+    # Geometric estimate
+    h_out, w_out = meta.h_out, meta.w_out
+    if h_out <= 0 or w_out <= 0:
+        # No spatial info — return 1 to make I_l = MACs (conservative: high
+        # per-tile intensity makes sparse easier to justify, but R_min and
+        # the S_l threshold still guard against bad decisions)
+        return 1.0
+
+    block_m = _estimate_block_m(h_out, w_out)
+    pixels = h_out * w_out
+    n_spatial = max((pixels + block_m - 1) // block_m, 1)
+    return float(meta.batch_size * n_spatial)
+
+
 # =============================================================================
-# Dispatch decision logic
+# Core dispatch logic
 # =============================================================================
 
 def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDecision:
+    """Execution-Grounded Dispatch for a single non-exact-zero layer.
+
+    Computes:
+        R_l = z + (1 - z)(1 - a)     saved work fraction
+        I_l = MACs / N_tiles          per-tile intensity
+        S_l = R_l × I_l              saved MACs per tile (dispatch score)
+
+    Decision:
+        R_l < R_min → dense   (savings consumed by per-group overhead)
+        S_l > τ_k   → sparse  (saved MACs exceed per-tile dispatch cost)
+        else        → dense
+    """
     agr, tzr, active_groups, total_groups = _map_diag_to_agr_tzr(diag)
     denseish_ratio, sparse_tile_ratio = _map_diag_tile_mix(diag)
     macs = meta.macs
     groups = meta.groups
-    ks = meta.kernel_size
-    st = meta.stride
-    is_1x1 = (ks == (1, 1) and groups == 1)
 
     dec = DispatchDecision(
         layer_name=meta.layer_name,
@@ -295,9 +406,11 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
         groups=groups,
     )
 
+    # ── Structural guard ──
+
     if groups != 1:
         dec.backend = "dense"
-        dec.reason = "groups!=1_keep_dense"
+        dec.reason = "groups!=1_unsupported"
         return dec
 
     if agr < 0 or tzr < 0:
@@ -305,100 +418,138 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
         dec.reason = "no_diag_fallback_dense"
         return dec
 
-    # Non-exact ultra-sparse layers should prefer SparseConv, not StaticZero.
-    if agr <= ULTRA_SPARSE_AGR_MAX or tzr >= ULTRA_SPARSE_TZR_MIN:
-        dec.backend = "sparse"
-        dec.reason = "ultra_sparse_sparse"
-        return dec
+    # ── Compute dispatch score ──
 
-    # Strong dense gate for very active, low-zero layers.
-    if agr >= DENSE_AGR_MIN and tzr <= DENSE_TZR_MAX:
-        dec.backend = "dense"
-        dec.reason = "hard_gate_dense"
-        return dec
+    # Saved work fraction R_l, derived from execution semantics:
+    #   z tiles → fully skipped
+    #   (1-z) tiles → skip (1-a) fraction of groups
+    # where a = AGR_nz = average active group ratio over non-zero tiles
+    nz_frac = max(1.0 - tzr, _EPS)
+    agr_nz = min(agr / nz_frac, 1.0)
+    R_l = tzr + nz_frac * (1.0 - agr_nz)
+    # Note: algebraically R_l = 1 - agr, but the expanded form shows the
+    # direct mapping to SparseFlow's two-level skip (tile + group).
 
-    # Dense-ish front layers: high AGR + many dense-ish tiles => keep dense.
-    if denseish_ratio >= 0 and denseish_ratio >= DENSEISH_RATIO_HIGH and agr >= FRONT_DENSE_AGR_MIN and tzr <= FRONT_DENSE_TZR_MAX:
-        dec.backend = "dense"
-        dec.reason = "denseish_front_keep_dense"
-        return dec
+    # Per-tile compute intensity
+    n_tiles = _get_n_tiles(diag, meta)
+    I_l = macs / max(n_tiles, 1.0)
 
-    # Slightly weaker dense-ish gate for very active early layers.
-    if denseish_ratio >= 0 and denseish_ratio >= DENSEISH_RATIO_MID and agr >= 0.45 and tzr <= 0.55:
-        dec.backend = "dense"
-        dec.reason = "high_agr_denseish_keep_dense"
-        return dec
+    # Dispatch score: saved MACs per tile
+    S_l = R_l * I_l
 
-    # 1x1 layers are more conservative: if reasonably active and not zero-heavy, keep dense.
-    if is_1x1 and denseish_ratio >= 0 and denseish_ratio >= CONV1x1_DENSEISH_MIN and agr >= CONV1x1_DENSE_AGR_MIN and tzr <= CONV1x1_TZR_MAX:
-        dec.backend = "dense"
-        dec.reason = "conv1x1_denseish_keep_dense"
-        return dec
+    # Kernel-family threshold
+    ks = meta.kernel_size
+    is_1x1 = (ks == (1, 1) and groups == 1)
+    tau = TAU_1x1 if is_1x1 else TAU_3x3
 
-    if macs < MIN_MACS_FOR_SPARSE and tzr < 0.90:
-        dec.backend = "dense"
-        dec.reason = "tiny_layer_dense"
-        return dec
+    # ── Record fields ──
 
-    x_inactive = 1.0 - agr
-    x_tzr = tzr
-    x_inter = x_inactive * x_tzr
-    x_log_macs = clamp01(math.log2(macs / 1e6 + 1.0) / 6.0)
-    x_group_pressure = agr * clamp01(active_groups / 4096.0 if active_groups >= 0 else 0.0)
-    x_small = 1.0 - x_log_macs
-    x_denseish = clamp01(denseish_ratio if denseish_ratio >= 0 else 0.0)
+    dec.R_l = R_l
+    dec.I_l = I_l
+    dec.S_l = S_l
+    dec.agr_nz = agr_nz
+    dec.n_tiles = n_tiles
+    dec.nz_fraction = nz_frac
+    dec.tau = tau
 
-    score_sparse = (
-        SPARSE_W_BIAS
-        + SPARSE_W_INACTIVE * x_inactive
-        + SPARSE_W_TZR * x_tzr
-        + SPARSE_W_INTER * x_inter
-        + SPARSE_W_LOGMACS * x_log_macs
-        + SPARSE_W_GROUP_PRESSURE * x_group_pressure
-        + SPARSE_W_SMALL * x_small
-        + SPARSE_W_DENSEISH * x_denseish
+    # Normalized score: >1 means sparse, ≤1 means dense (when R_l ≥ R_min)
+    dec.score_sparse = S_l / tau if tau > 0 else 0.0
+
+    # Backward-compatible benefit/overhead view:
+    # "benefit" = R_l, "overhead" = tau/I_l (threshold as fraction of work)
+    dec.effective_benefit = R_l
+    if I_l > 0:
+        dec.total_overhead = tau / I_l
+        dec.net_benefit = R_l - tau / I_l
+    else:
+        dec.total_overhead = float('inf')
+        dec.net_benefit = -1.0
+
+    # Legacy compat fields
+    dec.x_inactive = 1.0 - agr
+    dec.x_tzr = tzr
+    dec.x_inter = (1.0 - agr) * tzr
+    dec.x_log_macs = clamp01(math.log2(macs / 1e6 + 1.0) / 6.0)
+    dec.x_group_pressure = agr * clamp01(
+        active_groups / 4096.0 if active_groups >= 0 else 0.0
     )
+    dec.x_small = 1.0 - dec.x_log_macs
+    dec.x_denseish = clamp01(denseish_ratio if denseish_ratio >= 0 else 0.0)
+    dec.efficiency = R_l  # legacy: closest concept to "efficiency"
 
-    dec.score_sparse = score_sparse
-    dec.x_inactive = x_inactive
-    dec.x_tzr = x_tzr
-    dec.x_inter = x_inter
-    dec.x_log_macs = x_log_macs
-    dec.x_group_pressure = x_group_pressure
-    dec.x_small = x_small
-    dec.x_denseish = x_denseish
+    # ── Decision ──
 
-    if score_sparse >= SPARSE_SCORE_THRESHOLD:
+    if R_l < R_MIN:
+        dec.backend = "dense"
+        dec.reason = f"R={R_l:.3f}<R_min={R_MIN}"
+    elif S_l > tau:
         dec.backend = "sparse"
-        dec.reason = f"score={score_sparse:.4f}>=threshold"
+        dec.reason = f"S={S_l:.0f}>tau={tau:.0f}"
     else:
         dec.backend = "dense"
-        dec.reason = f"score={score_sparse:.4f}<threshold"
+        dec.reason = f"S={S_l:.0f}<=tau={tau:.0f}"
 
     return dec
 
 
 # =============================================================================
-# Batch dispatch helper
+# StaticZero decision helper
 # =============================================================================
 
-def dispatch_all_layers(targets, group_sparsity_data: Dict[str, Dict], zero_layers=None) -> Dict[str, DispatchDecision]:
+def _make_staticzero_decision(layer_name: str) -> DispatchDecision:
+    """DispatchDecision for an exact-zero-input layer.
+
+    StaticZero is the extreme of the dispatch surface:
+      R_l = 1.0 (all work saved), S_l → ∞ for any finite I_l.
+    """
+    return DispatchDecision(
+        layer_name=layer_name,
+        backend="staticzero",
+        reason="exact_zero_input",
+        agr=0.0,
+        tzr=1.0,
+        R_l=1.0,
+        agr_nz=0.0,
+        effective_benefit=1.0,
+        net_benefit=1.0,
+        score_sparse=float('inf'),
+        denseish_ratio=0.0,
+        sparse_tile_ratio=0.0,
+    )
+
+
+# =============================================================================
+# Batch dispatch
+# =============================================================================
+
+def dispatch_all_layers(
+    targets,
+    group_sparsity_data: Dict[str, Dict],
+    zero_layers=None,
+    prior_decisions: Optional[Dict[str, DispatchDecision]] = None,
+) -> Dict[str, DispatchDecision]:
+    """Run dispatch for all target layers.
+
+    Args:
+        targets: list of target dicts from analyze_targets().
+        group_sparsity_data: per-layer diagnostic dict from measure_group_sparsity().
+        zero_layers: set of layer names with exact-zero input (→ staticzero).
+        prior_decisions: accepted for interface compatibility (unused in v28;
+            the simplified score model is deterministic and does not require
+            hysteresis for stability).
+
+    Returns:
+        Dict mapping layer_name → DispatchDecision.
+    """
     if zero_layers is None:
         zero_layers = set()
 
     decisions: Dict[str, DispatchDecision] = {}
     for t in targets:
         name = t["name"]
+
         if name in zero_layers:
-            decisions[name] = DispatchDecision(
-                layer_name=name,
-                backend="staticzero",
-                reason="element_level_all_zero",
-                agr=0.0,
-                tzr=1.0,
-                denseish_ratio=0.0,
-                sparse_tile_ratio=0.0,
-            )
+            decisions[name] = _make_staticzero_decision(name)
             continue
 
         diag = group_sparsity_data.get(name, {})
@@ -409,6 +560,7 @@ def dispatch_all_layers(targets, group_sparsity_data: Dict[str, Dict], zero_laye
 
 
 def decisions_to_sets(decisions: Dict[str, DispatchDecision]):
+    """Convert decisions dict to (static_zero_set, sparse_set) for model building."""
     static_zero_set = set()
     sparse_set = set()
     for name, dec in decisions.items():
@@ -417,3 +569,74 @@ def decisions_to_sets(decisions: Dict[str, DispatchDecision]):
         elif dec.backend == "sparse":
             sparse_set.add(name)
     return static_zero_set, sparse_set
+
+
+# =============================================================================
+# Reporting
+# =============================================================================
+
+def format_egd_report_header() -> str:
+    """Column header for the EGD dispatch report."""
+    return (
+        f"  {'Layer':<40} {'AGR':>6} {'TZR':>6} {'AGR_nz':>7} "
+        f"{'R_l':>6} {'I_l':>10} {'S_l':>10} {'τ':>10} {'S/τ':>6} "
+        f"{'Dec':>8} {'Reason':>24}"
+    )
+
+
+def format_egd_report_row(dec: DispatchDecision) -> str:
+    """Format one row of the EGD dispatch report."""
+    name = dec.layer_name
+    short = name if len(name) <= 39 else "..." + name[-36:]
+    agr_s = f"{dec.agr:.3f}" if dec.agr >= 0 else "n/a"
+    tzr_s = f"{dec.tzr:.3f}" if dec.tzr >= 0 else "n/a"
+    agrnz_s = f"{dec.agr_nz:.3f}" if dec.agr_nz >= 0 else "n/a"
+    rl_s = f"{dec.R_l:.3f}"
+    il_s = f"{dec.I_l:.0f}" if dec.I_l > 0 else "n/a"
+    sl_s = f"{dec.S_l:.0f}" if dec.S_l > 0 else "0"
+    tau_s = f"{dec.tau:.0f}" if dec.tau > 0 else "n/a"
+    ratio_s = f"{dec.score_sparse:.2f}" if dec.score_sparse < 1e6 else "inf"
+    reason = dec.reason
+    if len(reason) > 24:
+        reason = reason[:21] + "..."
+    return (
+        f"  {short:<40} {agr_s:>6} {tzr_s:>6} {agrnz_s:>7} "
+        f"{rl_s:>6} {il_s:>10} {sl_s:>10} {tau_s:>10} {ratio_s:>6} "
+        f"{dec.backend:>8} {reason:>24}"
+    )
+
+
+def print_dispatch_decision_report(targets, group_sparsity_data, dispatch_decisions):
+    """Print a detailed EGD dispatch report to stdout.
+
+    Named to match the existing bench_4test.py call site.
+    """
+    print(f"\n  Execution-Grounded Dispatch Report (EGD v28)")
+    print(f"  Constants: τ_3x3={TAU_3x3:,}  τ_1x1={TAU_1x1:,}  R_min={R_MIN}")
+    print(f"  Score: S_l = R_l × I_l  (saved MACs per tile)")
+    print(format_egd_report_header())
+    print(f"  {'-'*150}")
+
+    n_sparse = 0
+    n_dense = 0
+    n_staticzero = 0
+    for t in targets:
+        name = t["name"]
+        dec = dispatch_decisions.get(name)
+        if dec is None:
+            continue
+        print(format_egd_report_row(dec))
+        if dec.backend == "sparse":
+            n_sparse += 1
+        elif dec.backend == "staticzero":
+            n_staticzero += 1
+        else:
+            n_dense += 1
+
+    total = n_sparse + n_dense + n_staticzero
+    print(f"\n  Summary: {n_sparse} sparse + {n_dense} dense + {n_staticzero} staticzero "
+          f"= {total} layers")
+
+
+# Alias for v26/v27 compatibility — bench code may call either name
+print_cbd_dispatch_report = print_dispatch_decision_report

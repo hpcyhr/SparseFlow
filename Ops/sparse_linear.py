@@ -2,7 +2,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any, Dict
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
@@ -44,13 +44,13 @@ class SparseLinear(nn.Module):
     """
     Grouped tile-level Dynamic-K sparse Linear.
 
-    Compared with the earlier CSR-style linear version, this module mirrors the
-    Conv path more closely:
-      - grouped bitmask metadata instead of exact per-channel lists
-      - three-stage prescan (zero-candidate / uncertain / denseish)
-      - three execution paths (zero / sparse / denseish)
-      - EMA-based dense fallback and zero promotion
-      - optional diagnostics and runtime profiling
+    Mirrors SparseConv2d style:
+      - grouped bitmask metadata
+      - three-stage prescan
+      - optional runtime profiling
+      - EMA-based dense fallback / zero promotion
+      - inference_mode to disable periodic calibration syncs
+      - backend metadata propagation from kernel entry
     """
 
     def __init__(
@@ -68,33 +68,39 @@ class SparseLinear(nn.Module):
         profile_runtime: bool = False,
     ):
         super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.threshold = threshold
-        self.return_ms = return_ms
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.threshold = float(threshold)
+        self.return_ms = bool(return_ms)
 
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         if bias:
             self.bias = nn.Parameter(torch.empty(out_features))
         else:
-            self.register_parameter('bias', None)
+            self.register_parameter("bias", None)
+
+        nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
+        if self.bias is not None:
+            bound = 1.0 / max(float(in_features), 1.0) ** 0.5
+            nn.init.uniform_(self.bias, -bound, bound)
 
         self._last_sparse_ms = 0.0
         self._last_dense_ms = 0.0
+        self._last_avg_active_ratio = -1.0
+
         self._triton_available = False
         try:
             import triton  # noqa: F401
             self._triton_available = True
-        except ImportError:
-            pass
+        except Exception:
+            self._triton_available = False
 
         self._w_t = None
         self._w_t_version = -1
         self._ag_mask_buf = None
         self._tile_class_buf = None
 
-        self._force_zero = False
-        self._force_dense = False
+        # policy state
         self._warmup_left = int(max(0, warmup_steps))
         self._calib_every = int(max(1, calib_every))
         self._ema_decay = float(ema_decay)
@@ -103,11 +109,14 @@ class SparseLinear(nn.Module):
         self._zero_streak = 0
         self._forward_count = 0
         self._ema_active_ratio: Optional[float] = None
-        self._last_avg_active_ratio = -1.0
+        self._force_zero = False
+        self._force_dense = False
+        self._inference_mode = False
 
+        # diagnostics
         self.collect_diag = False
-        self._last_diag = {}
-        self.profile_runtime = profile_runtime
+        self._last_diag: Dict[str, Any] = {}
+        self.profile_runtime = bool(profile_runtime)
         self._profile = _ProfileStats()
 
     @classmethod
@@ -132,6 +141,16 @@ class SparseLinear(nn.Module):
             sparse.bias.data.copy_(linear.bias.data)
         return sparse
 
+    def set_inference_mode(self, enabled: bool):
+        """
+        Disable periodic ratio calibration during timed runs.
+        Mirrors SparseConv2d behavior.
+        """
+        self._inference_mode = bool(enabled)
+        if enabled:
+            self.collect_diag = False
+            self.profile_runtime = False
+
     def get_profile_summary(self) -> str:
         p = self._profile
         if p.calls == 0:
@@ -153,14 +172,16 @@ class SparseLinear(nn.Module):
         )
 
     # ------------------------------------------------------------------
+    # timing helpers
+    # ------------------------------------------------------------------
     def _stamp(self) -> float:
-        if self.profile_runtime and torch.cuda.is_available():
-            torch.cuda.synchronize()
+        if self.profile_runtime and self.weight.is_cuda:
+            torch.cuda.synchronize(self.weight.device)
         return time.perf_counter()
 
     def _elapsed_ms(self, t0: float) -> float:
-        if self.profile_runtime and torch.cuda.is_available():
-            torch.cuda.synchronize()
+        if self.profile_runtime and self.weight.is_cuda:
+            torch.cuda.synchronize(self.weight.device)
         return (time.perf_counter() - t0) * 1000.0
 
     def _profile_add(self, field: str, ms: float):
@@ -172,12 +193,18 @@ class SparseLinear(nn.Module):
             setattr(self._profile, field, ms)
 
     # ------------------------------------------------------------------
+    # capability / layout helpers
+    # ------------------------------------------------------------------
     def _supports_triton(self) -> bool:
         return self._triton_available
+
+    def _supports_sparse(self) -> bool:
+        return self.in_features > 0 and self.out_features > 0
 
     def _get_w_t(self) -> torch.Tensor:
         ver = self.weight._version
         if self._w_t is None or self._w_t_version != ver:
+            # Kernels/linear.py expects weight transposed to [Cin, Cout]
             self._w_t = self.weight.data.half().t().contiguous()
             self._w_t_version = ver
         return self._w_t
@@ -186,12 +213,14 @@ class SparseLinear(nn.Module):
         if x.dim() < 2:
             raise ValueError(f"Expected at least 2D input, got {x.dim()}D")
 
+        # generic last-dim linear
         if x.shape[-1] == self.in_features:
-            return x.reshape(-1, self.in_features), ('lastdim', x.shape[:-1])
+            return x.reshape(-1, self.in_features), ("lastdim", x.shape[:-1])
 
-        if x.dim() == 5 and x.shape[2] * x.shape[3] * x.shape[4] == self.in_features:
+        # optional compatibility for [T,B,C,H,W] flattened to in_features
+        if x.dim() == 5 and (x.shape[2] * x.shape[3] * x.shape[4] == self.in_features):
             t, b, c, h, w = x.shape
-            return x.reshape(t * b, c * h * w), ('tbchw', t, b)
+            return x.reshape(t * b, c * h * w), ("tbchw", t, b)
 
         raise ValueError(
             f"Input shape {tuple(x.shape)} is incompatible with in_features={self.in_features}. "
@@ -200,10 +229,10 @@ class SparseLinear(nn.Module):
 
     def _restore_output(self, y2d: torch.Tensor, meta: Tuple) -> torch.Tensor:
         mode = meta[0]
-        if mode == 'lastdim':
+        if mode == "lastdim":
             prefix_shape = meta[1]
             return y2d.reshape(*prefix_shape, self.out_features)
-        if mode == 'tbchw':
+        if mode == "tbchw":
             t, b = meta[1], meta[2]
             return y2d.reshape(t, b, self.out_features)
         raise RuntimeError(f"Unknown restore mode: {mode}")
@@ -233,12 +262,20 @@ class SparseLinear(nn.Module):
         return self._ag_mask_buf, self._tile_class_buf
 
     def _zero_output_2d(self, x2d: torch.Tensor) -> torch.Tensor:
-        y = torch.zeros(x2d.shape[0], self.out_features, dtype=torch.float32, device=x2d.device)
+        y = torch.zeros(
+            x2d.shape[0], self.out_features,
+            dtype=torch.float32, device=x2d.device
+        )
         if self.bias is not None:
             y = y + self.bias.detach().float().view(1, -1)
         return y
 
+    # ------------------------------------------------------------------
+    # policy helpers
+    # ------------------------------------------------------------------
     def _should_collect_ratio(self) -> bool:
+        if self._inference_mode:
+            return False
         if self._warmup_left > 0:
             return True
         return (self._forward_count % self._calib_every) == 0
@@ -276,30 +313,32 @@ class SparseLinear(nn.Module):
             self._force_dense = False
 
     # ------------------------------------------------------------------
+    # forward
+    # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.profile_runtime:
             self._profile.calls += 1
             t_total = self._stamp()
 
         if self.collect_diag:
-            self._last_diag = {'sparse_path_executed': False}
+            self._last_diag = {"sparse_path_executed": False}
 
         if self.profile_runtime:
             t0 = self._stamp()
         x2d, restore_meta = self._flatten_input(x)
         if self.profile_runtime:
             ms = self._elapsed_ms(t0)
-            self._profile_add('reshape_ms', ms)
-            self._profile_set_last('last_reshape_ms', ms)
+            self._profile_add("reshape_ms", ms)
+            self._profile_set_last("last_reshape_ms", ms)
 
         if self._force_zero:
             y2d = self._zero_output_2d(x2d)
             if self.profile_runtime:
                 self._profile.zero_path_hits += 1
-                self._profile.last_path = 'zero(force)'
+                self._profile.last_path = "zero(force)"
                 total_ms = self._elapsed_ms(t_total)
-                self._profile_add('total_ms', total_ms)
-                self._profile_set_last('last_total_ms', total_ms)
+                self._profile_add("total_ms", total_ms)
+                self._profile_set_last("last_total_ms", total_ms)
             return self._restore_output(y2d, restore_meta)
 
         use_triton = self._supports_triton() and x2d.is_cuda
@@ -308,23 +347,34 @@ class SparseLinear(nn.Module):
 
         if self.profile_runtime:
             t0 = self._stamp()
-        avg_active_ratio = None
         need_ratio = use_triton and self._should_collect_ratio() and (not self._force_dense)
         if self.profile_runtime:
             ms = self._elapsed_ms(t0)
-            self._profile_add('policy_ms', ms)
-            self._profile_set_last('last_policy_ms', ms)
+            self._profile_add("policy_ms", ms)
+            self._profile_set_last("last_policy_ms", ms)
 
         self._forward_count += 1
 
-        if use_triton and not self._force_dense:
-            y2d, avg_active_ratio = self._triton_forward(x2d, need_ratio=need_ratio)
-            path = 'sparse'
-            if self.profile_runtime:
-                self._profile.sparse_path_hits += 1
+        if use_triton and not self._force_dense and self._supports_sparse():
+            y2d, avg_active_ratio, backend_kind = self._triton_forward(
+                x2d, need_ratio=need_ratio
+            )
+            if backend_kind == "dense_fallback":
+                path = "dense(fallback)"
+                if self.profile_runtime:
+                    self._profile.dense_path_hits += 1
+            elif backend_kind == "zero_tiles_only":
+                path = "zero(tile_compaction)"
+                if self.profile_runtime:
+                    self._profile.zero_path_hits += 1
+            else:
+                path = "sparse"
+                if self.profile_runtime:
+                    self._profile.sparse_path_hits += 1
         else:
             y2d = self._fallback_forward(x2d)
-            path = 'dense'
+            avg_active_ratio = None
+            path = "dense"
             if self.profile_runtime:
                 self._profile.dense_path_hits += 1
 
@@ -336,28 +386,34 @@ class SparseLinear(nn.Module):
         self._update_policy(avg_active_ratio)
         if self.profile_runtime:
             ms = self._elapsed_ms(t0)
-            self._profile_add('policy_ms', ms)
-            self._profile_set_last('last_policy_ms', self._profile.last_policy_ms + ms)
+            self._profile_add("policy_ms", ms)
+            self._profile_set_last("last_policy_ms", self._profile.last_policy_ms + ms)
 
         if self._force_zero and avg_active_ratio == 0.0:
             y2d = self._zero_output_2d(x2d)
-            path = 'zero(promoted)'
+            path = "zero(promoted)"
 
         if self.profile_runtime:
             t0 = self._stamp()
         y = self._restore_output(y2d, restore_meta)
         if self.profile_runtime:
             ms = self._elapsed_ms(t0)
-            self._profile_add('output_pack_ms', ms)
-            self._profile_set_last('last_output_pack_ms', ms)
+            self._profile_add("output_pack_ms", ms)
+            self._profile_set_last("last_output_pack_ms", ms)
             self._profile.last_path = path
             total_ms = self._elapsed_ms(t_total)
-            self._profile_add('total_ms', total_ms)
-            self._profile_set_last('last_total_ms', total_ms)
+            self._profile_add("total_ms", total_ms)
+            self._profile_set_last("last_total_ms", total_ms)
         return y
 
     # ------------------------------------------------------------------
     def _triton_forward(self, x2d: torch.Tensor, need_ratio: bool = False):
+        """
+        Core Triton sparse linear path.
+
+        Mirrors SparseConv2d convention:
+          return (y, ms) + optional ratio + optional tile_stats + backend_meta
+        """
         from Kernels.linear import sparse_linear_forward
 
         if self.profile_runtime:
@@ -369,55 +425,81 @@ class SparseLinear(nn.Module):
 
         if self.profile_runtime:
             ms = self._elapsed_ms(t0)
-            self._profile_add('buffer_ms', ms)
-            self._profile_set_last('last_buffer_ms', ms)
+            self._profile_add("buffer_ms", ms)
+            self._profile_set_last("last_buffer_ms", ms)
 
         collect_tiles = self.collect_diag
-        if need_ratio or collect_tiles:
-            result = sparse_linear_forward(
-                x=x_f16,
-                weight=self.weight,
-                bias=self.bias,
-                threshold=self.threshold,
-                w_t=w_t,
-                ag_mask_buf=ag_mask_buf,
-                tile_class_buf=tile_class_buf,
-                return_ms=self.return_ms,
-                return_avg_active_ratio=True,
-                return_tile_stats=collect_tiles,
-            )
-            if collect_tiles:
-                y2d, sparse_ms, avg_active_ratio, tile_stats = result
-            else:
-                y2d, sparse_ms, avg_active_ratio = result
-                tile_stats = None
-        else:
-            out = sparse_linear_forward(
-                x=x_f16,
-                weight=self.weight,
-                bias=self.bias,
-                threshold=self.threshold,
-                w_t=w_t,
-                ag_mask_buf=ag_mask_buf,
-                tile_class_buf=tile_class_buf,
-                return_ms=self.return_ms,
-                return_avg_active_ratio=False,
-                return_tile_stats=False,
-            )
-            y2d, sparse_ms = out
-            avg_active_ratio = None
-            tile_stats = None
+        want_ratio = need_ratio or collect_tiles
+        want_tiles = collect_tiles
 
-        self._last_sparse_ms = float(sparse_ms)
-        self._last_dense_ms = 0.0
-        if self.profile_runtime:
-            self._profile_add('sparse_kernel_ms', self._last_sparse_ms)
-            self._profile_set_last('last_sparse_kernel_ms', self._last_sparse_ms)
-            self._profile_set_last('last_dense_fallback_ms', 0.0)
+        result = sparse_linear_forward(
+            x=x_f16,
+            weight=self.weight,
+            bias=self.bias,
+            threshold=self.threshold,
+            w_t=w_t,
+            ag_mask_buf=ag_mask_buf,
+            tile_class_buf=tile_class_buf,
+            return_ms=self.return_ms,
+            return_avg_active_ratio=want_ratio,
+            return_tile_stats=want_tiles,
+            return_backend_meta=True,
+        )
+
+        if not isinstance(result, tuple) or len(result) < 2:
+            raise TypeError(f"sparse_linear_forward bad return: {type(result)}")
+
+        idx = 0
+        y2d = result[idx]
+        idx += 1
+
+        sparse_ms = result[idx]
+        idx += 1
+
+        avg_active_ratio = None
+        if want_ratio and idx < len(result):
+            avg_active_ratio = result[idx]
+            idx += 1
+
+        tile_stats = None
+        if want_tiles and idx < len(result):
+            tile_stats = result[idx]
+            idx += 1
+
+        backend_meta = result[idx] if idx < len(result) else {
+            "backend": "sparse_triton",
+            "reason": "no_meta",
+        }
+
+        backend_kind = backend_meta.get("backend", "sparse_triton") if backend_meta else "sparse_triton"
+
+        if backend_kind == "dense_fallback":
+            self._last_sparse_ms = 0.0
+            self._last_dense_ms = float(sparse_ms)
+            if self.profile_runtime:
+                self._profile_add("dense_fallback_ms", self._last_dense_ms)
+                self._profile_set_last("last_dense_fallback_ms", self._last_dense_ms)
+                self._profile_set_last("last_sparse_kernel_ms", 0.0)
+        else:
+            self._last_sparse_ms = float(sparse_ms)
+            self._last_dense_ms = 0.0
+            if self.profile_runtime:
+                self._profile_add("sparse_kernel_ms", self._last_sparse_ms)
+                self._profile_set_last("last_sparse_kernel_ms", self._last_sparse_ms)
+                self._profile_set_last("last_dense_fallback_ms", 0.0)
 
         if self.collect_diag:
-            self._collect_tile_group_diag(x_f16, ag_mask_buf, tile_class_buf, sparse_ms, avg_active_ratio, tile_stats)
-        return y2d, avg_active_ratio
+            self._collect_tile_group_diag(
+                x_f16,
+                ag_mask_buf,
+                tile_class_buf,
+                sparse_ms,
+                avg_active_ratio,
+                tile_stats,
+                backend_meta=backend_meta,
+            )
+
+        return y2d, avg_active_ratio, backend_kind
 
     def _collect_tile_group_diag(
         self,
@@ -427,8 +509,20 @@ class SparseLinear(nn.Module):
         sparse_ms: float,
         avg_active_ratio: Optional[float],
         tile_stats,
+        backend_meta: Optional[Dict[str, Any]] = None,
     ):
-        from Kernels.linear import _select_linear_block_m, choose_group_size, _popcount_buf, TILE_ZERO, TILE_SPARSE, TILE_DENSEISH
+        """
+        Only called when collect_diag is True.
+        May introduce GPU->CPU syncs, so do not enable during perf timing.
+        """
+        from Kernels.linear import (
+            _select_linear_block_m,
+            choose_group_size,
+            _popcount_buf,
+            TILE_ZERO,
+            TILE_SPARSE,
+            TILE_DENSEISH,
+        )
         import triton
 
         n_rows, c_in = x2d.shape
@@ -438,9 +532,9 @@ class SparseLinear(nn.Module):
         n_tiles = triton.cdiv(n_rows, block_m)
 
         if tile_stats is not None:
-            zt = tile_stats.get('zero_tiles', -1)
-            st = tile_stats.get('sparse_tiles', -1)
-            dt = tile_stats.get('denseish_tiles', -1)
+            zt = tile_stats.get("zero_tiles", -1)
+            st = tile_stats.get("sparse_tiles", -1)
+            dt = tile_stats.get("denseish_tiles", -1)
         else:
             tc = tile_class_buf[:n_tiles].cpu()
             zt = int((tc == TILE_ZERO).sum().item())
@@ -453,32 +547,42 @@ class SparseLinear(nn.Module):
         agr = active_g / max(total_g, 1.0)
 
         self._last_diag = {
-            'sparse_path_executed': True,
-            'metadata_kind': 'three_stage_grouped_linear_v2',
-            'group_size': group_size,
-            'num_groups': num_groups,
-            'nonzero_group_count': active_g,
-            'total_group_count': total_g,
-            'active_group_ratio': agr,
-            'tile_zero_count': zt,
-            'total_tile_count': int(n_tiles),
-            'tile_zero_ratio': zt / max(int(n_tiles), 1),
-            'effective_k_ratio': agr,
-            'sparse_compute_ms': float(sparse_ms),
-            'sparse_total_ms': float(sparse_ms),
-            'avg_active_ratio': float(avg_active_ratio) if avg_active_ratio is not None else -1.0,
-            'zero_tiles': zt,
-            'sparse_tiles': st,
-            'denseish_tiles': dt,
-            'prescan_mode': 'three_stage_grouped_linear_v2',
-            'kernel_type': 'linear',
-            'block_m': int(block_m),
+            "sparse_path_executed": True,
+            "metadata_kind": "three_stage_grouped_linear_v3",
+            "group_size": group_size,
+            "num_groups": int(num_groups),
+            "nonzero_group_count": active_g,
+            "total_group_count": total_g,
+            "active_group_ratio": agr,
+            "tile_zero_count": int(zt),
+            "total_tile_count": int(n_tiles),
+            "tile_zero_ratio": zt / max(int(n_tiles), 1),
+            "effective_k_ratio": agr,
+            "sparse_compute_ms": float(sparse_ms),
+            "sparse_total_ms": float(sparse_ms),
+            "avg_active_ratio": float(avg_active_ratio) if avg_active_ratio is not None else -1.0,
+            "zero_tiles": int(zt),
+            "sparse_tiles": int(st),
+            "denseish_tiles": int(dt),
+            "prescan_mode": "three_stage_grouped_linear_v3",
+            "kernel_type": "linear",
+            "block_m": int(block_m),
         }
+
+        if backend_meta is not None:
+            self._last_diag["backend"] = backend_meta.get("backend", "unknown")
+            self._last_diag["backend_reason"] = backend_meta.get("reason", "unknown")
+
         if tile_stats is not None:
             for key in (
-                'stage1_zero_candidate', 'stage1_denseish', 'stage1_uncertain',
-                'final_zero', 'final_sparse', 'final_denseish',
-                'stage2_zero_refine_tiles', 'stage2_uncertain_tiles',
+                "stage1_zero_candidate",
+                "stage1_denseish",
+                "stage1_uncertain",
+                "final_zero",
+                "final_sparse",
+                "final_denseish",
+                "stage2_zero_refine_tiles",
+                "stage2_uncertain_tiles",
             ):
                 if key in tile_stats:
                     self._last_diag[key] = tile_stats[key]
@@ -486,15 +590,19 @@ class SparseLinear(nn.Module):
     def _fallback_forward(self, x2d: torch.Tensor) -> torch.Tensor:
         if self.profile_runtime:
             t0 = self._stamp()
-        y = F.linear(x2d, self.weight, self.bias)
+
+        # match SparseConv2d: fallback uses float path
+        y = F.linear(x2d.float(), self.weight.float(), self.bias.float() if self.bias is not None else None).float()
         self._last_sparse_ms = 0.0
+
         if self.profile_runtime:
             self._last_dense_ms = self._elapsed_ms(t0)
-            self._profile_add('dense_fallback_ms', self._last_dense_ms)
-            self._profile_set_last('last_dense_fallback_ms', self._last_dense_ms)
-            self._profile_set_last('last_sparse_kernel_ms', 0.0)
+            self._profile_add("dense_fallback_ms", self._last_dense_ms)
+            self._profile_set_last("last_dense_fallback_ms", self._last_dense_ms)
+            self._profile_set_last("last_sparse_kernel_ms", 0.0)
         else:
             self._last_dense_ms = 0.0
+
         return y
 
     def extra_repr(self) -> str:
@@ -502,5 +610,5 @@ class SparseLinear(nn.Module):
             f"{self.in_features}, {self.out_features}, bias={self.bias is not None}, "
             f"sparse=True, dense_threshold={self._dense_threshold}, "
             f"warmup_left={self._warmup_left}, calib_every={self._calib_every}, "
-            f"profile_runtime={self.profile_runtime}"
+            f"profile_runtime={self.profile_runtime}, inference_mode={self._inference_mode}"
         )
