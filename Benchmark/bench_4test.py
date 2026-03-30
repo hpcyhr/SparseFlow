@@ -419,6 +419,426 @@ def print_analysis_report(targets, skipped, fused=False):
     if skipped:
         reason_counts = {}
         for s in skipped:
+            r = s["reason"]
+            reason_counts[r] = reason_counts.get(r, 0) + 1
+        parts = [f"{r}={c}" for r, c in sorted(reason_counts.items())]
+        print(f"  Skip reasons: {', '.join(parts)}")
+
+
+def measure_sparsity(model, targets, loader, device, T, num_batches=10,
+                     spike_mode="normalized_bernoulli"):
+    sparsity_data = {t["name"]: {"zeros": 0, "total": 0} for t in targets}
+
+    def make_hook(name):
+        def hook(m, inp, out):
+            x = inp[0]
+            if not isinstance(x, torch.Tensor):
+                return
+            with torch.no_grad():
+                x = x.detach()
+                if x.dim() == 5:
+                    T_, B, C, H, W = x.shape
+                    x = x.reshape(T_ * B, C, H, W)
+                sparsity_data[name]["zeros"] += (x.abs() <= 1e-6).sum().item()
+                sparsity_data[name]["total"] += x.numel()
+                del x
+        return hook
+
+    hook_handles = []
+    for target in targets:
+        name = target["name"]
+        m = _get_module_by_name(model, name)
+        hook_handles.append(m.register_forward_hook(make_hook(name)))
+
+    batch_count = 0
+    for imgs, _ in loader:
+        if batch_count >= num_batches:
+            break
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        sj_func.reset_net(model)
+        with torch.no_grad():
+            _ = model(inp)
+        batch_count += 1
+
+    for h in hook_handles:
+        h.remove()
+    return sparsity_data
+
+
+def collect_static_zero_layers(targets, sparsity_data):
+    zero_layers = set()
+    for t in targets:
+        name = t["name"]
+        sd = sparsity_data[name]
+        if sd["total"] > 0 and sd["zeros"] == sd["total"]:
+            zero_layers.add(name)
+    return zero_layers
+
+
+def measure_group_sparsity(model, targets, loader, device, T, num_batches=5,
+                           spike_mode="normalized_bernoulli"):
+    for _, mod in model.named_modules():
+        if isinstance(mod, SparseConv2d):
+            mod.collect_diag = True
+
+    batch_count = 0
+    for imgs, _ in loader:
+        if batch_count >= num_batches:
+            break
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        sj_func.reset_net(model)
+        with torch.no_grad():
+            _ = model(inp)
+        batch_count += 1
+
+    target_names = {t["name"] for t in targets}
+    group_data = {}
+    for name, mod in model.named_modules():
+        if isinstance(mod, SparseConv2d) and name in target_names:
+            diag = getattr(mod, '_last_diag', {})
+            group_data[name] = {
+                'active_group_ratio': diag.get('active_group_ratio', -1.0),
+                'tile_zero_ratio': diag.get('tile_zero_ratio', -1.0),
+                'total_group_count': diag.get('total_group_count', -1.0),
+                'nonzero_group_count': diag.get('nonzero_group_count', -1.0),
+                'tile_zero_count': diag.get('tile_zero_count', -1.0),
+                'total_tile_count': diag.get('total_tile_count', -1.0),
+                'effective_k_ratio': diag.get('effective_k_ratio', -1.0),
+                'sparse_compute_ms': diag.get('sparse_compute_ms', -1.0),
+                'sparse_total_ms': diag.get('sparse_total_ms', -1.0),
+                # v19 two-stage prescan fields
+                'stage1_zero_tiles': diag.get('stage1_zero_tiles', -1),
+                'stage2_tiles': diag.get('stage2_tiles', -1),
+                'zero_tiles': diag.get('zero_tiles', -1),
+                'sparse_tiles': diag.get('sparse_tiles', -1),
+                'denseish_tiles': diag.get('denseish_tiles', -1),
+                'prescan_mode': diag.get('prescan_mode', 'unknown'),
+                'metadata_kind': diag.get('metadata_kind', 'unknown'),
+                'kernel_type': diag.get('kernel_type', 'unknown'),
+                # v22 zero-candidate fields
+                'stage1_zero_candidate': diag.get('stage1_zero_candidate', -1),
+                'stage1_denseish': diag.get('stage1_denseish', -1),
+                'stage1_uncertain': diag.get('stage1_uncertain', -1),
+            }
+
+    for _, mod in model.named_modules():
+        if isinstance(mod, SparseConv2d):
+            mod.collect_diag = False
+    return group_data
+
+
+def should_use_sparse_selective(target, group_data, min_cin=128, max_agr=0.5, no_1x1=False):
+    name = target["name"]
+    c_in = target.get("in_channels", 0)
+    kind = classify_target_type(target)
+    if no_1x1 and kind == "1x1/s1":
+        return False
+    if c_in < min_cin:
+        return False
+    gd = group_data.get(name, {})
+    agr = gd.get('active_group_ratio', 1.0)
+    if agr < 0:
+        agr = 1.0
+    if agr > max_agr:
+        return False
+    return True
+
+
+def pick_stage_probe_names(model, max_probes=8):
+    spike_names = [name for name, module in model.named_modules() if isinstance(module, SPIKE_OPS)]
+    if not spike_names:
+        return []
+    if len(spike_names) <= max_probes:
+        return spike_names
+    chosen = []
+    last_idx = -1
+    for i in range(max_probes):
+        idx = round(i * (len(spike_names) - 1) / max(max_probes - 1, 1))
+        if idx == last_idx:
+            continue
+        chosen.append(spike_names[idx])
+        last_idx = idx
+    return chosen
+
+
+def measure_stage_spike_rates(model, loader, device, T, num_batches=10,
+                              spike_mode="normalized_bernoulli", stage_names=None):
+    if stage_names is None:
+        stage_names = pick_stage_probe_names(model)
+    modules = dict(model.named_modules())
+    stats = OrderedDict()
+    hooks = []
+    for name in stage_names:
+        if name in modules:
+            stats[name] = {"nz": 0, "total": 0}
+            def make_hook(layer_name):
+                def hook(m, inp, out):
+                    if isinstance(out, torch.Tensor):
+                        y = out.detach()
+                        stats[layer_name]["nz"] += (y.abs() > 1e-6).sum().item()
+                        stats[layer_name]["total"] += y.numel()
+                return hook
+            hooks.append(modules[name].register_forward_hook(make_hook(name)))
+
+    count = 0
+    for imgs, _ in loader:
+        if count >= num_batches:
+            break
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        sj_func.reset_net(model)
+        with torch.no_grad():
+            _ = model(inp)
+        count += 1
+    for h in hooks:
+        h.remove()
+
+    rates = OrderedDict()
+    for name, st in stats.items():
+        rates[name] = 100.0 * st["nz"] / max(st["total"], 1)
+    return rates
+
+
+def print_stage_spike_rates(rates):
+    print(f"\n  {'Stage':<20} {'Spike Rate':>12}")
+    print(f"  {'-'*36}")
+    for name, val in rates.items():
+        print(f"  {name:<20} {val:>11.4f}%")
+
+
+def inspect_logits(model, loader, device, T, num_batches=5,
+                   spike_mode="normalized_bernoulli"):
+    mean_abs_sum, std_sum, max_abs_sum, count = 0.0, 0.0, 0.0, 0
+    for imgs, _ in loader:
+        if count >= num_batches:
+            break
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        sj_func.reset_net(model)
+        with torch.no_grad():
+            out = model(inp)
+        if out.dim() == 3:
+            out = out.mean(dim=0)
+        mean_abs_sum += out.abs().mean().item()
+        std_sum += out.std().item()
+        max_abs_sum += out.abs().max().item()
+        count += 1
+    n = max(count, 1)
+    return {"mean_abs": mean_abs_sum / n, "std": std_sum / n, "max_abs": max_abs_sum / n}
+
+
+def replace_model(model, targets, fused=False, static_zero_layers=None,
+                  only_static_zero=False, selective_sparse_set=None):
+    if static_zero_layers is None:
+        static_zero_layers = set()
+
+    replaced = sparse_count = fused_count = static_zero_count = dense_keep_count = 0
+
+    for target in targets:
+        conv_name = target["name"]
+        conv_module = target["module"]
+
+        if conv_name in static_zero_layers:
+            zero_conv = StaticZeroConv2d.from_conv(conv_module)
+            _set_module_by_name(model, conv_name, zero_conv)
+            static_zero_count += 1; replaced += 1; continue
+
+        if only_static_zero:
+            dense_keep_count += 1; replaced += 1; continue
+
+        if selective_sparse_set is not None and conv_name not in selective_sparse_set:
+            dense_keep_count += 1; replaced += 1; continue
+
+        if fused and target.get("lif_name") is not None:
+            fused_module = FusedSparseConvLIF.from_conv_and_lif(
+                conv_module, target["lif_module"])
+            _set_module_by_name(model, conv_name, fused_module)
+            _set_module_by_name(model, target["lif_name"], nn.Identity())
+            fused_count += 1; replaced += 1; continue
+
+        sparse_conv = SparseConv2d.from_dense(conv_module)
+        _set_module_by_name(model, conv_name, sparse_conv)
+        sparse_count += 1; replaced += 1
+
+    return replaced, sparse_count, fused_count, static_zero_count, dense_keep_count
+
+
+def measure_e2e_latency(model, loader, device, T, warmup=10, max_batches=None,
+                        spike_mode="normalized_bernoulli"):
+    warmup_count = 0
+    for imgs, _ in loader:
+        if warmup_count >= warmup:
+            break
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        sj_func.reset_net(model)
+        with torch.no_grad():
+            _ = model(inp)
+        warmup_count += 1
+    sync()
+
+    total_ms = 0.0; num_batches = 0
+    for imgs, _ in loader:
+        if max_batches is not None and num_batches >= max_batches:
+            break
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        sj_func.reset_net(model)
+        sync()
+        start_evt = make_event(); end_evt = make_event()
+        start_evt.record()
+        with torch.no_grad():
+            _ = model(inp)
+        end_evt.record()
+        sync()
+        total_ms += start_evt.elapsed_time(end_evt)
+        num_batches += 1
+
+    avg_ms = total_ms / max(num_batches, 1)
+    return avg_ms, total_ms, num_batches
+
+
+def measure_layer_timing(model, loader, device, T, target_names,
+                         warmup=5, num_batches=20, spike_mode="normalized_bernoulli"):
+    name_to_module = {}
+    for name, module in model.named_modules():
+        if name in target_names:
+            name_to_module[name] = module
+
+    timing = {name: {"total_ms": 0.0, "count": 0} for name in target_names}
+    pre_events = {}; post_events = {}
+    hook_handles = []
+
+    def make_pre_hook(layer_name):
+        def hook(m, inp):
+            evt = torch.cuda.Event(enable_timing=True); evt.record()
+            pre_events[layer_name] = evt
+        return hook
+    def make_post_hook(layer_name):
+        def hook(m, inp, out):
+            evt = torch.cuda.Event(enable_timing=True); evt.record()
+            post_events[layer_name] = evt
+        return hook
+
+    for name in target_names:
+        if name in name_to_module:
+            mod = name_to_module[name]
+            hook_handles.append(mod.register_forward_pre_hook(make_pre_hook(name)))
+            hook_handles.append(mod.register_forward_hook(make_post_hook(name)))
+
+    warmup_count = 0
+    for imgs, _ in loader:
+        if warmup_count >= warmup:
+            break
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        sj_func.reset_net(model)
+        with torch.no_grad():
+            _ = model(inp)
+        warmup_count += 1
+    sync()
+
+    batch_count = 0
+    for imgs, _ in loader:
+        if batch_count >= num_batches:
+            break
+        pre_events.clear(); post_events.clear()
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        sj_func.reset_net(model)
+        with torch.no_grad():
+            _ = model(inp)
+        sync()
+        for name in target_names:
+            if name in pre_events and name in post_events:
+                ms = pre_events[name].elapsed_time(post_events[name])
+                timing[name]["total_ms"] += ms; timing[name]["count"] += 1
+        batch_count += 1
+
+    for h in hook_handles:
+        h.remove()
+    result = {}
+    for name in target_names:
+        t = timing[name]
+        result[name] = t["total_ms"] / t["count"] if t["count"] > 0 else 0.0
+    return result
+
+
+def print_layer_profile(baseline_timing, sparse_timing, targets, e2e_baseline_ms=None,
+                        e2e_sparse_ms=None, label="Sparse"):
+    """Print per-layer timing comparison between baseline and a sparse variant.
+
+    Args:
+        baseline_timing: dict layer_name -> avg ms (dense baseline)
+        sparse_timing:   dict layer_name -> avg ms (sparse variant)
+        targets:         list of target info dicts
+        e2e_baseline_ms: optional end-to-end baseline latency for percentage calc
+        e2e_sparse_ms:   optional end-to-end sparse latency for percentage calc
+        label:           label string for the sparse variant column header
+    """
+    target_names = [t["name"] for t in targets]
+
+    col_sparse = f"{label}(ms)"
+    print(f"\n  {'Layer':<40} {'Base(ms)':>9} {col_sparse:>14} {'Speedup':>8}")
+    print(f"  {'-'*75}")
+    total_base = 0.0; total_sparse = 0.0
+    bucket = defaultdict(lambda: {"count": 0, "base": 0.0, "sparse": 0.0})
+    target_map = {t["name"]: t for t in targets}
+
+    for name in target_names:
+        b = baseline_timing.get(name, 0.0); s = sparse_timing.get(name, 0.0)
+        total_base += b; total_sparse += s
+        sp = f"{b / s:.3f}x" if s > 1e-6 else "inf"
+        short = name if len(name) <= 39 else "..." + name[-36:]
+        print(f"  {short:<40} {b:>9.3f} {s:>14.3f} {sp:>8}")
+        kind = classify_target_type(target_map[name])
+        bucket[kind]["count"] += 1; bucket[kind]["base"] += b; bucket[kind]["sparse"] += s
+
+    print(f"  {'-'*75}")
+    sp = f"{total_base / total_sparse:.3f}x" if total_sparse > 1e-6 else "inf"
+    print(f"  {'[REPLACED TOTAL]':<40} {total_base:>9.3f} {total_sparse:>14.3f} {sp:>8}")
+
+    if e2e_baseline_ms is not None and e2e_baseline_ms > 1e-6:
+        print(f"\n  鏇挎崲灞傚崰 baseline e2e: {100.0 * total_base / e2e_baseline_ms:.2f}%")
+    if e2e_sparse_ms is not None and e2e_sparse_ms > 1e-6:
+        print(f"  鏇挎崲灞傚崰 {label} e2e:   {100.0 * total_sparse / e2e_sparse_ms:.2f}%")
+
+    saved_ms = total_base - total_sparse
+    print(f"  鏇挎崲灞傝妭鐪? {saved_ms:.3f} ms/batch")
+
+    print(f"\n  {'Bucket':<12} {'Count':>6} {'Base(ms)':>10} {col_sparse:>14} {'Speedup':>8}")
+    print(f"  {'-'*58}")
+    for kind in ["1x1/s1", "1x1/s2", "3x3/s1", "3x3/s2"]:
+        c = bucket[kind]["count"]; b = bucket[kind]["base"]; s = bucket[kind]["sparse"]
+        if c == 0:
+            continue
+        sp = f"{b / s:.3f}x" if s > 1e-6 else "inf"
+        print(f"  {kind:<12} {c:>6} {b:>10.3f} {s:>14.3f} {sp:>8}")
+
+
+def verify_consistency(model_baseline, model_sparse, loader, device, T,
+                       num_batches=5, spike_mode="normalized_bernoulli"):
+    cosine_sum = agree_sum = 0.0; global_max_abs = 0.0; count = 0
+    for imgs, _ in loader:
+        if count >= num_batches:
+            break
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        sj_func.reset_net(model_baseline)
+        with torch.no_grad():
+            out_base = model_baseline(inp)
+        sj_func.reset_net(model_sparse)
+        with torch.no_grad():
+            out_sparse = model_sparse(inp)
+        if out_base.dim() == 3:
+            out_base = out_base.mean(dim=0)
+        if out_sparse.dim() == 3:
+            out_sparse = out_sparse.mean(dim=0)
+        diff = (out_sparse - out_base).float()
+        max_abs = diff.abs().max().item()
+        global_max_abs = max(global_max_abs, max_abs)
+        flat_s = out_sparse.flatten().float(); flat_b = out_base.flatten().float()
+        if flat_s.norm() < 1e-8 and flat_b.norm() < 1e-8:
+            cos = 1.0
+        elif flat_s.norm() < 1e-8 or flat_b.norm() < 1e-8:
+            cos = 0.0
+        else:
+            cos = F.cosine_similarity(flat_s.unsqueeze(0), flat_b.unsqueeze(0)).item()
+        cosine_sum += cos
+        pred_base = out_base.argmax(dim=-1); pred_sparse = out_sparse.argmax(dim=-1)
         agree_sum += (pred_base == pred_sparse).float().mean().item()
         count += 1
     n = max(count, 1)
