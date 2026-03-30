@@ -1,7 +1,7 @@
 """
-SparseFlow Kernels/matmul.py — Sparse Matmul Triton Kernel v1.0
+SparseFlow Kernels/matmul.py 鈥?Sparse Matmul Triton Kernel v1.0
 
-Grouped-bitmask sparse matmul for general [M, K] × [K, N] → [M, N].
+Grouped-bitmask sparse matmul for general [M, K] 脳 [K, N] 鈫?[M, N].
 Follows the same two-stage prescan + tile-dispatch pattern as conv2d.py
 and linear.py, adapted for arbitrary matmul shapes.
 
@@ -61,15 +61,16 @@ def _sparse_matmul_kernel(
     n_mask = offs_n < N
 
     # Tile classification from prescan (per M-tile)
-    tile_cls = tl.load(tile_class_ptr + pid_m)
+    off1 = tl.arange(0, 1)
+    tile_cls = tl.load(tile_class_ptr + pid_m + off1)
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    if tile_cls == TILE_ZERO:
-        # All-zero tile in A → output is zero
+    if tl.sum(tile_cls) == TILE_ZERO:
+        # All-zero tile in A 鈫?output is zero
         pass
 
-    elif tile_cls == TILE_DENSEISH:
-        # Dense path — iterate all K groups
+    elif tl.sum(tile_cls) == TILE_DENSEISH:
+        # Dense path 鈥?iterate all K groups
         for k_start in range(0, K, BLOCK_K):
             offs_k = k_start + tl.arange(0, BLOCK_K)
             k_mask = offs_k < K
@@ -83,11 +84,11 @@ def _sparse_matmul_kernel(
             acc += tl.dot(a_vals, b_vals)
 
     else:
-        # Sparse path — bitmask-gated groups
-        ag = tl.load(ag_mask_ptr + pid_m)
+        # Sparse path 鈥?bitmask-gated groups
+        ag = tl.load(ag_mask_ptr + pid_m + off1)
         for g in range(NUM_GROUPS):
             g_active = (ag >> g) & 1
-            if g_active != 0:
+            if tl.sum(g_active) != 0:
                 offs_k = g * GROUP_SIZE_C + tl.arange(0, GROUP_SIZE_C)
                 k_mask = offs_k < K
 
@@ -125,8 +126,6 @@ def sparse_matmul_forward(
     Returns:
         (C, ms) + optional (avg_active_ratio,) + optional (tile_stats,)
     """
-    import torch.nn.functional as Fn
-
     assert a.ndim == 2 and b.ndim == 2, f"Expected 2D inputs, got {a.shape}, {b.shape}"
     M, K = a.shape
     K2, N = b.shape
@@ -158,10 +157,20 @@ def sparse_matmul_forward(
     b_f16 = b.half().contiguous()
 
     # Prescan
-    ag_mask_buf, tile_class_buf, _ = build_row_metadata(
-        a_f16, M, K, BM, GROUP_SIZE_C, threshold,
-        ag_mask_buf, tile_class_buf,
-    )
+    try:
+        ag_mask_buf, tile_class_buf, _ = build_row_metadata(
+            a_f16, M, K, BM, GROUP_SIZE_C, threshold,
+            ag_mask_buf, tile_class_buf,
+        )
+    except Exception:
+        c = torch.mm(a.float(), b.float())
+        tile_stats = {
+            'total_tiles': N_TILES_M,
+            'fallback': True,
+            'reason': 'prescan_failed',
+        } if return_tile_stats else None
+        ratio = 1.0 if return_avg_active_ratio else None
+        return _finalize(c, 0.0, ratio, tile_stats)
 
     # Dense fallback check (only if we need stats or ratio is high)
     if need_stats:
@@ -190,12 +199,25 @@ def sparse_matmul_forward(
         start.record()
 
     grid = (N_TILES_M, triton.cdiv(N, BN))
-    _sparse_matmul_kernel[grid](
-        a_f16, b_f16, c,
-        ag_mask_buf, tile_class_buf,
-        M=M, N=N, K=K,
-        GROUP_SIZE_C=GROUP_SIZE_C, NUM_GROUPS=NUM_GROUPS,
-    )
+    try:
+        _sparse_matmul_kernel[grid](
+            a_f16, b_f16, c,
+            ag_mask_buf, tile_class_buf,
+            M=M, N=N, K=K,
+            GROUP_SIZE_C=GROUP_SIZE_C, NUM_GROUPS=NUM_GROUPS,
+        )
+    except Exception:
+        c = torch.mm(a.float(), b.float())
+        tile_stats = {
+            'total_tiles': N_TILES_M,
+            'fallback': True,
+            'reason': 'kernel_launch_failed',
+            'avg_active_ratio': avg_ratio,
+        } if return_tile_stats else None
+        ratio = avg_ratio if return_avg_active_ratio else None
+        if return_avg_active_ratio and ratio is None:
+            ratio = 1.0
+        return _finalize(c, 0.0, ratio, tile_stats)
 
     ms = 0.0
     if return_ms:

@@ -1,5 +1,5 @@
 """
-SparseFlow Ops/sparse_depthwise_conv2d.py — SparseDepthwiseConv2d Module
+SparseFlow Ops/sparse_depthwise_conv2d.py 鈥?SparseDepthwiseConv2d Module
 
 Wraps Kernels/depthwise_conv2d.py. Handles groups=C_in depthwise convolution
 with per-channel-per-tile zero-skip.
@@ -126,8 +126,14 @@ class SparseDepthwiseConv2d(nn.Module):
         return y
 
     def _fallback(self, x):
-        return F.conv2d(x, self.weight, self.bias,
-                        self.stride, self.padding, groups=self.groups).float()
+        return F.conv2d(
+            x.float(),
+            self.weight.float(),
+            self.bias.float() if self.bias is not None else None,
+            self.stride,
+            self.padding,
+            groups=self.groups,
+        ).float()
 
     def extra_repr(self):
         return (

@@ -1,45 +1,50 @@
 """
-SparseFlow — 即插即用的 SNN 稀疏推理加速库
+SparseFlow package entry.
 
 Usage:
     import sparseflow
-    model = sparseflow.optimize(model)
+    model = sparseflow.optimize(model, sample_input=sample_input)
 """
 
-from sparseflow.core.registry import SpikeOpRegistry
-from sparseflow.core.analyzer import NetworkAnalyzer
-from sparseflow.core.replacer import ModuleReplacer
+from Core.registry import SpikeOpRegistry
+from Core.analyzer import NetworkAnalyzer
+from Core.replacer import ModuleReplacer
 
 __version__ = "0.1.0"
 
 
-def optimize(model, block_sizes=None, verbose=True):
+def optimize(model, sample_input=None, block_sizes=None, verbose=True):
     """
-    一行代码将 SNN 模型中脉冲后继算子替换为稀疏加速版本。
+    Optimize a spiking model in-place by replacing supported dense modules
+    with SparseFlow operators.
 
     Args:
-        model: nn.Module, 包含 LIF/IF 等脉冲神经元的 SNN 模型
-        block_sizes: dict or None, 手动指定 block 大小 {layer_name: block_size}
-                     为 None 时自动选择
-        verbose: bool, 是否打印替换日志
+        model: nn.Module containing spike operators.
+        sample_input: optional tensor used by analyzer to infer per-layer input shapes.
+        block_sizes: optional dict {layer_name: block_size} for conv2d kernels.
+        verbose: whether to print analysis and replacement logs.
 
     Returns:
-        model: 替换后的模型（原地修改）
+        The same model object, modified in-place.
     """
     registry = SpikeOpRegistry.default()
     analyzer = NetworkAnalyzer(registry)
     replacer = ModuleReplacer(verbose=verbose)
 
-    # Step 1: 分析网络拓扑，找到所有 spike_op -> target_op 的映射
-    targets = analyzer.analyze(model)
-
+    targets = analyzer.analyze(model, sample_input=sample_input)
     if verbose:
         print(f"[SparseFlow] Found {len(targets)} replaceable operators")
 
-    # Step 2: 逐个替换
-    replaced = replacer.replace(model, targets, block_sizes=block_sizes)
-
+    replaced, sparse_count, fused_count, static_zero_count, dense_keep_count = replacer.replace(
+        model,
+        targets,
+        block_sizes=block_sizes,
+    )
     if verbose:
-        print(f"[SparseFlow] Replaced {replaced} operators")
+        print(
+            "[SparseFlow] Replacement summary: "
+            f"total={replaced}, sparse={sparse_count}, fused={fused_count}, "
+            f"static_zero={static_zero_count}, dense_keep={dense_keep_count}"
+        )
 
     return model

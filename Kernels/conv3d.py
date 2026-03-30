@@ -1,11 +1,11 @@
 """
-SparseFlow Kernels/conv3d.py — Sparse Conv3d Triton Kernel v1.0
+SparseFlow Kernels/conv3d.py 鈥?Sparse Conv3d Triton Kernel v1.0
 
-3D convolution [N, C_IN, D, H, W] → [N, C_OUT, D_OUT, H_OUT, W_OUT]
+3D convolution [N, C_IN, D, H, W] 鈫?[N, C_OUT, D_OUT, H_OUT, W_OUT]
 with grouped-bitmask prescan on input channels per volumetric tile.
 
 v1: Prescan + dense compute fallback with tile classification stats.
-Sparse compute kernel deferred to v2 — the prescan establishes whether
+Sparse compute kernel deferred to v2 鈥?the prescan establishes whether
 3D sparsity patterns in SNN volumetric models justify dedicated kernels.
 
 Supported: kernel_size=3, stride=1, padding=1, groups=1, dilation=1.
@@ -30,7 +30,7 @@ FALLBACK_RATIO = 0.85
 
 
 # ---------------------------------------------------------------------------
-# Public entry — v1 prescan + F.conv3d fallback
+# Public entry 鈥?v1 prescan + F.conv3d fallback
 # ---------------------------------------------------------------------------
 
 def sparse_conv3d_forward(
@@ -44,7 +44,7 @@ def sparse_conv3d_forward(
     return_tile_stats: bool = False,
 ):
     """
-    Sparse 3D convolution — v1 with input sparsity profiling.
+    Sparse 3D convolution 鈥?v1 with input sparsity profiling.
 
     Currently executes dense compute (F.conv3d) but reports per-tile
     sparsity statistics to guide future kernel development.
@@ -72,7 +72,13 @@ def sparse_conv3d_forward(
         end = torch.cuda.Event(enable_timing=True)
         start.record()
 
-    y = Fn.conv3d(x, weight, bias, stride=stride, padding=padding).float()
+    y = Fn.conv3d(
+        x.float(),
+        weight.float(),
+        bias.float() if bias is not None else None,
+        stride=stride,
+        padding=padding,
+    ).float()
 
     ms = 0.0
     if return_ms:

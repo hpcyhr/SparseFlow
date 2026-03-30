@@ -1,5 +1,5 @@
 """
-SparseFlow Ops/sparse_conv1d.py — SparseConv1d nn.Module Wrapper
+SparseFlow Ops/sparse_conv1d.py 鈥?SparseConv1d nn.Module Wrapper
 
 Wraps Kernels/conv1d.py. Manages buffers, provides from_dense(),
 5D (T, N, C, L) input support, and F.conv1d fallback.
@@ -101,7 +101,7 @@ class SparseConv1d(nn.Module):
         return self._forward_3d(x)
 
     def _forward_3d(self, x: torch.Tensor) -> torch.Tensor:
-        # groups != 1 → dense fallback (sparse kernel supports groups=1 only)
+        # groups != 1 鈫?dense fallback (sparse kernel supports groups=1 only)
         if self.groups != 1 or not self._triton_available or not x.is_cuda:
             return self._fallback(x)
 
@@ -125,8 +125,14 @@ class SparseConv1d(nn.Module):
         return y
 
     def _fallback(self, x):
-        return F.conv1d(x, self.weight, self.bias,
-                        self.stride, self.padding, groups=self.groups).float()
+        return F.conv1d(
+            x.float(),
+            self.weight.float(),
+            self.bias.float() if self.bias is not None else None,
+            self.stride,
+            self.padding,
+            groups=self.groups,
+        ).float()
 
     def extra_repr(self):
         return (

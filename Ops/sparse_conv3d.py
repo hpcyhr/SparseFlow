@@ -1,5 +1,5 @@
 """
-SparseFlow Ops/sparse_conv3d.py — SparseConv3d nn.Module Wrapper
+SparseFlow Ops/sparse_conv3d.py 鈥?SparseConv3d nn.Module Wrapper
 
 Wraps Kernels/conv3d.py. v1: prescan stats + F.conv3d compute.
 """
@@ -123,8 +123,14 @@ class SparseConv3d(nn.Module):
         return y
 
     def _fallback(self, x):
-        return F.conv3d(x, self.weight, self.bias,
-                        self.stride, self.padding, groups=self.groups).float()
+        return F.conv3d(
+            x.float(),
+            self.weight.float(),
+            self.bias.float() if self.bias is not None else None,
+            self.stride,
+            self.padding,
+            groups=self.groups,
+        ).float()
 
     def extra_repr(self):
         return (

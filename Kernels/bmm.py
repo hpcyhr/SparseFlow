@@ -1,10 +1,10 @@
 """
-SparseFlow Kernels/bmm.py — Sparse Batched Matmul Triton Kernel v1.0
+SparseFlow Kernels/bmm.py 鈥?Sparse Batched Matmul Triton Kernel v1.0
 
-Sparse BMM for [B, M, K] × [B, K, N] → [B, M, N].
+Sparse BMM for [B, M, K] 脳 [B, K, N] 鈫?[B, M, N].
 Per-batch prescan on the A tensor, then dispatches per (batch, m-tile, n-tile).
 
-Critical for Spikeformer attention (Q×K^T, attn×V) where Q/attn carry
+Critical for Spikeformer attention (Q脳K^T, attn脳V) where Q/attn carry
 spike sparsity from upstream LIF neurons.
 """
 
@@ -26,7 +26,7 @@ from Utils.sparse_helpers import (
 FALLBACK_RATIO = 0.85
 
 # ---------------------------------------------------------------------------
-# Prescan kernel — per batch element
+# Prescan kernel 鈥?per batch element
 # ---------------------------------------------------------------------------
 
 @triton.jit
@@ -54,8 +54,9 @@ def _prescan_bmm_kernel(
     row_mask = rows < M
 
     batch_offset = batch_idx * M * K
-    ag_mask = tl.zeros([], dtype=tl.int32)
-    any_nonzero = tl.zeros([], dtype=tl.int32)
+    off1 = tl.arange(0, 1)
+    ag_mask = tl.zeros([1], dtype=tl.int32)
+    any_nonzero = tl.zeros([1], dtype=tl.int32)
 
     for g in range(NUM_GROUPS):
         col_start = g * GROUP_SIZE_C
@@ -66,21 +67,20 @@ def _prescan_bmm_kernel(
         mask = row_mask[:, None] & col_mask[None, :]
         vals = tl.load(a_ptr + addrs, mask=mask, other=0.0)
 
-        has_nonzero = tl.sum(tl.abs(vals) > THRESHOLD) > 0
-        if has_nonzero:
-            ag_mask = ag_mask | (1 << g)
-            any_nonzero = 1
+        has_nonzero = (tl.sum((tl.abs(vals) > THRESHOLD).to(tl.int32), axis=0) > 0).to(tl.int32)
+        ag_mask = ag_mask + has_nonzero * (1 << g)
+        any_nonzero = tl.maximum(any_nonzero, has_nonzero)
 
     out_idx = batch_idx * N_TILES_M + tile_idx
-    tl.store(ag_mask_ptr + out_idx, ag_mask)
+    tl.store(ag_mask_ptr + out_idx + off1, ag_mask)
 
-    cls = TILE_ZERO
-    if any_nonzero != 0:
-        if ag_mask == ALL_ONES:
-            cls = TILE_DENSEISH
+    if tl.sum(any_nonzero) == 0:
+        tl.store(tile_class_ptr + out_idx + off1, tl.zeros([1], dtype=tl.int32))
+    else:
+        if tl.sum(ag_mask == ALL_ONES) > 0:
+            tl.store(tile_class_ptr + out_idx + off1, tl.full([1], TILE_DENSEISH, dtype=tl.int32))
         else:
-            cls = TILE_SPARSE
-    tl.store(tile_class_ptr + out_idx, cls)
+            tl.store(tile_class_ptr + out_idx + off1, tl.full([1], TILE_SPARSE, dtype=tl.int32))
 
 
 # ---------------------------------------------------------------------------
@@ -122,14 +122,15 @@ def _sparse_bmm_kernel(
     c_batch = batch_idx * M * N
 
     meta_idx = batch_idx * N_TILES_M + tile_m
-    tile_cls = tl.load(tile_class_ptr + meta_idx)
+    off1 = tl.arange(0, 1)
+    tile_cls = tl.load(tile_class_ptr + meta_idx + off1)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    if tile_cls == TILE_ZERO:
+    if tl.sum(tile_cls) == TILE_ZERO:
         pass
 
-    elif tile_cls == TILE_DENSEISH:
+    elif tl.sum(tile_cls) == TILE_DENSEISH:
         for k_start in range(0, K, BLOCK_K):
             offs_k = k_start + tl.arange(0, BLOCK_K)
             k_mask = offs_k < K
@@ -143,10 +144,10 @@ def _sparse_bmm_kernel(
             acc += tl.dot(a_vals, b_vals)
 
     else:
-        ag = tl.load(ag_mask_ptr + meta_idx)
+        ag = tl.load(ag_mask_ptr + meta_idx + off1)
         for g in range(NUM_GROUPS):
             g_active = (ag >> g) & 1
-            if g_active != 0:
+            if tl.sum(g_active) != 0:
                 offs_k = g * GROUP_SIZE_C + tl.arange(0, GROUP_SIZE_C)
                 k_mask = offs_k < K
 
@@ -226,13 +227,23 @@ def sparse_bmm_forward(
         tile_class_buf = torch.empty(TOTAL_META, dtype=torch.int32, device=device)
 
     # Prescan
-    _prescan_bmm_kernel[(TOTAL_META,)](
-        a_f16, ag_mask_buf, tile_class_buf,
-        B=B_dim, M=M, K=K, N_TILES_M=N_TILES_M,
-        BLOCK_M=BM, GROUP_SIZE_C=GROUP_SIZE_C,
-        NUM_GROUPS=NUM_GROUPS, ALL_ONES=ALL_ONES,
-        THRESHOLD=threshold,
-    )
+    try:
+        _prescan_bmm_kernel[(TOTAL_META,)](
+            a_f16, ag_mask_buf, tile_class_buf,
+            B=B_dim, M=M, K=K, N_TILES_M=N_TILES_M,
+            BLOCK_M=BM, GROUP_SIZE_C=GROUP_SIZE_C,
+            NUM_GROUPS=NUM_GROUPS, ALL_ONES=ALL_ONES,
+            THRESHOLD=threshold,
+        )
+    except Exception:
+        c = torch.bmm(a.float(), b.float())
+        stats = {
+            'total_tiles': TOTAL_META,
+            'fallback': True,
+            'reason': 'prescan_failed',
+        } if return_tile_stats else None
+        ratio = 1.0 if return_avg_active_ratio else None
+        return _finalize(c, 0.0, ratio, stats)
 
     # Ratio check
     avg_ratio = None
@@ -255,13 +266,26 @@ def sparse_bmm_forward(
         start.record()
 
     grid = (B_dim * N_TILES_M, N_TILES_N)
-    _sparse_bmm_kernel[grid](
-        a_f16, b_f16, c,
-        ag_mask_buf, tile_class_buf,
-        B_dim=B_dim, M=M, N=N, K=K,
-        N_TILES_M=N_TILES_M,
-        GROUP_SIZE_C=GROUP_SIZE_C, NUM_GROUPS=NUM_GROUPS,
-    )
+    try:
+        _sparse_bmm_kernel[grid](
+            a_f16, b_f16, c,
+            ag_mask_buf, tile_class_buf,
+            B_dim=B_dim, M=M, N=N, K=K,
+            N_TILES_M=N_TILES_M,
+            GROUP_SIZE_C=GROUP_SIZE_C, NUM_GROUPS=NUM_GROUPS,
+        )
+    except Exception:
+        c = torch.bmm(a.float(), b.float())
+        stats = {
+            'total_tiles': TOTAL_META,
+            'fallback': True,
+            'reason': 'kernel_launch_failed',
+            'avg_active_ratio': avg_ratio,
+        } if return_tile_stats else None
+        ratio = avg_ratio if return_avg_active_ratio else None
+        if return_avg_active_ratio and ratio is None:
+            ratio = 1.0
+        return _finalize(c, 0.0, ratio, stats)
 
     ms = 0.0
     if return_ms:

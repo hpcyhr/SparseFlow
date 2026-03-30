@@ -9,7 +9,7 @@ import argparse
 import copy
 import json
 import math
-from collections import OrderedDict, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 import os
 from PIL import Image
 from torch.utils.data import Dataset
@@ -32,6 +32,9 @@ from Ops.static_zero_conv2d import StaticZeroConv2d, make_synthetic_zero_diag
 from Utils.layer_logger import LayerLogger
 from Utils.dispatch_model import dispatch_all_layers, decisions_to_sets
 from Utils.timing_utils import prepare_for_timing, set_launch_mode, count_sync_state
+from Core.registry import SpikeOpRegistry
+from Core.analyzer import NetworkAnalyzer
+from Core.replacer import ModuleReplacer
 
 
 DEVICE = None
@@ -80,7 +83,7 @@ MODEL_BUILDERS, MODEL_META = _discover_model_builders()
 
 
 def print_supported_models():
-    print("\n支持的模型:")
+    print("\n鏀寔鐨勬ā鍨?")
     for name in MODEL_BUILDERS:
         print(f"  {name}")
     print()
@@ -191,7 +194,7 @@ class FlatImageFolderDataset(Dataset):
         if self.transform is not None:
             img = self.transform(img)
 
-        # 这里只做推理性能测试，所以标签给 dummy=0 即可
+        # 杩欓噷鍙仛鎺ㄧ悊鎬ц兘娴嬭瘯锛屾墍浠ユ爣绛剧粰 dummy=0 鍗冲彲
         return img, 0
 
 def build_dataset(dataset_name, data_root, spike_mode="normalized_bernoulli"):
@@ -384,14 +387,16 @@ def print_analysis_report(targets, skipped, fused=False):
     supported_n = len(targets)
     skipped_n = len(skipped)
 
-    print(f"\n  ┌{'─'*120}┐")
-    print(f"  │{'候选层分析报告':^118}│")
-    print(f"  ├{'─'*120}┤")
-    header = (f"  │ {'Layer':<36} {'C_in':>5} {'C_out':>5} "
-              f"{'Kernel':>6} {'Stride':>6} {'Pad':>4} {'Grp':>4} "
-              f"{'H':>4} {'W':>4} {'Status':<10} {'Reason':<22} │")
+    print(f"\n  {'=' * 120}")
+    print(f"  {'Candidate Layer Analysis':^118}")
+    print(f"  {'=' * 120}")
+    header = (
+        f"  {'Layer':<36} {'C_in':>5} {'C_out':>5} "
+        f"{'Kernel':>6} {'Stride':>6} {'Pad':>4} {'Grp':>4} "
+        f"{'H':>4} {'W':>4} {'Status':<10} {'Reason':<22}"
+    )
     print(header)
-    print(f"  ├{'─'*120}┤")
+    print(f"  {'-' * 120}")
 
     for info in all_candidates:
         name = info["name"]
@@ -402,436 +407,18 @@ def print_analysis_report(targets, skipped, fused=False):
         k_str = f"{k[0]}x{k[1]}"
         s_str = f"{s[0]},{s[1]}"
         p_str = f"{p[0]},{p[1]}" if isinstance(p, tuple) else str(p)
-        line = (f"  │ {short:<36} {info['in_channels']:>5} {info['out_channels']:>5} "
-                f"{k_str:>6} {s_str:>6} {p_str:>4} {g:>4} "
-                f"{info['H']:>4} {info['W']:>4} {status:<10} {reason:<22} │")
+        line = (
+            f"  {short:<36} {info['in_channels']:>5} {info['out_channels']:>5} "
+            f"{k_str:>6} {s_str:>6} {p_str:>4} {g:>4} "
+            f"{info['H']:>4} {info['W']:>4} {status:<10} {reason:<22}"
+        )
         print(line)
 
-    print(f"  └{'─'*120}┘")
-    print(f"\n  汇总: total_conv={total_conv}  supported={supported_n}  skipped={skipped_n}")
+    print(f"  {'=' * 120}")
+    print(f"\n  Summary: total_conv={total_conv}  supported={supported_n}  skipped={skipped_n}")
     if skipped:
         reason_counts = {}
         for s in skipped:
-            r = s["reason"]
-            reason_counts[r] = reason_counts.get(r, 0) + 1
-        parts = [f"{r}={c}" for r, c in sorted(reason_counts.items())]
-        print(f"  跳过原因: {', '.join(parts)}")
-
-
-def measure_sparsity(model, targets, loader, device, T, num_batches=10,
-                     spike_mode="normalized_bernoulli"):
-    sparsity_data = {t["name"]: {"zeros": 0, "total": 0} for t in targets}
-
-    def make_hook(name):
-        def hook(m, inp, out):
-            x = inp[0]
-            if not isinstance(x, torch.Tensor):
-                return
-            with torch.no_grad():
-                x = x.detach()
-                if x.dim() == 5:
-                    T_, B, C, H, W = x.shape
-                    x = x.reshape(T_ * B, C, H, W)
-                sparsity_data[name]["zeros"] += (x.abs() <= 1e-6).sum().item()
-                sparsity_data[name]["total"] += x.numel()
-                del x
-        return hook
-
-    hook_handles = []
-    for target in targets:
-        name = target["name"]
-        m = _get_module_by_name(model, name)
-        hook_handles.append(m.register_forward_hook(make_hook(name)))
-
-    batch_count = 0
-    for imgs, _ in loader:
-        if batch_count >= num_batches:
-            break
-        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
-        sj_func.reset_net(model)
-        with torch.no_grad():
-            _ = model(inp)
-        batch_count += 1
-
-    for h in hook_handles:
-        h.remove()
-    return sparsity_data
-
-
-def collect_static_zero_layers(targets, sparsity_data):
-    zero_layers = set()
-    for t in targets:
-        name = t["name"]
-        sd = sparsity_data[name]
-        if sd["total"] > 0 and sd["zeros"] == sd["total"]:
-            zero_layers.add(name)
-    return zero_layers
-
-
-def measure_group_sparsity(model, targets, loader, device, T, num_batches=5,
-                           spike_mode="normalized_bernoulli"):
-    for _, mod in model.named_modules():
-        if isinstance(mod, SparseConv2d):
-            mod.collect_diag = True
-
-    batch_count = 0
-    for imgs, _ in loader:
-        if batch_count >= num_batches:
-            break
-        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
-        sj_func.reset_net(model)
-        with torch.no_grad():
-            _ = model(inp)
-        batch_count += 1
-
-    target_names = {t["name"] for t in targets}
-    group_data = {}
-    for name, mod in model.named_modules():
-        if isinstance(mod, SparseConv2d) and name in target_names:
-            diag = getattr(mod, '_last_diag', {})
-            group_data[name] = {
-                'active_group_ratio': diag.get('active_group_ratio', -1.0),
-                'tile_zero_ratio': diag.get('tile_zero_ratio', -1.0),
-                'total_group_count': diag.get('total_group_count', -1.0),
-                'nonzero_group_count': diag.get('nonzero_group_count', -1.0),
-                'tile_zero_count': diag.get('tile_zero_count', -1.0),
-                'total_tile_count': diag.get('total_tile_count', -1.0),
-                'effective_k_ratio': diag.get('effective_k_ratio', -1.0),
-                'sparse_compute_ms': diag.get('sparse_compute_ms', -1.0),
-                'sparse_total_ms': diag.get('sparse_total_ms', -1.0),
-                # v19 two-stage prescan fields
-                'stage1_zero_tiles': diag.get('stage1_zero_tiles', -1),
-                'stage2_tiles': diag.get('stage2_tiles', -1),
-                'zero_tiles': diag.get('zero_tiles', -1),
-                'sparse_tiles': diag.get('sparse_tiles', -1),
-                'denseish_tiles': diag.get('denseish_tiles', -1),
-                'prescan_mode': diag.get('prescan_mode', 'unknown'),
-                'metadata_kind': diag.get('metadata_kind', 'unknown'),
-                'kernel_type': diag.get('kernel_type', 'unknown'),
-                # v22 zero-candidate fields
-                'stage1_zero_candidate': diag.get('stage1_zero_candidate', -1),
-                'stage1_denseish': diag.get('stage1_denseish', -1),
-                'stage1_uncertain': diag.get('stage1_uncertain', -1),
-            }
-
-    for _, mod in model.named_modules():
-        if isinstance(mod, SparseConv2d):
-            mod.collect_diag = False
-    return group_data
-
-
-def should_use_sparse_selective(target, group_data, min_cin=128, max_agr=0.5, no_1x1=False):
-    name = target["name"]
-    c_in = target.get("in_channels", 0)
-    kind = classify_target_type(target)
-    if no_1x1 and kind == "1x1/s1":
-        return False
-    if c_in < min_cin:
-        return False
-    gd = group_data.get(name, {})
-    agr = gd.get('active_group_ratio', 1.0)
-    if agr < 0:
-        agr = 1.0
-    if agr > max_agr:
-        return False
-    return True
-
-
-def pick_stage_probe_names(model, max_probes=8):
-    spike_names = [name for name, module in model.named_modules() if isinstance(module, SPIKE_OPS)]
-    if not spike_names:
-        return []
-    if len(spike_names) <= max_probes:
-        return spike_names
-    chosen = []
-    last_idx = -1
-    for i in range(max_probes):
-        idx = round(i * (len(spike_names) - 1) / max(max_probes - 1, 1))
-        if idx == last_idx:
-            continue
-        chosen.append(spike_names[idx])
-        last_idx = idx
-    return chosen
-
-
-def measure_stage_spike_rates(model, loader, device, T, num_batches=10,
-                              spike_mode="normalized_bernoulli", stage_names=None):
-    if stage_names is None:
-        stage_names = pick_stage_probe_names(model)
-    modules = dict(model.named_modules())
-    stats = OrderedDict()
-    hooks = []
-    for name in stage_names:
-        if name in modules:
-            stats[name] = {"nz": 0, "total": 0}
-            def make_hook(layer_name):
-                def hook(m, inp, out):
-                    if isinstance(out, torch.Tensor):
-                        y = out.detach()
-                        stats[layer_name]["nz"] += (y.abs() > 1e-6).sum().item()
-                        stats[layer_name]["total"] += y.numel()
-                return hook
-            hooks.append(modules[name].register_forward_hook(make_hook(name)))
-
-    count = 0
-    for imgs, _ in loader:
-        if count >= num_batches:
-            break
-        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
-        sj_func.reset_net(model)
-        with torch.no_grad():
-            _ = model(inp)
-        count += 1
-    for h in hooks:
-        h.remove()
-
-    rates = OrderedDict()
-    for name, st in stats.items():
-        rates[name] = 100.0 * st["nz"] / max(st["total"], 1)
-    return rates
-
-
-def print_stage_spike_rates(rates):
-    print(f"\n  {'Stage':<20} {'Spike Rate':>12}")
-    print(f"  {'-'*36}")
-    for name, val in rates.items():
-        print(f"  {name:<20} {val:>11.4f}%")
-
-
-def inspect_logits(model, loader, device, T, num_batches=5,
-                   spike_mode="normalized_bernoulli"):
-    mean_abs_sum, std_sum, max_abs_sum, count = 0.0, 0.0, 0.0, 0
-    for imgs, _ in loader:
-        if count >= num_batches:
-            break
-        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
-        sj_func.reset_net(model)
-        with torch.no_grad():
-            out = model(inp)
-        if out.dim() == 3:
-            out = out.mean(dim=0)
-        mean_abs_sum += out.abs().mean().item()
-        std_sum += out.std().item()
-        max_abs_sum += out.abs().max().item()
-        count += 1
-    n = max(count, 1)
-    return {"mean_abs": mean_abs_sum / n, "std": std_sum / n, "max_abs": max_abs_sum / n}
-
-
-def replace_model(model, targets, fused=False, static_zero_layers=None,
-                  only_static_zero=False, selective_sparse_set=None):
-    if static_zero_layers is None:
-        static_zero_layers = set()
-
-    replaced = sparse_count = fused_count = static_zero_count = dense_keep_count = 0
-
-    for target in targets:
-        conv_name = target["name"]
-        conv_module = target["module"]
-
-        if conv_name in static_zero_layers:
-            zero_conv = StaticZeroConv2d.from_conv(conv_module)
-            _set_module_by_name(model, conv_name, zero_conv)
-            static_zero_count += 1; replaced += 1; continue
-
-        if only_static_zero:
-            dense_keep_count += 1; replaced += 1; continue
-
-        if selective_sparse_set is not None and conv_name not in selective_sparse_set:
-            dense_keep_count += 1; replaced += 1; continue
-
-        if fused and target.get("lif_name") is not None:
-            fused_module = FusedSparseConvLIF.from_conv_and_lif(
-                conv_module, target["lif_module"])
-            _set_module_by_name(model, conv_name, fused_module)
-            _set_module_by_name(model, target["lif_name"], nn.Identity())
-            fused_count += 1; replaced += 1; continue
-
-        sparse_conv = SparseConv2d.from_dense(conv_module)
-        _set_module_by_name(model, conv_name, sparse_conv)
-        sparse_count += 1; replaced += 1
-
-    return replaced, sparse_count, fused_count, static_zero_count, dense_keep_count
-
-
-def measure_e2e_latency(model, loader, device, T, warmup=10, max_batches=None,
-                        spike_mode="normalized_bernoulli"):
-    warmup_count = 0
-    for imgs, _ in loader:
-        if warmup_count >= warmup:
-            break
-        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
-        sj_func.reset_net(model)
-        with torch.no_grad():
-            _ = model(inp)
-        warmup_count += 1
-    sync()
-
-    total_ms = 0.0; num_batches = 0
-    for imgs, _ in loader:
-        if max_batches is not None and num_batches >= max_batches:
-            break
-        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
-        sj_func.reset_net(model)
-        sync()
-        start_evt = make_event(); end_evt = make_event()
-        start_evt.record()
-        with torch.no_grad():
-            _ = model(inp)
-        end_evt.record()
-        sync()
-        total_ms += start_evt.elapsed_time(end_evt)
-        num_batches += 1
-
-    avg_ms = total_ms / max(num_batches, 1)
-    return avg_ms, total_ms, num_batches
-
-
-def measure_layer_timing(model, loader, device, T, target_names,
-                         warmup=5, num_batches=20, spike_mode="normalized_bernoulli"):
-    name_to_module = {}
-    for name, module in model.named_modules():
-        if name in target_names:
-            name_to_module[name] = module
-
-    timing = {name: {"total_ms": 0.0, "count": 0} for name in target_names}
-    pre_events = {}; post_events = {}
-    hook_handles = []
-
-    def make_pre_hook(layer_name):
-        def hook(m, inp):
-            evt = torch.cuda.Event(enable_timing=True); evt.record()
-            pre_events[layer_name] = evt
-        return hook
-    def make_post_hook(layer_name):
-        def hook(m, inp, out):
-            evt = torch.cuda.Event(enable_timing=True); evt.record()
-            post_events[layer_name] = evt
-        return hook
-
-    for name in target_names:
-        if name in name_to_module:
-            mod = name_to_module[name]
-            hook_handles.append(mod.register_forward_pre_hook(make_pre_hook(name)))
-            hook_handles.append(mod.register_forward_hook(make_post_hook(name)))
-
-    warmup_count = 0
-    for imgs, _ in loader:
-        if warmup_count >= warmup:
-            break
-        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
-        sj_func.reset_net(model)
-        with torch.no_grad():
-            _ = model(inp)
-        warmup_count += 1
-    sync()
-
-    batch_count = 0
-    for imgs, _ in loader:
-        if batch_count >= num_batches:
-            break
-        pre_events.clear(); post_events.clear()
-        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
-        sj_func.reset_net(model)
-        with torch.no_grad():
-            _ = model(inp)
-        sync()
-        for name in target_names:
-            if name in pre_events and name in post_events:
-                ms = pre_events[name].elapsed_time(post_events[name])
-                timing[name]["total_ms"] += ms; timing[name]["count"] += 1
-        batch_count += 1
-
-    for h in hook_handles:
-        h.remove()
-    result = {}
-    for name in target_names:
-        t = timing[name]
-        result[name] = t["total_ms"] / t["count"] if t["count"] > 0 else 0.0
-    return result
-
-
-def print_layer_profile(baseline_timing, sparse_timing, targets, e2e_baseline_ms=None,
-                        e2e_sparse_ms=None, label="Sparse"):
-    """Print per-layer timing comparison between baseline and a sparse variant.
-
-    Args:
-        baseline_timing: dict layer_name -> avg ms (dense baseline)
-        sparse_timing:   dict layer_name -> avg ms (sparse variant)
-        targets:         list of target info dicts
-        e2e_baseline_ms: optional end-to-end baseline latency for percentage calc
-        e2e_sparse_ms:   optional end-to-end sparse latency for percentage calc
-        label:           label string for the sparse variant column header
-    """
-    target_names = [t["name"] for t in targets]
-
-    col_sparse = f"{label}(ms)"
-    print(f"\n  {'Layer':<40} {'Base(ms)':>9} {col_sparse:>14} {'Speedup':>8}")
-    print(f"  {'-'*75}")
-    total_base = 0.0; total_sparse = 0.0
-    bucket = defaultdict(lambda: {"count": 0, "base": 0.0, "sparse": 0.0})
-    target_map = {t["name"]: t for t in targets}
-
-    for name in target_names:
-        b = baseline_timing.get(name, 0.0); s = sparse_timing.get(name, 0.0)
-        total_base += b; total_sparse += s
-        sp = f"{b / s:.3f}x" if s > 1e-6 else "inf"
-        short = name if len(name) <= 39 else "..." + name[-36:]
-        print(f"  {short:<40} {b:>9.3f} {s:>14.3f} {sp:>8}")
-        kind = classify_target_type(target_map[name])
-        bucket[kind]["count"] += 1; bucket[kind]["base"] += b; bucket[kind]["sparse"] += s
-
-    print(f"  {'-'*75}")
-    sp = f"{total_base / total_sparse:.3f}x" if total_sparse > 1e-6 else "inf"
-    print(f"  {'[REPLACED TOTAL]':<40} {total_base:>9.3f} {total_sparse:>14.3f} {sp:>8}")
-
-    if e2e_baseline_ms is not None and e2e_baseline_ms > 1e-6:
-        print(f"\n  替换层占 baseline e2e: {100.0 * total_base / e2e_baseline_ms:.2f}%")
-    if e2e_sparse_ms is not None and e2e_sparse_ms > 1e-6:
-        print(f"  替换层占 {label} e2e:   {100.0 * total_sparse / e2e_sparse_ms:.2f}%")
-
-    saved_ms = total_base - total_sparse
-    print(f"  替换层节省: {saved_ms:.3f} ms/batch")
-
-    print(f"\n  {'Bucket':<12} {'Count':>6} {'Base(ms)':>10} {col_sparse:>14} {'Speedup':>8}")
-    print(f"  {'-'*58}")
-    for kind in ["1x1/s1", "1x1/s2", "3x3/s1", "3x3/s2"]:
-        c = bucket[kind]["count"]; b = bucket[kind]["base"]; s = bucket[kind]["sparse"]
-        if c == 0:
-            continue
-        sp = f"{b / s:.3f}x" if s > 1e-6 else "inf"
-        print(f"  {kind:<12} {c:>6} {b:>10.3f} {s:>14.3f} {sp:>8}")
-
-
-def verify_consistency(model_baseline, model_sparse, loader, device, T,
-                       num_batches=5, spike_mode="normalized_bernoulli"):
-    cosine_sum = agree_sum = 0.0; global_max_abs = 0.0; count = 0
-    for imgs, _ in loader:
-        if count >= num_batches:
-            break
-        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
-        sj_func.reset_net(model_baseline)
-        with torch.no_grad():
-            out_base = model_baseline(inp)
-        sj_func.reset_net(model_sparse)
-        with torch.no_grad():
-            out_sparse = model_sparse(inp)
-        if out_base.dim() == 3:
-            out_base = out_base.mean(dim=0)
-        if out_sparse.dim() == 3:
-            out_sparse = out_sparse.mean(dim=0)
-        diff = (out_sparse - out_base).float()
-        max_abs = diff.abs().max().item()
-        global_max_abs = max(global_max_abs, max_abs)
-        flat_s = out_sparse.flatten().float(); flat_b = out_base.flatten().float()
-        if flat_s.norm() < 1e-8 and flat_b.norm() < 1e-8:
-            cos = 1.0
-        elif flat_s.norm() < 1e-8 or flat_b.norm() < 1e-8:
-            cos = 0.0
-        else:
-            cos = F.cosine_similarity(flat_s.unsqueeze(0), flat_b.unsqueeze(0)).item()
-        cosine_sum += cos
-        pred_base = out_base.argmax(dim=-1); pred_sparse = out_sparse.argmax(dim=-1)
         agree_sum += (pred_base == pred_sparse).float().mean().item()
         count += 1
     n = max(count, 1)
@@ -863,7 +450,7 @@ def print_fourway_route_report(targets, sparsity_data, hybrid_decisions=None):
         short = name if len(name) <= 39 else "..." + name[-36:]
         print(f"  {short:<40} {sp:>9.2f}% {sz_route:>24} {sp_route:>24} {hy_route:>24}")
     avg_sparsity = sum(sparsity_values) / max(len(sparsity_values), 1)
-    print(f"  {'[平均]':<40} {avg_sparsity:>9.2f}%")
+    print(f"  {'[骞冲潎]':<40} {avg_sparsity:>9.2f}%")
     return avg_sparsity
 
 
@@ -930,6 +517,143 @@ def build_fourway_models(model_baseline, targets, hybrid_static_zero_layers, hyb
     return model_static_zero_only, model_sparse_only, model_hybrid, counts
 
 
+def _print_core_target_report(targets):
+    print(f"\n  {'Layer':<50} {'Type':<22} {'Spike Source':<38}")
+    print(f"  {'-'*114}")
+    for t in targets:
+        layer = t.conv_name if len(t.conv_name) <= 49 else "..." + t.conv_name[-46:]
+        spike = t.spike_name if len(t.spike_name) <= 37 else "..." + t.spike_name[-34:]
+        print(f"  {layer:<50} {t.op_type:<22} {spike:<38}")
+
+    op_counter = Counter(t.op_type for t in targets)
+    print(f"\n  [Core-AllOps] replaceable layers: {len(targets)}")
+    for op_name, count in sorted(op_counter.items()):
+        print(f"    - {op_name}: {count}")
+
+
+def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
+    print(f"[3/6] Analyze replaceable targets via Core (all operator types) ...")
+    imgs_s, _ = next(iter(loader))
+    sample_input = make_spike_input(imgs_s[:4], args.T, device, spike_mode=args.spike_mode)
+
+    registry = SpikeOpRegistry.default()
+    analyzer = NetworkAnalyzer(registry)
+    targets = analyzer.analyze(model_baseline, sample_input=sample_input)
+
+    if not targets:
+        print("\n  No replaceable layers found by Core analyzer.")
+        return
+    _print_core_target_report(targets)
+
+    print(f"\n[4/6] Build replaced model (Core replacer, all ops enabled) ...")
+    model_replaced = copy.deepcopy(model_baseline)
+    replacer = ModuleReplacer(verbose=True)
+    replaced, sparse_count, fused_count, static_zero_count, dense_keep_count = replacer.replace(
+        model_replaced,
+        targets,
+        block_sizes=None,
+        static_zero_layers=set(),
+        disable_static_zero=True,
+        only_static_zero=False,
+    )
+    print(
+        f"\n  Replacement done: total={replaced}, sparse={sparse_count}, "
+        f"fused={fused_count}, static_zero={static_zero_count}, dense_keep={dense_keep_count}"
+    )
+
+    print(f"\n[5/6] End-to-end latency (warmup={args.warmup}) ...")
+    dense_avg, dense_total, dense_n = measure_e2e_latency(
+        model_baseline,
+        loader,
+        device,
+        args.T,
+        warmup=args.warmup,
+        spike_mode=args.spike_mode,
+    )
+    repl_avg, repl_total, repl_n = measure_e2e_latency(
+        model_replaced,
+        loader,
+        device,
+        args.T,
+        warmup=args.warmup,
+        spike_mode=args.spike_mode,
+    )
+    speedup = dense_avg / repl_avg if repl_avg > 1e-6 else float("inf")
+    dense_energy = (dense_total / 1000.0) * args.power
+    repl_energy = (repl_total / 1000.0) * args.power
+    energy_saving = (1 - repl_energy / max(dense_energy, 1e-9)) * 100.0
+
+    print(f"  Dense:     {dense_avg:.2f} ms/batch (total={dense_total:.1f} ms, {dense_n} batches)")
+    print(f"  Replaced:  {repl_avg:.2f} ms/batch (total={repl_total:.1f} ms, {repl_n} batches)")
+    print(f"  Speedup:   {speedup:.3f}x")
+    print(f"  Energy save (est.): {energy_saving:.2f}%")
+
+    print(f"\n[6/6] Consistency check ({args.verify_batches} batches) ...")
+    avg_cos, avg_agree, max_abs = verify_consistency(
+        model_baseline,
+        model_replaced,
+        loader,
+        device,
+        args.T,
+        num_batches=args.verify_batches,
+        spike_mode=args.spike_mode,
+    )
+    consistency_ok = avg_cos > 0.999 and max_abs < 0.1
+    print(f"  Cosine similarity:  {avg_cos:.8f}")
+    print(f"  Pred agreement:     {avg_agree * 100:.2f}%")
+    print(f"  Max absolute error: {max_abs:.6f}")
+    print(f"  Consistency:        {'PASS' if consistency_ok else 'FAIL'}")
+
+    op_counter = Counter(t.op_type for t in targets)
+    results = {
+        "script_mode": "core_all_ops",
+        "model": args.model,
+        "dataset": args.dataset,
+        "T": args.T,
+        "batch_size": args.batch_size,
+        "gpu": torch.cuda.get_device_name(gpu_id),
+        "weight_init": args.weight_init,
+        "seed": args.seed,
+        "spike_mode": args.spike_mode,
+        "num_targets": len(targets),
+        "op_type_counts": dict(sorted(op_counter.items())),
+        "replace_summary": {
+            "total": replaced,
+            "sparse": sparse_count,
+            "fused": fused_count,
+            "static_zero": static_zero_count,
+            "dense_keep": dense_keep_count,
+        },
+        "dense": {
+            "ms_per_batch": round(dense_avg, 4),
+            "total_ms": round(dense_total, 4),
+            "energy_j": round(dense_energy, 6),
+        },
+        "replaced": {
+            "ms_per_batch": round(repl_avg, 4),
+            "total_ms": round(repl_total, 4),
+            "energy_j": round(repl_energy, 6),
+            "speedup": round(speedup, 6),
+            "energy_saving_pct": round(energy_saving, 4),
+        },
+        "consistency": {
+            "cosine_sim": round(avg_cos, 8),
+            "pred_agreement_pct": round(avg_agree * 100.0, 4),
+            "max_abs_err": round(max_abs, 6),
+            "status": "PASS" if consistency_ok else "FAIL",
+        },
+    }
+
+    out_path = (
+        args.out_json
+        or args.save_json
+        or f"results_core_all_ops_{args.model}_{args.dataset}_T{args.T}_bs{args.batch_size}_{args.weight_init}.json"
+    )
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\n  Result JSON saved: {out_path}")
+
+
 def main():
     global DEVICE
 
@@ -967,7 +691,7 @@ def main():
     parser.add_argument("--max_agr_for_sparse", type=float, default=0.5)
     parser.add_argument("--no_sparse_1x1", action="store_true")
     parser.add_argument("--min_spatial_size", type=int, default=4)
-    # ── NEW: layer-level profiling ──
+    # 鈹€鈹€ NEW: layer-level profiling 鈹€鈹€
     parser.add_argument("--layer_profile", action="store_true",
                         help="Measure per-layer timing for baseline vs each sparse variant")
     parser.add_argument("--layer_profile_warmup", type=int, default=5,
@@ -984,6 +708,15 @@ def main():
                         help="Disable periodic calibration syncs during timing.")
     parser.add_argument("--ab_compare", action="store_true",
                         help="Run both Mode A and Mode B and report comparison.")
+    parser.add_argument(
+        "--replace_all_ops",
+        action="store_true",
+        help=(
+            "Use Core analyzer/replacer to benchmark all currently supported operator "
+            "types (conv1d/conv2d/depthwise/conv3d/linear). "
+            "When enabled, run simplified dense-vs-replaced pipeline."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1021,7 +754,7 @@ def main():
     print(f"  Layer profile: {'ON' if args.layer_profile else 'OFF'}")
     print()
 
-    print(f"[1/7] 构建 {args.model} ...")
+    print(f"[1/7] 鏋勫缓 {args.model} ...")
     if args.dataset == "cifar10":
         num_classes = 10
     elif args.dataset == "cifar100":
@@ -1035,13 +768,17 @@ def main():
         weight_init=args.weight_init, sew_cnf=args.sew_cnf,
         num_classes=num_classes, seed=args.seed)
 
-    print(f"[2/7] 加载 {args.dataset} 测试集 ...")
+    print(f"[2/7] 鍔犺浇 {args.dataset} 娴嬭瘯闆?...")
     ds = build_dataset(args.dataset, args.data_root, spike_mode=args.spike_mode)
     # loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=True)
-    print(f"  测试集: {len(ds)} 张, {len(loader)} batches, {num_classes} classes")
+    print(f"  娴嬭瘯闆? {len(ds)} 寮? {len(loader)} batches, {num_classes} classes")
 
-    print(f"[3/7] 分析网络拓扑 ...")
+    if args.replace_all_ops:
+        run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id)
+        return
+
+    print(f"[3/7] 鍒嗘瀽缃戠粶鎷撴墤 ...")
     imgs_s, _ = next(iter(loader))
     sample_input = make_spike_input(imgs_s[:4], args.T, device, spike_mode=args.spike_mode)
     targets, skipped = analyze_targets(
@@ -1049,14 +786,15 @@ def main():
         min_spatial_size=args.min_spatial_size)
     print_analysis_report(targets, skipped, fused=False)
     if not targets:
-        print("\n  未找到可替换的目标层，退出。"); return
+        print("\n  No replaceable target layers found, exiting.")
+        return
 
-    print(f"\n[4/7] 统计稀疏率与调度特征 ({args.sparsity_batches} batches) ...")
+    print(f"\n[4/7] 缁熻绋€鐤忕巼涓庤皟搴︾壒寰?({args.sparsity_batches} batches) ...")
     sparsity_data = measure_sparsity(
         model_baseline, targets, loader, device, args.T,
         num_batches=args.sparsity_batches, spike_mode=args.spike_mode)
     zero_layers = collect_static_zero_layers(targets, sparsity_data)
-    print(f"\n  检测到 {len(zero_layers)} 个全零输入层。")
+    print(f"\n  Detected {len(zero_layers)} exact-zero-input layers.")
 
     print(f"\n  [Dispatch] Measuring group/tile sparsity for hybrid routing ...")
     _tmp_model = copy.deepcopy(model_baseline)
@@ -1157,12 +895,12 @@ def main():
 
     model_static_zero_only, model_sparse_only, model_hybrid, route_counts = build_fourway_models(
         model_baseline, targets, hybrid_static_zero_layers, hybrid_sparse_set=hybrid_sparse_set)
-    print(f"\n  替换完成:")
+    print(f"\n  鏇挎崲瀹屾垚:")
     for mode_name, rc in route_counts.items():
         print(f"    {mode_name}: {rc['num_sparse_conv']} Sparse + {rc['num_static_zero']} StaticZero + {rc['num_dense_keep']} DenseKeep")
 
 
-    # ── v25: timing preparation ──
+    # 鈹€鈹€ v25: timing preparation 鈹€鈹€
     if args.inference_mode:
         n_so = prepare_for_timing(model_sparse_only)
         n_hy = prepare_for_timing(model_hybrid)
@@ -1179,7 +917,7 @@ def main():
     print(f"  [v25] hybrid sync state: {_hy_state}")
 
 
-    print(f"\n[5/7] 端到端延迟 (warmup={args.warmup}) ...")
+    print(f"\n[5/7] 绔埌绔欢杩?(warmup={args.warmup}) ...")
     dense_res = measure_mode(model_baseline, loader, device, args.T, args.warmup, args.spike_mode, args.power, "Dense cuDNN")
     sz_res = measure_mode(model_static_zero_only, loader, device, args.T, args.warmup, args.spike_mode, args.power, "StaticZero only")
     so_res = measure_mode(model_sparse_only, loader, device, args.T, args.warmup, args.spike_mode, args.power, "SparseConv only")
@@ -1197,16 +935,16 @@ def main():
     print(f"\n  Speedup SZ-only: {sz_speedup:.3f}x  Sparse-only: {so_speedup:.3f}x  Hybrid: {hy_speedup:.3f}x")
     print(f"  Energy  SZ-only: {sz_esave:.2f}%  Sparse-only: {so_esave:.2f}%  Hybrid: {hy_esave:.2f}%")
 
-    # ══════════════════════════════════════════════════════════════════════
-    # [6/7] 逐层加速分析 (Layer-level profiling)
-    # ══════════════════════════════════════════════════════════════════════
+    # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+    # [6/7] 閫愬眰鍔犻€熷垎鏋?(Layer-level profiling)
+    # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
     layer_profile_data = {}
     if args.layer_profile:
         lp_warmup = args.layer_profile_warmup
         lp_batches = args.layer_profile_batches
         target_names = [t["name"] for t in targets]
 
-        print(f"\n[6/7] 逐层加速分析 (warmup={lp_warmup}, batches={lp_batches}) ...")
+        print(f"\n[6/7] 閫愬眰鍔犻€熷垎鏋?(warmup={lp_warmup}, batches={lp_batches}) ...")
 
         # 6a) Baseline (Dense cuDNN) per-layer timing
         print(f"  Measuring baseline (Dense cuDNN) per-layer timing ...")
@@ -1217,7 +955,7 @@ def main():
         # 6b) SparseConv-only per-layer timing
         print(f"  Measuring SparseConv-only per-layer timing ...")
         # For sparse models, the replaced layer names still exist but the module
-        # type is now SparseConv2d / StaticZeroConv2d — hooks work the same way.
+        # type is now SparseConv2d / StaticZeroConv2d 鈥?hooks work the same way.
         sparse_only_layer_timing = measure_layer_timing(
             model_sparse_only, loader, device, args.T, target_names,
             warmup=lp_warmup, num_batches=lp_batches, spike_mode=args.spike_mode)
@@ -1229,18 +967,18 @@ def main():
             warmup=lp_warmup, num_batches=lp_batches, spike_mode=args.spike_mode)
 
         # Print SparseConv-only layer profile
-        print(f"\n  ╔{'═'*77}╗")
-        print(f"  ║{'逐层对比: Dense cuDNN  vs  SparseConv-only':^77}║")
-        print(f"  ╚{'═'*77}╝")
+        print(f"\n  {'=' * 77}")
+        print(f"  {'Per-layer Compare: Dense cuDNN vs SparseConv-only':^77}")
+        print(f"  {'=' * 77}")
         print_layer_profile(baseline_layer_timing, sparse_only_layer_timing, targets,
                             e2e_baseline_ms=dense_res["avg_ms"],
                             e2e_sparse_ms=so_res["avg_ms"],
                             label="SparseOnly")
 
         # Print Hybrid layer profile
-        print(f"\n  ╔{'═'*77}╗")
-        print(f"  ║{'逐层对比: Dense cuDNN  vs  Hybrid (Sparse+StaticZero)':^77}║")
-        print(f"  ╚{'═'*77}╝")
+        print(f"\n  {'=' * 77}")
+        print(f"  {'Per-layer Compare: Dense cuDNN vs Hybrid (Sparse+StaticZero)':^77}")
+        print(f"  {'=' * 77}")
         print_layer_profile(baseline_layer_timing, hybrid_layer_timing, targets,
                             e2e_baseline_ms=dense_res["avg_ms"],
                             e2e_sparse_ms=hy_res["avg_ms"],
@@ -1263,9 +1001,9 @@ def main():
             layer_profile_data["per_layer_speedup_hybrid"][name] = (
                 round(b / s_hy, 4) if s_hy > 1e-6 else float("inf"))
     else:
-        print(f"\n[6/7] 逐层加速分析 ... SKIPPED (use --layer_profile to enable)")
+        print(f"\n[6/7] 閫愬眰鍔犻€熷垎鏋?... SKIPPED (use --layer_profile to enable)")
 
-    print(f"\n[7/7] 一致性验证 ({args.verify_batches} batches) ...")
+    print(f"\n[7/7] 涓€鑷存€ч獙璇?({args.verify_batches} batches) ...")
     sz_cos, sz_agr, sz_mabs = verify_consistency(model_baseline, model_static_zero_only, loader, device, args.T, num_batches=args.verify_batches, spike_mode=args.spike_mode)
     so_cos, so_agr, so_mabs = verify_consistency(model_baseline, model_sparse_only, loader, device, args.T, num_batches=args.verify_batches, spike_mode=args.spike_mode)
     hy_cos, hy_agr, hy_mabs = verify_consistency(model_baseline, model_hybrid, loader, device, args.T, num_batches=args.verify_batches, spike_mode=args.spike_mode)
@@ -1290,7 +1028,7 @@ def main():
     print(f"{'='*96}\n")
 
 
-    # ── v25: A/B tile launch comparison ──
+    # 鈹€鈹€ v25: A/B tile launch comparison 鈹€鈹€
     if args.ab_compare:
         print(f"\n[A/B] Tile launch mode comparison ...")
         prepare_for_timing(model_sparse_only)
@@ -1335,7 +1073,7 @@ def main():
         "sparse_only": {"ms_per_batch": round(so_res["avg_ms"], 2), "speedup": round(so_speedup, 4), "energy_saving_pct": round(so_esave, 2), "cosine_sim": round(so_cos, 8), "consistency": "PASS" if so_ok else "FAIL"},
         "hybrid": {"ms_per_batch": round(hy_res["avg_ms"], 2), "speedup": round(hy_speedup, 4), "energy_saving_pct": round(hy_esave, 2), "cosine_sim": round(hy_cos, 8), "consistency": "PASS" if hy_ok else "FAIL"},
     }
-    # ── NEW: include layer profile data in JSON ──
+    # 鈹€鈹€ NEW: include layer profile data in JSON 鈹€鈹€
     if layer_profile_data:
         results["layer_profile"] = layer_profile_data
 
@@ -1376,16 +1114,16 @@ def main():
                     sparse_total_ms=gd.get('sparse_total_ms', -1.0))
         if args.diag_json:
             layer_logger.save_json(args.diag_json)
-            print(f"  诊断 JSON: {args.diag_json}")
+            print(f"  璇婃柇 JSON: {args.diag_json}")
         if args.diag_csv:
             layer_logger.save_csv(args.diag_csv)
-            print(f"  诊断 CSV: {args.diag_csv}")
+            print(f"  璇婃柇 CSV: {args.diag_csv}")
         layer_logger.print_summary()
 
     out_path = args.out_json or args.save_json or f"results_fourway_{args.model}_{args.dataset}_T{args.T}_bs{args.batch_size}_{args.weight_init}.json"
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"  结果: {out_path}")
+    print(f"  缁撴灉: {out_path}")
 
 
 if __name__ == "__main__":

@@ -1,11 +1,11 @@
 """
-SparseFlow Utils/sparse_helpers.py — Shared prescan & metadata helpers
+SparseFlow Utils/sparse_helpers.py 鈥?Shared prescan & metadata helpers
 
 Minimal shared code factored out from the row-geometry prescan pattern
 used by Linear, Matmul, and BMM kernels.  Conv2d has its own spatial
 prescan and does NOT use this module.
 
-This file must remain small and stable — it is a leaf dependency.
+This file must remain small and stable 鈥?it is a leaf dependency.
 """
 
 import torch
@@ -106,9 +106,10 @@ def _prescan_rows_kernel(
     row_start = tile_id * BLOCK_M
     rows = row_start + tl.arange(0, BLOCK_M)
     row_mask = rows < M
+    off1 = tl.arange(0, 1)
 
-    ag_mask = tl.zeros([], dtype=tl.int32)
-    any_nonzero = tl.zeros([], dtype=tl.int32)
+    ag_mask = tl.zeros([1], dtype=tl.int32)
+    any_nonzero = tl.zeros([1], dtype=tl.int32)
 
     for g in range(NUM_GROUPS):
         col_start = g * GROUP_SIZE_C
@@ -119,21 +120,19 @@ def _prescan_rows_kernel(
         mask = row_mask[:, None] & col_mask[None, :]
         vals = tl.load(x_ptr + addrs, mask=mask, other=0.0)
 
-        has_nonzero = tl.sum(tl.abs(vals) > THRESHOLD) > 0
-        if has_nonzero:
-            ag_mask = ag_mask | (1 << g)
-            any_nonzero = 1
+        has_nonzero = (tl.sum((tl.abs(vals) > THRESHOLD).to(tl.int32), axis=0) > 0).to(tl.int32)
+        ag_mask = ag_mask + has_nonzero * (1 << g)
+        any_nonzero = tl.maximum(any_nonzero, has_nonzero)
 
-    tl.store(ag_mask_ptr + tile_id, ag_mask)
+    tl.store(ag_mask_ptr + tile_id + off1, ag_mask)
 
-    # classify
-    cls = TILE_ZERO  # 0
-    if any_nonzero != 0:
-        if ag_mask == ALL_ONES:
-            cls = TILE_DENSEISH  # 2
+    if tl.sum(any_nonzero) == 0:
+        tl.store(tile_class_ptr + tile_id + off1, tl.zeros([1], dtype=tl.int32))
+    else:
+        if tl.sum(ag_mask == ALL_ONES) > 0:
+            tl.store(tile_class_ptr + tile_id + off1, tl.full([1], TILE_DENSEISH, dtype=tl.int32))
         else:
-            cls = TILE_SPARSE    # 1
-    tl.store(tile_class_ptr + tile_id, cls)
+            tl.store(tile_class_ptr + tile_id + off1, tl.full([1], TILE_SPARSE, dtype=tl.int32))
 
 
 def build_row_metadata(
