@@ -7,7 +7,7 @@ with minimal runtime overhead.
 Design principles:
   1. Output = bias-only constant tensor (exact, not heuristic)
   2. Template caching by (device, dtype, H_out, W_out, bias_version)
-  3. expand() for batch dimension — no allocation, no copy
+  3. Write-safe output tensor for downstream in-place ops
   4. Unified diagnostics: zero_reason, backend_family, diag_path
 
 Zero backend family covers:
@@ -15,7 +15,7 @@ Zero backend family covers:
   - zero_fastpath (SparseConv2d runtime zero detection)
   - exact zero propagation (model-level zero flow)
 
-All share the same output construction: cached bias-only template + expand().
+All share the same output construction: cached bias-only template + write-safe batch materialization.
 """
 
 import math
@@ -127,15 +127,18 @@ class StaticZeroConv2d(nn.Module):
             B, _, H, W = x.shape
             H_out, W_out = self._output_hw(H, W)
             tpl = self._get_template(x.device, torch.float32, H_out, W_out)
-            # expand() shares memory — no allocation for batch dimension
-            return tpl.expand(B, -1, -1, -1)
+            # Materialize to avoid shared-storage aliasing from expand().
+            # Some backbones use in-place residual adds (e.g., out += identity),
+            # which require a writable tensor with unique storage.
+            return tpl.expand(B, -1, -1, -1).clone()
 
         elif x.dim() == 5:
             T, B, _, H, W = x.shape
             H_out, W_out = self._output_hw(H, W)
             tpl = self._get_template(x.device, torch.float32, H_out, W_out)
-            # expand to [T*B, ...] then reshape to [T, B, ...]
-            return tpl.expand(T * B, -1, -1, -1).reshape(T, B, self.out_channels, H_out, W_out)
+            # Materialize to avoid shared-storage aliasing from expand().
+            y4d = tpl.expand(T * B, -1, -1, -1).clone()
+            return y4d.reshape(T, B, self.out_channels, H_out, W_out)
 
         else:
             raise ValueError(f"Expected 4D or 5D input, got {x.dim()}D")
@@ -181,8 +184,8 @@ def make_zero_conv_output(
     """
     if bias is not None:
         b = bias.detach().to(device=device, dtype=dtype)
-        # [1, C, 1, 1] → expand to [B, C, H, W]
-        return b.view(1, -1, 1, 1).expand(batch_size, out_channels, H_out, W_out)
+        # Return a write-safe tensor (no shared-storage aliasing across batch).
+        return b.view(1, -1, 1, 1).expand(batch_size, out_channels, H_out, W_out).clone()
     else:
         return torch.zeros(batch_size, out_channels, H_out, W_out, dtype=dtype, device=device)
 

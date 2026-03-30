@@ -44,6 +44,7 @@ class ModuleReplacer:
         static_zero_layers: Optional[Set[str]] = None,
         disable_static_zero: bool = False,
         only_static_zero: bool = False,
+        enable_fused_conv_lif: bool = False,
     ) -> Tuple[int, int, int, int, int]:
         if static_zero_layers is None:
             static_zero_layers = set()
@@ -97,7 +98,11 @@ class ModuleReplacer:
                     print(f"  [KEEP   ] {module_name} ({op}) -> DenseKeep")
                 continue
 
-            new_module = self._create_sparse_module(target, block)
+            new_module = self._create_sparse_module(
+                target,
+                block,
+                enable_fused_conv_lif=enable_fused_conv_lif,
+            )
             if new_module is None:
                 dense_keep_count += 1
                 if self.verbose:
@@ -108,6 +113,8 @@ class ModuleReplacer:
             replaced += 1
 
             actually_fused = (
+                enable_fused_conv_lif
+                and
                 op in ("fused_conv3x3_lif", "fused_conv1x1_lif", "fused_conv3x3s2_lif")
                 and _eligible_direct_fusion_conv_name(module_name)
                 and target.lif_module is not None
@@ -132,7 +139,12 @@ class ModuleReplacer:
 
         return replaced, sparse_count, fused_count, static_zero_count, dense_keep_count
 
-    def _create_sparse_module(self, target: ReplacementTarget, block: Optional[int]) -> Optional[nn.Module]:
+    def _create_sparse_module(
+        self,
+        target: ReplacementTarget,
+        block: Optional[int],
+        enable_fused_conv_lif: bool = False,
+    ) -> Optional[nn.Module]:
         op = target.op_type
         mod = target.conv_module
 
@@ -147,6 +159,9 @@ class ModuleReplacer:
             return sparse.to(mod.weight.device)
 
         if op in ("fused_conv3x3_lif", "fused_conv1x1_lif", "fused_conv3x3s2_lif"):
+            if not enable_fused_conv_lif:
+                sparse = SparseConv2d.from_dense(mod, block_size=block)
+                return sparse.to(mod.weight.device)
             if target.lif_module is None:
                 sparse = SparseConv2d.from_dense(mod, block_size=block)
                 return sparse.to(mod.weight.device)
@@ -209,6 +224,10 @@ class ModuleReplacer:
             fused_with = target.lif_name or "?"
             extra = f", BN={target.bn_name}" if target.bn_name else ""
             print(f"  [FUSE   ] {target.conv_name} ({op}) + {fused_with}{extra} <- {target.spike_name}, {info}")
+            return
+        if "fused" in op and not actually_fused:
+            info = display_block_info(target)
+            print(f"  [REPLACE] {target.conv_name} ({op}, fusion=OFF) <- {target.spike_name}, {info}")
             return
 
         if op == "conv1d":

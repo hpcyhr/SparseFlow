@@ -23,6 +23,7 @@ from spikingjelly.activation_based.model import sew_resnet, spiking_resnet, spik
 from Core.analyzer import NetworkAnalyzer
 from Core.registry import SpikeOpRegistry
 from Core.replacer import ModuleReplacer
+from Models.spikformer_github import MODEL_BUILDERS as EXTERNAL_MODEL_BUILDERS
 
 
 def _discover_model_builders():
@@ -39,6 +40,8 @@ def _discover_model_builders():
             fn = getattr(mod, attr_name)
             if callable(fn):
                 builders[attr_name] = fn
+    for name, fn in EXTERNAL_MODEL_BUILDERS.items():
+        builders[name] = fn
     return builders
 
 
@@ -70,7 +73,7 @@ def set_random_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def build_model(model_name, device, v_threshold=1.0, weight_init="random", sew_cnf=None, num_classes=None, seed=42):
+def build_model(model_name, device, v_threshold=1.0, weight_init="random", sew_cnf=None, T=None, num_classes=None, seed=42):
     builder = MODEL_BUILDERS[model_name]
     use_pretrained = (weight_init == "pretrained")
     builder_kwargs = {
@@ -80,6 +83,7 @@ def build_model(model_name, device, v_threshold=1.0, weight_init="random", sew_c
         "v_threshold": v_threshold,
         "num_classes": num_classes,
         "cnf": sew_cnf,
+        "T": T,
     }
     filtered = _filter_builder_kwargs(builder, builder_kwargs)
     set_random_seed(seed)
@@ -198,6 +202,8 @@ def main():
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--max_batches", type=int, default=0, help="0 means all test batches")
     parser.add_argument("--verify_batches", type=int, default=10)
+    parser.add_argument("--core_only_linear", action="store_true",
+                        help="Replace only nn.Linear targets after Core analysis.")
     parser.add_argument("--spike_mode", type=str, default="normalized_bernoulli",
                         choices=["normalized_bernoulli", "raw_bernoulli", "raw_repeat"])
     parser.add_argument("--gpu", type=int, default=0)
@@ -218,6 +224,7 @@ def main():
         v_threshold=args.v_threshold,
         weight_init=args.weight_init,
         sew_cnf=args.sew_cnf,
+        T=args.T,
         num_classes=num_classes,
         seed=args.seed,
     )
@@ -241,6 +248,14 @@ def main():
     if not targets:
         print("No replaceable layers found.")
         return
+
+    if args.core_only_linear:
+        linear_targets = [t for t in targets if t.op_type == "linear"]
+        print(f"  Linear-only filter: {len(linear_targets)}/{len(targets)} targets kept")
+        targets = linear_targets
+        if not targets:
+            print("No linear targets found after filtering.")
+            return
 
     op_counter = Counter(t.op_type for t in targets)
     print(f"  Replaceable layers: {len(targets)}")

@@ -35,6 +35,7 @@ from Utils.timing_utils import prepare_for_timing, set_launch_mode, count_sync_s
 from Core.registry import SpikeOpRegistry
 from Core.analyzer import NetworkAnalyzer
 from Core.replacer import ModuleReplacer
+from Models.spikformer_github import MODEL_BUILDERS as EXTERNAL_MODEL_BUILDERS
 
 
 DEVICE = None
@@ -76,6 +77,10 @@ def _discover_model_builders():
                 continue
             builders[attr_name] = fn
             metadata[attr_name] = {"family": family, "module": mod}
+
+    for name, fn in EXTERNAL_MODEL_BUILDERS.items():
+        builders[name] = fn
+        metadata[name] = {"family": "external_transformer", "module": "Models.spikformer_github"}
     return builders, metadata
 
 
@@ -83,7 +88,7 @@ MODEL_BUILDERS, MODEL_META = _discover_model_builders()
 
 
 def print_supported_models():
-    print("\n鏀寔鐨勬ā鍨?")
+    print("\nSupported models:")
     for name in MODEL_BUILDERS:
         print(f"  {name}")
     print()
@@ -137,6 +142,7 @@ def reinitialize_model_weights(model):
 
 
 def build_model(model_name, device, v_threshold=1.0, weight_init="random", sew_cnf=None,
+                T=None,
                 num_classes=None, seed=None):
     if weight_init not in ("random", "pretrained"):
         raise ValueError(f"Unknown weight_init: {weight_init}")
@@ -155,6 +161,10 @@ def build_model(model_name, device, v_threshold=1.0, weight_init="random", sew_c
         "num_classes": num_classes,
         "cnf": sew_cnf,
     }
+    # Only external transformer builders consume T at model-construction time.
+    meta = MODEL_META.get(model_name, {})
+    if meta.get("family") == "external_transformer":
+        builder_kwargs["T"] = T
     filtered = _filter_builder_kwargs(builder, builder_kwargs)
     set_random_seed(seed)
     model = builder(**filtered)
@@ -194,7 +204,7 @@ class FlatImageFolderDataset(Dataset):
         if self.transform is not None:
             img = self.transform(img)
 
-        # 杩欓噷鍙仛鎺ㄧ悊鎬ц兘娴嬭瘯锛屾墍浠ユ爣绛剧粰 dummy=0 鍗冲彲
+        # Benchmark-only dataset: label is a dummy value.
         return img, 0
 
 def build_dataset(dataset_name, data_root, spike_mode="normalized_bernoulli"):
@@ -793,12 +803,12 @@ def print_layer_profile(baseline_timing, sparse_timing, targets, e2e_baseline_ms
     print(f"  {'[REPLACED TOTAL]':<40} {total_base:>9.3f} {total_sparse:>14.3f} {sp:>8}")
 
     if e2e_baseline_ms is not None and e2e_baseline_ms > 1e-6:
-        print(f"\n  鏇挎崲灞傚崰 baseline e2e: {100.0 * total_base / e2e_baseline_ms:.2f}%")
+        print(f"\n  Replaced layers / baseline e2e: {100.0 * total_base / e2e_baseline_ms:.2f}%")
     if e2e_sparse_ms is not None and e2e_sparse_ms > 1e-6:
-        print(f"  鏇挎崲灞傚崰 {label} e2e:   {100.0 * total_sparse / e2e_sparse_ms:.2f}%")
+        print(f"  Replaced layers / {label} e2e:   {100.0 * total_sparse / e2e_sparse_ms:.2f}%")
 
     saved_ms = total_base - total_sparse
-    print(f"  鏇挎崲灞傝妭鐪? {saved_ms:.3f} ms/batch")
+    print(f"  Replaced-layer saved latency: {saved_ms:.3f} ms/batch")
 
     print(f"\n  {'Bucket':<12} {'Count':>6} {'Base(ms)':>10} {col_sparse:>14} {'Speedup':>8}")
     print(f"  {'-'*58}")
@@ -870,7 +880,7 @@ def print_fourway_route_report(targets, sparsity_data, hybrid_decisions=None):
         short = name if len(name) <= 39 else "..." + name[-36:]
         print(f"  {short:<40} {sp:>9.2f}% {sz_route:>24} {sp_route:>24} {hy_route:>24}")
     avg_sparsity = sum(sparsity_values) / max(len(sparsity_values), 1)
-    print(f"  {'[骞冲潎]':<40} {avg_sparsity:>9.2f}%")
+    print(f"  {'[AVG]':<40} {avg_sparsity:>9.2f}%")
     return avg_sparsity
 
 
@@ -951,8 +961,79 @@ def _print_core_target_report(targets):
         print(f"    - {op_name}: {count}")
 
 
+_CORE_STATICZERO_ELIGIBLE_OPS = {
+    "conv2d_3x3",
+    "conv2d_1x1",
+    "conv2d_3x3_s2",
+    "depthwise_conv2d",
+    "fused_conv3x3_lif",
+    "fused_conv1x1_lif",
+    "fused_conv3x3s2_lif",
+}
+
+
+def _is_core_staticzero_eligible(target):
+    return getattr(target, "op_type", "") in _CORE_STATICZERO_ELIGIBLE_OPS
+
+
+def measure_sparsity_core(
+    model,
+    targets,
+    loader,
+    device,
+    T,
+    num_batches=10,
+    spike_mode="normalized_bernoulli",
+):
+    target_names = [t.conv_name for t in targets]
+    sparsity_data = {name: {"zeros": 0, "total": 0} for name in target_names}
+
+    def make_hook(name):
+        def hook(m, inp, out):
+            if not isinstance(inp, (tuple, list)) or len(inp) == 0:
+                return
+            x = inp[0]
+            if not isinstance(x, torch.Tensor):
+                return
+            with torch.no_grad():
+                x = x.detach()
+                sparsity_data[name]["zeros"] += (x.abs() <= 1e-6).sum().item()
+                sparsity_data[name]["total"] += x.numel()
+        return hook
+
+    hook_handles = []
+    for name in target_names:
+        m = _get_module_by_name(model, name)
+        hook_handles.append(m.register_forward_hook(make_hook(name)))
+
+    batch_count = 0
+    for imgs, _ in loader:
+        if batch_count >= num_batches:
+            break
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        sj_func.reset_net(model)
+        with torch.no_grad():
+            _ = model(inp)
+        batch_count += 1
+
+    for h in hook_handles:
+        h.remove()
+    return sparsity_data
+
+
+def collect_core_static_zero_layers(targets, sparsity_data):
+    zero_layers = set()
+    for t in targets:
+        if not _is_core_staticzero_eligible(t):
+            continue
+        sd = sparsity_data.get(t.conv_name, {"zeros": 0, "total": 0})
+        if sd["total"] > 0 and sd["zeros"] == sd["total"]:
+            zero_layers.add(t.conv_name)
+    return zero_layers
+
+
 def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
-    print(f"[3/6] Analyze replaceable targets via Core (all operator types) ...")
+    print(f"[3/7] Analyze replaceable targets via Core (all operator types) ...")
     imgs_s, _ = next(iter(loader))
     sample_input = make_spike_input(imgs_s[:4], args.T, device, spike_mode=args.spike_mode)
 
@@ -963,70 +1044,163 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
     if not targets:
         print("\n  No replaceable layers found by Core analyzer.")
         return
-    _print_core_target_report(targets)
 
-    print(f"\n[4/6] Build replaced model (Core replacer, all ops enabled) ...")
-    model_replaced = copy.deepcopy(model_baseline)
+    if args.core_only_linear:
+        linear_targets = [t for t in targets if t.op_type == "linear"]
+        print(
+            f"  [Core-AllOps] linear-only filter enabled: "
+            f"{len(linear_targets)}/{len(targets)} targets kept"
+        )
+        targets = linear_targets
+        if not targets:
+            print("  No linear targets found after filtering.")
+            return
+
+    _print_core_target_report(targets)
+    if not args.fuse_conv_lif:
+        print(
+            "  [Note] 'fused_conv*' in the table is analyzer target type; "
+            "actual replacement uses non-fused sparse conv when --fuse_conv_lif is OFF."
+        )
+    op_counter = Counter(t.op_type for t in targets)
+
+    print(
+        f"\n[4/7] Measure static-zero candidates ({args.sparsity_batches} batches) ..."
+    )
+    sparsity_data = measure_sparsity_core(
+        model_baseline,
+        targets,
+        loader,
+        device,
+        args.T,
+        num_batches=args.sparsity_batches,
+        spike_mode=args.spike_mode,
+    )
+    zero_layers = collect_core_static_zero_layers(targets, sparsity_data)
+    eligible_staticzero = sum(1 for t in targets if _is_core_staticzero_eligible(t))
+    print(
+        f"  StaticZero eligible targets: {eligible_staticzero}/{len(targets)}, "
+        f"exact-zero detected: {len(zero_layers)}"
+    )
+
+    print(
+        f"\n[5/7] Build 4 benchmark modes (Core replacer, all ops enabled, "
+        f"fuse_conv_lif={'ON' if args.fuse_conv_lif else 'OFF'}) ..."
+    )
     replacer = ModuleReplacer(verbose=True)
-    replaced, sparse_count, fused_count, static_zero_count, dense_keep_count = replacer.replace(
-        model_replaced,
+
+    print("  - Building StaticZero only ...")
+    model_staticzero = copy.deepcopy(model_baseline)
+    sz_summary = replacer.replace(
+        model_staticzero,
+        targets,
+        block_sizes=None,
+        static_zero_layers=set(zero_layers),
+        disable_static_zero=False,
+        only_static_zero=True,
+        enable_fused_conv_lif=args.fuse_conv_lif,
+    )
+
+    print("  - Building SparseKernel only ...")
+    model_sparse = copy.deepcopy(model_baseline)
+    so_summary = replacer.replace(
+        model_sparse,
         targets,
         block_sizes=None,
         static_zero_layers=set(),
         disable_static_zero=True,
         only_static_zero=False,
-    )
-    print(
-        f"\n  Replacement done: total={replaced}, sparse={sparse_count}, "
-        f"fused={fused_count}, static_zero={static_zero_count}, dense_keep={dense_keep_count}"
+        enable_fused_conv_lif=args.fuse_conv_lif,
     )
 
-    print(f"\n[5/6] End-to-end latency (warmup={args.warmup}) ...")
-    dense_avg, dense_total, dense_n = measure_e2e_latency(
-        model_baseline,
-        loader,
-        device,
-        args.T,
-        warmup=args.warmup,
-        spike_mode=args.spike_mode,
+    print("  - Building SparseKernel + StaticZero ...")
+    model_hybrid = copy.deepcopy(model_baseline)
+    hy_summary = replacer.replace(
+        model_hybrid,
+        targets,
+        block_sizes=None,
+        static_zero_layers=set(zero_layers),
+        disable_static_zero=False,
+        only_static_zero=False,
+        enable_fused_conv_lif=args.fuse_conv_lif,
     )
-    repl_avg, repl_total, repl_n = measure_e2e_latency(
-        model_replaced,
-        loader,
-        device,
-        args.T,
-        warmup=args.warmup,
-        spike_mode=args.spike_mode,
+
+    route_counts = {
+        "static_zero_only": {
+            "total": sz_summary[0], "sparse": sz_summary[1], "fused": sz_summary[2],
+            "static_zero": sz_summary[3], "dense_keep": sz_summary[4],
+        },
+        "sparse_only": {
+            "total": so_summary[0], "sparse": so_summary[1], "fused": so_summary[2],
+            "static_zero": so_summary[3], "dense_keep": so_summary[4],
+        },
+        "hybrid": {
+            "total": hy_summary[0], "sparse": hy_summary[1], "fused": hy_summary[2],
+            "static_zero": hy_summary[3], "dense_keep": hy_summary[4],
+        },
+    }
+    print("\n  Replacement summary:")
+    for mode_name, c in route_counts.items():
+        print(
+            f"    {mode_name}: total={c['total']}, sparse={c['sparse']}, "
+            f"fused={c['fused']}, static_zero={c['static_zero']}, dense_keep={c['dense_keep']}"
+        )
+
+    print(f"\n[6/7] End-to-end latency (warmup={args.warmup}) ...")
+    dense_res = measure_mode(model_baseline, loader, device, args.T, args.warmup, args.spike_mode, args.power, "Dense cuDNN")
+    sz_res = measure_mode(model_staticzero, loader, device, args.T, args.warmup, args.spike_mode, args.power, "StaticZero only")
+    so_res = measure_mode(model_sparse, loader, device, args.T, args.warmup, args.spike_mode, args.power, "SparseKernel only")
+    hy_res = measure_mode(model_hybrid, loader, device, args.T, args.warmup, args.spike_mode, args.power, "SparseKernel + StaticZero")
+    for r in [dense_res, sz_res, so_res, hy_res]:
+        print_mode_result(r)
+
+    sz_speedup = dense_res["avg_ms"] / sz_res["avg_ms"] if sz_res["avg_ms"] > 1e-6 else float("inf")
+    so_speedup = dense_res["avg_ms"] / so_res["avg_ms"] if so_res["avg_ms"] > 1e-6 else float("inf")
+    hy_speedup = dense_res["avg_ms"] / hy_res["avg_ms"] if hy_res["avg_ms"] > 1e-6 else float("inf")
+    sz_esave = (1 - sz_res["energy_j"] / max(dense_res["energy_j"], 1e-9)) * 100.0
+    so_esave = (1 - so_res["energy_j"] / max(dense_res["energy_j"], 1e-9)) * 100.0
+    hy_esave = (1 - hy_res["energy_j"] / max(dense_res["energy_j"], 1e-9)) * 100.0
+
+    print(f"\n  Speedup StaticZero-only: {sz_speedup:.3f}x")
+    print(f"  Speedup Sparse-only:     {so_speedup:.3f}x")
+    print(f"  Speedup Hybrid:          {hy_speedup:.3f}x")
+
+    print(f"\n[7/7] Consistency check ({args.verify_batches} batches) ...")
+    sz_cos, sz_agr, sz_mabs = verify_consistency(
+        model_baseline, model_staticzero, loader, device, args.T,
+        num_batches=args.verify_batches, spike_mode=args.spike_mode
     )
-    speedup = dense_avg / repl_avg if repl_avg > 1e-6 else float("inf")
-    dense_energy = (dense_total / 1000.0) * args.power
-    repl_energy = (repl_total / 1000.0) * args.power
-    energy_saving = (1 - repl_energy / max(dense_energy, 1e-9)) * 100.0
-
-    print(f"  Dense:     {dense_avg:.2f} ms/batch (total={dense_total:.1f} ms, {dense_n} batches)")
-    print(f"  Replaced:  {repl_avg:.2f} ms/batch (total={repl_total:.1f} ms, {repl_n} batches)")
-    print(f"  Speedup:   {speedup:.3f}x")
-    print(f"  Energy save (est.): {energy_saving:.2f}%")
-
-    print(f"\n[6/6] Consistency check ({args.verify_batches} batches) ...")
-    avg_cos, avg_agree, max_abs = verify_consistency(
-        model_baseline,
-        model_replaced,
-        loader,
-        device,
-        args.T,
-        num_batches=args.verify_batches,
-        spike_mode=args.spike_mode,
+    so_cos, so_agr, so_mabs = verify_consistency(
+        model_baseline, model_sparse, loader, device, args.T,
+        num_batches=args.verify_batches, spike_mode=args.spike_mode
     )
-    consistency_ok = avg_cos > 0.999 and max_abs < 0.1
-    print(f"  Cosine similarity:  {avg_cos:.8f}")
-    print(f"  Pred agreement:     {avg_agree * 100:.2f}%")
-    print(f"  Max absolute error: {max_abs:.6f}")
-    print(f"  Consistency:        {'PASS' if consistency_ok else 'FAIL'}")
+    hy_cos, hy_agr, hy_mabs = verify_consistency(
+        model_baseline, model_hybrid, loader, device, args.T,
+        num_batches=args.verify_batches, spike_mode=args.spike_mode
+    )
+    sz_ok = sz_cos > 0.999 and sz_mabs < 0.1
+    so_ok = so_cos > 0.999 and so_mabs < 0.1
+    hy_ok = hy_cos > 0.999 and hy_mabs < 0.1
+    print(f"  StaticZero-only: cos={sz_cos:.8f}  agree={sz_agr*100:.2f}%  max_abs={sz_mabs:.6f}  {'PASS' if sz_ok else 'FAIL'}")
+    print(f"  Sparse-only:     cos={so_cos:.8f}  agree={so_agr*100:.2f}%  max_abs={so_mabs:.6f}  {'PASS' if so_ok else 'FAIL'}")
+    print(f"  Hybrid:          cos={hy_cos:.8f}  agree={hy_agr*100:.2f}%  max_abs={hy_mabs:.6f}  {'PASS' if hy_ok else 'FAIL'}")
 
-    op_counter = Counter(t.op_type for t in targets)
+    print(f"\n{'='*96}")
+    print(f"{'FOUR-WAY SUMMARY (Core All Ops)':^96}")
+    print(f"{'='*96}")
+    print(f"  Model: {args.model}  Dataset: {args.dataset}  T={args.T}  Spike: {args.spike_mode}")
+    print(f"  Targets: {len(targets)}  StaticZero exact-zero layers: {len(zero_layers)}")
+    print(f"  Fuse Conv+LIF: {'ON' if args.fuse_conv_lif else 'OFF'}")
+    print(f"\n  {'Mode':<28} {'Latency(ms)':>12} {'Speedup':>10} {'EnergySave':>12} {'Consistency':>12}")
+    print(f"  {'-'*80}")
+    print(f"  {'Dense cuDNN':<28} {dense_res['avg_ms']:>12.2f} {'1.000x':>10} {'0.00%':>12} {'REF':>12}")
+    print(f"  {'StaticZero only':<28} {sz_res['avg_ms']:>12.2f} {sz_speedup:>9.3f}x {sz_esave:>11.2f}% {('PASS' if sz_ok else 'FAIL'):>12}")
+    print(f"  {'SparseKernel only':<28} {so_res['avg_ms']:>12.2f} {so_speedup:>9.3f}x {so_esave:>11.2f}% {('PASS' if so_ok else 'FAIL'):>12}")
+    print(f"  {'SparseKernel + StaticZero':<28} {hy_res['avg_ms']:>12.2f} {hy_speedup:>9.3f}x {hy_esave:>11.2f}% {('PASS' if hy_ok else 'FAIL'):>12}")
+    print(f"{'='*96}\n")
+
     results = {
-        "script_mode": "core_all_ops",
+        "script_mode": "core_all_ops_four_way",
         "model": args.model,
         "dataset": args.dataset,
         "T": args.T,
@@ -1035,32 +1209,51 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
         "weight_init": args.weight_init,
         "seed": args.seed,
         "spike_mode": args.spike_mode,
+        "fuse_conv_lif": bool(args.fuse_conv_lif),
+        "core_only_linear": bool(args.core_only_linear),
         "num_targets": len(targets),
         "op_type_counts": dict(sorted(op_counter.items())),
-        "replace_summary": {
-            "total": replaced,
-            "sparse": sparse_count,
-            "fused": fused_count,
-            "static_zero": static_zero_count,
-            "dense_keep": dense_keep_count,
-        },
+        "num_staticzero_eligible": eligible_staticzero,
+        "num_staticzero_exact_zero": len(zero_layers),
+        "static_zero_layers": sorted(list(zero_layers)),
+        "route_counts": route_counts,
         "dense": {
-            "ms_per_batch": round(dense_avg, 4),
-            "total_ms": round(dense_total, 4),
-            "energy_j": round(dense_energy, 6),
+            "ms_per_batch": round(dense_res["avg_ms"], 4),
+            "total_ms": round(dense_res["total_ms"], 4),
+            "energy_j": round(dense_res["energy_j"], 6),
         },
-        "replaced": {
-            "ms_per_batch": round(repl_avg, 4),
-            "total_ms": round(repl_total, 4),
-            "energy_j": round(repl_energy, 6),
-            "speedup": round(speedup, 6),
-            "energy_saving_pct": round(energy_saving, 4),
+        "static_zero_only": {
+            "ms_per_batch": round(sz_res["avg_ms"], 4),
+            "total_ms": round(sz_res["total_ms"], 4),
+            "energy_j": round(sz_res["energy_j"], 6),
+            "speedup": round(sz_speedup, 6),
+            "energy_saving_pct": round(sz_esave, 4),
+            "cosine_sim": round(sz_cos, 8),
+            "pred_agreement_pct": round(sz_agr * 100.0, 4),
+            "max_abs_err": round(sz_mabs, 6),
+            "consistency": "PASS" if sz_ok else "FAIL",
         },
-        "consistency": {
-            "cosine_sim": round(avg_cos, 8),
-            "pred_agreement_pct": round(avg_agree * 100.0, 4),
-            "max_abs_err": round(max_abs, 6),
-            "status": "PASS" if consistency_ok else "FAIL",
+        "sparse_only": {
+            "ms_per_batch": round(so_res["avg_ms"], 4),
+            "total_ms": round(so_res["total_ms"], 4),
+            "energy_j": round(so_res["energy_j"], 6),
+            "speedup": round(so_speedup, 6),
+            "energy_saving_pct": round(so_esave, 4),
+            "cosine_sim": round(so_cos, 8),
+            "pred_agreement_pct": round(so_agr * 100.0, 4),
+            "max_abs_err": round(so_mabs, 6),
+            "consistency": "PASS" if so_ok else "FAIL",
+        },
+        "hybrid": {
+            "ms_per_batch": round(hy_res["avg_ms"], 4),
+            "total_ms": round(hy_res["total_ms"], 4),
+            "energy_j": round(hy_res["energy_j"], 6),
+            "speedup": round(hy_speedup, 6),
+            "energy_saving_pct": round(hy_esave, 4),
+            "cosine_sim": round(hy_cos, 8),
+            "pred_agreement_pct": round(hy_agr * 100.0, 4),
+            "max_abs_err": round(hy_mabs, 6),
+            "consistency": "PASS" if hy_ok else "FAIL",
         },
     }
 
@@ -1111,7 +1304,7 @@ def main():
     parser.add_argument("--max_agr_for_sparse", type=float, default=0.5)
     parser.add_argument("--no_sparse_1x1", action="store_true")
     parser.add_argument("--min_spatial_size", type=int, default=4)
-    # 鈹€鈹€ NEW: layer-level profiling 鈹€鈹€
+    # NEW: layer-level profiling
     parser.add_argument("--layer_profile", action="store_true",
                         help="Measure per-layer timing for baseline vs each sparse variant")
     parser.add_argument("--layer_profile_warmup", type=int, default=5,
@@ -1136,6 +1329,16 @@ def main():
             "types (conv1d/conv2d/depthwise/conv3d/linear). "
             "When enabled, run simplified dense-vs-replaced pipeline."
         ),
+    )
+    parser.add_argument(
+        "--core_only_linear",
+        action="store_true",
+        help="When --replace_all_ops is enabled, replace only nn.Linear targets.",
+    )
+    parser.add_argument(
+        "--fuse_conv_lif",
+        action="store_true",
+        help="Enable Conv2d+LIF fused replacement in Core pipeline (default: disabled).",
     )
 
     args = parser.parse_args()
@@ -1174,7 +1377,7 @@ def main():
     print(f"  Layer profile: {'ON' if args.layer_profile else 'OFF'}")
     print()
 
-    print(f"[1/7] 鏋勫缓 {args.model} ...")
+    print(f"[1/7] Building {args.model} ...")
     if args.dataset == "cifar10":
         num_classes = 10
     elif args.dataset == "cifar100":
@@ -1186,19 +1389,20 @@ def main():
     model_baseline = build_model(
         args.model, device, args.v_threshold,
         weight_init=args.weight_init, sew_cnf=args.sew_cnf,
+        T=args.T,
         num_classes=num_classes, seed=args.seed)
 
-    print(f"[2/7] 鍔犺浇 {args.dataset} 娴嬭瘯闆?...")
+    print(f"[2/7] Loading {args.dataset} test set ...")
     ds = build_dataset(args.dataset, args.data_root, spike_mode=args.spike_mode)
     # loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=True)
-    print(f"  娴嬭瘯闆? {len(ds)} 寮? {len(loader)} batches, {num_classes} classes")
+    print(f"  Test set: {len(ds)} samples, {len(loader)} batches, {num_classes} classes")
 
     if args.replace_all_ops:
         run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id)
         return
 
-    print(f"[3/7] 鍒嗘瀽缃戠粶鎷撴墤 ...")
+    print(f"[3/7] Analyzing network topology ...")
     imgs_s, _ = next(iter(loader))
     sample_input = make_spike_input(imgs_s[:4], args.T, device, spike_mode=args.spike_mode)
     targets, skipped = analyze_targets(
@@ -1209,7 +1413,7 @@ def main():
         print("\n  No replaceable target layers found, exiting.")
         return
 
-    print(f"\n[4/7] 缁熻绋€鐤忕巼涓庤皟搴︾壒寰?({args.sparsity_batches} batches) ...")
+    print(f"\n[4/7] Measuring sparsity and dispatch features ({args.sparsity_batches} batches) ...")
     sparsity_data = measure_sparsity(
         model_baseline, targets, loader, device, args.T,
         num_batches=args.sparsity_batches, spike_mode=args.spike_mode)
@@ -1315,12 +1519,12 @@ def main():
 
     model_static_zero_only, model_sparse_only, model_hybrid, route_counts = build_fourway_models(
         model_baseline, targets, hybrid_static_zero_layers, hybrid_sparse_set=hybrid_sparse_set)
-    print(f"\n  鏇挎崲瀹屾垚:")
+    print(f"\n  Replacement finished:")
     for mode_name, rc in route_counts.items():
         print(f"    {mode_name}: {rc['num_sparse_conv']} Sparse + {rc['num_static_zero']} StaticZero + {rc['num_dense_keep']} DenseKeep")
 
 
-    # 鈹€鈹€ v25: timing preparation 鈹€鈹€
+    # v25: timing preparation
     if args.inference_mode:
         n_so = prepare_for_timing(model_sparse_only)
         n_hy = prepare_for_timing(model_hybrid)
@@ -1337,7 +1541,7 @@ def main():
     print(f"  [v25] hybrid sync state: {_hy_state}")
 
 
-    print(f"\n[5/7] 绔埌绔欢杩?(warmup={args.warmup}) ...")
+    print(f"\n[5/7] End-to-end latency (warmup={args.warmup}) ...")
     dense_res = measure_mode(model_baseline, loader, device, args.T, args.warmup, args.spike_mode, args.power, "Dense cuDNN")
     sz_res = measure_mode(model_static_zero_only, loader, device, args.T, args.warmup, args.spike_mode, args.power, "StaticZero only")
     so_res = measure_mode(model_sparse_only, loader, device, args.T, args.warmup, args.spike_mode, args.power, "SparseConv only")
@@ -1355,16 +1559,14 @@ def main():
     print(f"\n  Speedup SZ-only: {sz_speedup:.3f}x  Sparse-only: {so_speedup:.3f}x  Hybrid: {hy_speedup:.3f}x")
     print(f"  Energy  SZ-only: {sz_esave:.2f}%  Sparse-only: {so_esave:.2f}%  Hybrid: {hy_esave:.2f}%")
 
-    # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
-    # [6/7] 閫愬眰鍔犻€熷垎鏋?(Layer-level profiling)
-    # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+    # [6/7] Layer-level profiling
     layer_profile_data = {}
     if args.layer_profile:
         lp_warmup = args.layer_profile_warmup
         lp_batches = args.layer_profile_batches
         target_names = [t["name"] for t in targets]
 
-        print(f"\n[6/7] 閫愬眰鍔犻€熷垎鏋?(warmup={lp_warmup}, batches={lp_batches}) ...")
+        print(f"\n[6/7] Layer-level profiling (warmup={lp_warmup}, batches={lp_batches}) ...")
 
         # 6a) Baseline (Dense cuDNN) per-layer timing
         print(f"  Measuring baseline (Dense cuDNN) per-layer timing ...")
@@ -1375,7 +1577,7 @@ def main():
         # 6b) SparseConv-only per-layer timing
         print(f"  Measuring SparseConv-only per-layer timing ...")
         # For sparse models, the replaced layer names still exist but the module
-        # type is now SparseConv2d / StaticZeroConv2d 鈥?hooks work the same way.
+        # Type is now SparseConv2d / StaticZeroConv2d, hooks work the same way.
         sparse_only_layer_timing = measure_layer_timing(
             model_sparse_only, loader, device, args.T, target_names,
             warmup=lp_warmup, num_batches=lp_batches, spike_mode=args.spike_mode)
@@ -1421,9 +1623,9 @@ def main():
             layer_profile_data["per_layer_speedup_hybrid"][name] = (
                 round(b / s_hy, 4) if s_hy > 1e-6 else float("inf"))
     else:
-        print(f"\n[6/7] 閫愬眰鍔犻€熷垎鏋?... SKIPPED (use --layer_profile to enable)")
+        print(f"\n[6/7] Layer-level profiling ... SKIPPED (use --layer_profile to enable)")
 
-    print(f"\n[7/7] 涓€鑷存€ч獙璇?({args.verify_batches} batches) ...")
+    print(f"\n[7/7] Consistency check ({args.verify_batches} batches) ...")
     sz_cos, sz_agr, sz_mabs = verify_consistency(model_baseline, model_static_zero_only, loader, device, args.T, num_batches=args.verify_batches, spike_mode=args.spike_mode)
     so_cos, so_agr, so_mabs = verify_consistency(model_baseline, model_sparse_only, loader, device, args.T, num_batches=args.verify_batches, spike_mode=args.spike_mode)
     hy_cos, hy_agr, hy_mabs = verify_consistency(model_baseline, model_hybrid, loader, device, args.T, num_batches=args.verify_batches, spike_mode=args.spike_mode)
@@ -1448,7 +1650,7 @@ def main():
     print(f"{'='*96}\n")
 
 
-    # 鈹€鈹€ v25: A/B tile launch comparison 鈹€鈹€
+    # v25: A/B tile launch comparison
     if args.ab_compare:
         print(f"\n[A/B] Tile launch mode comparison ...")
         prepare_for_timing(model_sparse_only)
@@ -1493,7 +1695,7 @@ def main():
         "sparse_only": {"ms_per_batch": round(so_res["avg_ms"], 2), "speedup": round(so_speedup, 4), "energy_saving_pct": round(so_esave, 2), "cosine_sim": round(so_cos, 8), "consistency": "PASS" if so_ok else "FAIL"},
         "hybrid": {"ms_per_batch": round(hy_res["avg_ms"], 2), "speedup": round(hy_speedup, 4), "energy_saving_pct": round(hy_esave, 2), "cosine_sim": round(hy_cos, 8), "consistency": "PASS" if hy_ok else "FAIL"},
     }
-    # 鈹€鈹€ NEW: include layer profile data in JSON 鈹€鈹€
+    # NEW: include layer profile data in JSON
     if layer_profile_data:
         results["layer_profile"] = layer_profile_data
 
@@ -1534,17 +1736,20 @@ def main():
                     sparse_total_ms=gd.get('sparse_total_ms', -1.0))
         if args.diag_json:
             layer_logger.save_json(args.diag_json)
-            print(f"  璇婃柇 JSON: {args.diag_json}")
+            print(f"  Diagnostic JSON: {args.diag_json}")
         if args.diag_csv:
             layer_logger.save_csv(args.diag_csv)
-            print(f"  璇婃柇 CSV: {args.diag_csv}")
+            print(f"  Diagnostic CSV: {args.diag_csv}")
         layer_logger.print_summary()
 
     out_path = args.out_json or args.save_json or f"results_fourway_{args.model}_{args.dataset}_T{args.T}_bs{args.batch_size}_{args.weight_init}.json"
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"  缁撴灉: {out_path}")
+    print(f"  Result: {out_path}")
 
 
 if __name__ == "__main__":
     main()
+
+
+
