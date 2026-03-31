@@ -271,13 +271,13 @@ def _target_get(target: Any, key: str, default=None):
 
 def _infer_batch_from_shape(input_shape: Optional[Tuple]) -> int:
     if input_shape is None:
-        return 1
+        return 0
     shape = tuple(input_shape) if not isinstance(input_shape, str) else ()
     if len(shape) >= 5:
         return int(shape[0]) * int(shape[1])
     if len(shape) >= 1:
         return int(shape[0])
-    return 1
+    return 0
 
 
 def conv_meta_from_target(target: Any) -> ConvMeta:
@@ -296,7 +296,7 @@ def conv_meta_from_target(target: Any) -> ConvMeta:
             c_in = int(conv_module.in_features)
             c_out = int(conv_module.out_features)
             batch_size = _infer_batch_from_shape(input_shape)
-            macs = float(batch_size * c_in * c_out)
+            macs = float(batch_size * c_in * c_out) if batch_size > 0 else 0.0
             return ConvMeta(
                 layer_name=layer_name,
                 c_in=c_in,
@@ -320,7 +320,7 @@ def conv_meta_from_target(target: Any) -> ConvMeta:
         c_in = int(_target_get(target, "in_features", _target_get(target, "cin", _target_get(target, "c_in", 0))))
         c_out = int(_target_get(target, "out_features", _target_get(target, "cout", _target_get(target, "c_out", 0))))
         batch_size = _infer_batch_from_shape(input_shape)
-        macs = float(batch_size * c_in * c_out)
+        macs = float(batch_size * c_in * c_out) if batch_size > 0 else 0.0
         return ConvMeta(
             layer_name=layer_name,
             c_in=c_in,
@@ -502,6 +502,24 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
 
     # Per-tile compute intensity
     n_tiles = _get_n_tiles(diag, meta)
+
+    # For linear targets in Core-all-ops flow, input_shape can be unavailable,
+    # which makes meta.macs = 0. Recover MACs using measured tile geometry.
+    is_linear_diag = str(diag.get("kernel_type", "")).lower() == "linear"
+    is_linear_meta = (
+        meta.kernel_size == (1, 1)
+        and meta.h_out <= 1
+        and meta.w_out <= 1
+        and meta.groups == 1
+    )
+    if macs <= 0 and is_linear_diag and is_linear_meta and meta.c_in > 0 and meta.c_out > 0:
+        block_m = float(diag.get("block_m", -1))
+        if block_m <= 0:
+            block_m = 32.0
+        n_rows_est = max(n_tiles * block_m, 1.0)
+        macs = float(n_rows_est * meta.c_in * meta.c_out)
+        dec.macs = macs
+
     I_l = macs / max(n_tiles, 1.0)
 
     # Dispatch score: saved MACs per tile

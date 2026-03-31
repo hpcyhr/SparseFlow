@@ -35,7 +35,9 @@ from Utils.timing_utils import prepare_for_timing, set_launch_mode, count_sync_s
 from Core.registry import SpikeOpRegistry
 from Core.analyzer import NetworkAnalyzer
 from Core.replacer import ModuleReplacer
-from Models.spikformer_github import MODEL_BUILDERS as EXTERNAL_MODEL_BUILDERS
+from Models.spikformer_github import MODEL_BUILDERS as SPIKFORMER_MODEL_BUILDERS
+from Models.sdtv1_github import MODEL_BUILDERS as SDTV1_MODEL_BUILDERS
+from Models.qkformer_github import MODEL_BUILDERS as QKFORMER_MODEL_BUILDERS
 
 
 DEVICE = None
@@ -50,6 +52,13 @@ TRANSPARENT_TYPES = (
 )
 
 MIN_SPATIAL_SIZE = 4
+
+
+_EXTERNAL_MODEL_SOURCES = [
+    ("Models.spikformer_github", SPIKFORMER_MODEL_BUILDERS),
+    ("Models.sdtv1_github", SDTV1_MODEL_BUILDERS),
+    ("Models.qkformer_github", QKFORMER_MODEL_BUILDERS),
+]
 
 
 def sync():
@@ -78,9 +87,10 @@ def _discover_model_builders():
             builders[attr_name] = fn
             metadata[attr_name] = {"family": family, "module": mod}
 
-    for name, fn in EXTERNAL_MODEL_BUILDERS.items():
-        builders[name] = fn
-        metadata[name] = {"family": "external_transformer", "module": "Models.spikformer_github"}
+    for module_name, model_builders in _EXTERNAL_MODEL_SOURCES:
+        for name, fn in model_builders.items():
+            builders[name] = fn
+            metadata[name] = {"family": "external_transformer", "module": module_name}
     return builders, metadata
 
 
@@ -969,6 +979,7 @@ _CORE_STATICZERO_ELIGIBLE_OPS = {
     "fused_conv3x3_lif",
     "fused_conv1x1_lif",
     "fused_conv3x3s2_lif",
+    "linear",
 }
 
 
@@ -1089,6 +1100,7 @@ def measure_group_sparsity_core(
             "stage1_zero_candidate": diag.get("stage1_zero_candidate", -1),
             "stage1_denseish": diag.get("stage1_denseish", -1),
             "stage1_uncertain": diag.get("stage1_uncertain", -1),
+            "block_m": diag.get("block_m", -1),
         }
 
     for name, mod in model.named_modules():

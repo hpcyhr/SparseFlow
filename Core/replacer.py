@@ -13,6 +13,7 @@ from torch.nn.utils.fusion import fuse_conv_bn_eval
 from Core.analyzer import ReplacementTarget, display_block_info
 from Ops.sparse_conv2d import SparseConv2d
 from Ops.static_zero_conv2d import StaticZeroConv2d
+from Ops.static_zero_linear import StaticZeroLinear
 from Ops.sparse_fused_conv_lif import FusedSparseConvLIF
 
 
@@ -77,10 +78,14 @@ class ModuleReplacer:
                     "fused_conv3x3_lif",
                     "fused_conv1x1_lif",
                     "fused_conv3x3s2_lif",
+                    "linear",
                 )
             )
             if can_use_static_zero:
-                new_module = StaticZeroConv2d.from_conv(target.conv_module)
+                if op == "linear":
+                    new_module = StaticZeroLinear.from_linear(target.conv_module)
+                else:
+                    new_module = StaticZeroConv2d.from_conv(target.conv_module)
                 _set_module_by_name(model, module_name, new_module)
                 replaced += 1
                 static_zero_count += 1
@@ -91,7 +96,10 @@ class ModuleReplacer:
                 #   so removing them can break numerical equivalence.
                 #   Only explicit fused route is allowed to fold/remove BN/LIF.
                 if self.verbose:
-                    print(f"  [STATIC ] {module_name} ({op}) -> StaticZeroConv2d")
+                    if op == "linear":
+                        print(f"  [STATIC ] {module_name} ({op}) -> StaticZeroLinear")
+                    else:
+                        print(f"  [STATIC ] {module_name} ({op}) -> StaticZeroConv2d")
                 continue
 
             if only_static_zero:
