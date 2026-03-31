@@ -9,6 +9,7 @@ TILE_SPARSE = 1
 TILE_DENSEISH = 2
 TILE_UNCERTAIN = 3
 TILE_ZERO_CANDIDATE = 4
+TRITON_MAX_TENSOR_NUMEL = 131072
 
 
 # ---------------------------------------------------------------------------
@@ -288,8 +289,6 @@ _LINEAR_CONFIGS = [
     Config({'BLOCK_N': 128, 'DENSE_K': 32},  num_warps=4, num_stages=1),
     Config({'BLOCK_N': 128, 'DENSE_K': 64},  num_warps=8, num_stages=2),
     Config({'BLOCK_N': 128, 'DENSE_K': 128}, num_warps=8, num_stages=2),
-    Config({'BLOCK_N': 256, 'DENSE_K': 64},  num_warps=8, num_stages=2),
-    Config({'BLOCK_N': 256, 'DENSE_K': 128}, num_warps=8, num_stages=2),
 ]
 
 
@@ -355,18 +354,22 @@ def sparse_linear_grouped_kernel(
         for g in range(NUM_GROUPS):
             g_active = (ag >> g) & 1
             if tl.sum(g_active) != 0:
-                offs_k = g * GROUP_SIZE_C + tl.arange(0, GROUP_SIZE_C)
-                k_mask = offs_k < C_IN
+                # Chunk active group by DENSE_K to avoid large temporary tiles
+                # like [GROUP_SIZE_C, BLOCK_N], which can exceed shared memory.
+                g_base = g * GROUP_SIZE_C
+                for k_off in range(0, GROUP_SIZE_C, DENSE_K):
+                    offs_k = g_base + k_off + tl.arange(0, DENSE_K)
+                    k_mask = offs_k < C_IN
 
-                x_addrs = offs_m[:, None] * C_IN + offs_k[None, :]
-                x_mask = m_mask[:, None] & k_mask[None, :]
-                x_tile = tl.load(x_ptr + x_addrs, mask=x_mask, other=0.0).to(tl.float16)
+                    x_addrs = offs_m[:, None] * C_IN + offs_k[None, :]
+                    x_mask = m_mask[:, None] & k_mask[None, :]
+                    x_tile = tl.load(x_ptr + x_addrs, mask=x_mask, other=0.0).to(tl.float16)
 
-                w_addrs = offs_k[:, None] * C_OUT + offs_n[None, :]
-                w_mask = k_mask[:, None] & n_mask[None, :]
-                w_tile = tl.load(w_t_ptr + w_addrs, mask=w_mask, other=0.0).to(tl.float16)
+                    w_addrs = offs_k[:, None] * C_OUT + offs_n[None, :]
+                    w_mask = k_mask[:, None] & n_mask[None, :]
+                    w_tile = tl.load(w_t_ptr + w_addrs, mask=w_mask, other=0.0).to(tl.float16)
 
-                acc += tl.dot(x_tile, w_tile)
+                    acc += tl.dot(x_tile, w_tile)
 
     if HAS_BIAS:
         bias_vals = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)
@@ -478,6 +481,23 @@ def sparse_linear_forward(
         tile_class_buf,
         prescan_stats=tile_stats,
     )
+
+    # Safety guard against Triton per-tensor numel limit in kernel temporaries.
+    # The sparse path constructs tensors with shape [GROUP_SIZE_C, BLOCK_N].
+    # With current configs BLOCK_N can be up to 128, so require:
+    #   GROUP_SIZE_C * 128 <= TRITON_MAX_TENSOR_NUMEL
+    max_block_n = max(cfg.kwargs["BLOCK_N"] for cfg in _LINEAR_CONFIGS)
+    if group_size_c * max_block_n > TRITON_MAX_TENSOR_NUMEL:
+        return _dense_fallback(
+            reason=f"group_size_too_large_for_sparse_kernel(gs={group_size_c}, max_bn={max_block_n})",
+            avg_active_ratio_val=1.0,
+            tile_stats_val=tile_stats,
+            backend_meta_extra={
+                "group_size_c": int(group_size_c),
+                "num_groups": int(num_groups),
+                "total_tiles": int(N_TILES),
+            },
+        )
 
     has_bias = bias is not None
     bias_f32 = bias.float().contiguous() if has_bias else torch.empty(1, dtype=torch.float32, device=device)

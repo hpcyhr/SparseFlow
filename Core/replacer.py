@@ -84,10 +84,12 @@ class ModuleReplacer:
                 _set_module_by_name(model, module_name, new_module)
                 replaced += 1
                 static_zero_count += 1
-                if target.bn_name is not None:
-                    _set_module_by_name(model, target.bn_name, nn.Identity())
-                if target.lif_name is not None:
-                    _set_module_by_name(model, target.lif_name, nn.Identity())
+                # Keep downstream BN/LIF untouched for static-zero route.
+                # Reason:
+                #   StaticZeroConv2d only guarantees exact conv(x=0) output.
+                #   BN/LIF may be stateful / non-identity (especially in SNN blocks),
+                #   so removing them can break numerical equivalence.
+                #   Only explicit fused route is allowed to fold/remove BN/LIF.
                 if self.verbose:
                     print(f"  [STATIC ] {module_name} ({op}) -> StaticZeroConv2d")
                 continue
