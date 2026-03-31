@@ -284,11 +284,10 @@ def _build_linear_metadata(
 # ---------------------------------------------------------------------------
 
 _LINEAR_CONFIGS = [
-    Config({'BLOCK_N': 64,  'DENSE_K': 32},  num_warps=4, num_stages=1),
-    Config({'BLOCK_N': 64,  'DENSE_K': 64},  num_warps=4, num_stages=2),
-    Config({'BLOCK_N': 128, 'DENSE_K': 32},  num_warps=4, num_stages=1),
-    Config({'BLOCK_N': 128, 'DENSE_K': 64},  num_warps=8, num_stages=2),
-    Config({'BLOCK_N': 128, 'DENSE_K': 128}, num_warps=8, num_stages=2),
+    # Conservative set to avoid OOR on large C_IN/C_OUT (e.g., VGG classifier).
+    Config({'BLOCK_N': 32, 'DENSE_K': 32}, num_warps=4, num_stages=1),
+    Config({'BLOCK_N': 64, 'DENSE_K': 32}, num_warps=4, num_stages=1),
+    Config({'BLOCK_N': 64, 'DENSE_K': 64}, num_warps=4, num_stages=1),
 ]
 
 
@@ -484,8 +483,8 @@ def sparse_linear_forward(
 
     # Safety guard against Triton per-tensor numel limit in kernel temporaries.
     # The sparse path constructs tensors with shape [GROUP_SIZE_C, BLOCK_N].
-    # With current configs BLOCK_N can be up to 128, so require:
-    #   GROUP_SIZE_C * 128 <= TRITON_MAX_TENSOR_NUMEL
+    # Require:
+    #   GROUP_SIZE_C * max(BLOCK_N) <= TRITON_MAX_TENSOR_NUMEL
     max_block_n = max(cfg.kwargs["BLOCK_N"] for cfg in _LINEAR_CONFIGS)
     if group_size_c * max_block_n > TRITON_MAX_TENSOR_NUMEL:
         return _dense_fallback(
@@ -496,6 +495,29 @@ def sparse_linear_forward(
                 "group_size_c": int(group_size_c),
                 "num_groups": int(num_groups),
                 "total_tiles": int(N_TILES),
+            },
+        )
+
+    # Guard against shared-memory heavy configs. Triton autotune can still pick
+    # configs that exceed HW SMEM budget for large GEMM tiles on some GPUs.
+    # Use a conservative estimate and fallback to dense before kernel launch.
+    max_dense_k = max(cfg.kwargs["DENSE_K"] for cfg in _LINEAR_CONFIGS)
+    est_smem_bytes = (
+        (BLOCK_M * max_dense_k) + (max_dense_k * max_block_n) + (BLOCK_M * max_block_n)
+    ) * 4
+    if est_smem_bytes > 160_000:
+        return _dense_fallback(
+            reason=(
+                "estimated_shared_memory_too_large_for_sparse_kernel"
+                f"(block_m={BLOCK_M}, max_bn={max_block_n}, max_dk={max_dense_k}, smem={est_smem_bytes})"
+            ),
+            avg_active_ratio_val=1.0,
+            tile_stats_val=tile_stats,
+            backend_meta_extra={
+                "group_size_c": int(group_size_c),
+                "num_groups": int(num_groups),
+                "total_tiles": int(N_TILES),
+                "estimated_shared_mem_bytes": int(est_smem_bytes),
             },
         )
 

@@ -263,21 +263,88 @@ def conv_meta_from_module(conv_module, sample_x_shape: Optional[Tuple] = None,
     )
 
 
-def conv_meta_from_target(target: Dict[str, Any]) -> ConvMeta:
-    conv_module = target.get("module")
-    layer_name = target.get("name", "")
-    input_shape = target.get("input_shape")
+def _target_get(target: Any, key: str, default=None):
+    if isinstance(target, dict):
+        return target.get(key, default)
+    return getattr(target, key, default)
+
+
+def _infer_batch_from_shape(input_shape: Optional[Tuple]) -> int:
+    if input_shape is None:
+        return 1
+    shape = tuple(input_shape) if not isinstance(input_shape, str) else ()
+    if len(shape) >= 5:
+        return int(shape[0]) * int(shape[1])
+    if len(shape) >= 1:
+        return int(shape[0])
+    return 1
+
+
+def conv_meta_from_target(target: Any) -> ConvMeta:
+    conv_module = _target_get(target, "module")
+    if conv_module is None:
+        conv_module = _target_get(target, "conv_module")
+    layer_name = _target_get(target, "name", "")
+    if not layer_name:
+        layer_name = _target_get(target, "conv_name", "")
+    input_shape = _target_get(target, "input_shape")
+    op_type = _target_get(target, "op_type", "")
 
     if conv_module is not None:
+        # Linear target from Core ReplacementTarget / dict target
+        if hasattr(conv_module, "in_features") and hasattr(conv_module, "out_features"):
+            c_in = int(conv_module.in_features)
+            c_out = int(conv_module.out_features)
+            batch_size = _infer_batch_from_shape(input_shape)
+            macs = float(batch_size * c_in * c_out)
+            return ConvMeta(
+                layer_name=layer_name,
+                c_in=c_in,
+                c_out=c_out,
+                kernel_size=(1, 1),
+                stride=(1, 1),
+                padding=(0, 0),
+                dilation=(1, 1),
+                groups=1,
+                h_in=1,
+                w_in=1,
+                h_out=1,
+                w_out=1,
+                batch_size=batch_size,
+                macs=macs,
+            )
         return conv_meta_from_module(conv_module, input_shape, layer_name)
 
-    ks = _pair(target.get("kernel_size", (3, 3)))
-    st = _pair(target.get("stride", (1, 1)))
-    pad = _pair(target.get("padding", (1, 1)))
-    dil = _pair(target.get("dilation", (1, 1)))
-    groups = int(target.get("groups", 1))
-    c_in = int(target.get("cin", target.get("c_in", 0)))
-    c_out = int(target.get("cout", target.get("c_out", 0)))
+    # Dict target (legacy bench path) or attribute-only Core target fallback.
+    if op_type == "linear":
+        c_in = int(_target_get(target, "in_features", _target_get(target, "cin", _target_get(target, "c_in", 0))))
+        c_out = int(_target_get(target, "out_features", _target_get(target, "cout", _target_get(target, "c_out", 0))))
+        batch_size = _infer_batch_from_shape(input_shape)
+        macs = float(batch_size * c_in * c_out)
+        return ConvMeta(
+            layer_name=layer_name,
+            c_in=c_in,
+            c_out=c_out,
+            kernel_size=(1, 1),
+            stride=(1, 1),
+            padding=(0, 0),
+            dilation=(1, 1),
+            groups=1,
+            h_in=1,
+            w_in=1,
+            h_out=1,
+            w_out=1,
+            batch_size=batch_size,
+            macs=macs,
+        )
+
+    ks = _pair(_target_get(target, "kernel_size", (3, 3)))
+    st = _pair(_target_get(target, "stride", (1, 1)))
+    pad = _pair(_target_get(target, "padding", (1, 1)))
+    dil = _pair(_target_get(target, "dilation", (1, 1)))
+    groups = int(_target_get(target, "groups", 1))
+    c_in = int(_target_get(target, "cin", _target_get(target, "c_in", 0)))
+    c_out = int(_target_get(target, "cout", _target_get(target, "c_out", 0)))
 
     h_in, w_in, batch_size = 0, 0, 1
     if input_shape is not None:
@@ -288,6 +355,9 @@ def conv_meta_from_target(target: Dict[str, Any]) -> ConvMeta:
         elif len(shape) == 4:
             batch_size = shape[0]
             h_in, w_in = shape[2], shape[3]
+        elif len(shape) == 3:
+            batch_size = shape[0]
+            h_in, w_in = shape[2], 1
 
     h_out, w_out = infer_conv_output_hw(h_in, w_in, ks, st, pad, dil)
     macs = estimate_conv_macs(batch_size, h_out, w_out, c_out, c_in, ks, groups)
@@ -546,7 +616,11 @@ def dispatch_all_layers(
 
     decisions: Dict[str, DispatchDecision] = {}
     for t in targets:
-        name = t["name"]
+        name = _target_get(t, "name", "")
+        if not name:
+            name = _target_get(t, "conv_name", "")
+        if not name:
+            continue
 
         if name in zero_layers:
             decisions[name] = _make_staticzero_decision(name)
@@ -621,7 +695,11 @@ def print_dispatch_decision_report(targets, group_sparsity_data, dispatch_decisi
     n_dense = 0
     n_staticzero = 0
     for t in targets:
-        name = t["name"]
+        name = _target_get(t, "name", "")
+        if not name:
+            name = _target_get(t, "conv_name", "")
+        if not name:
+            continue
         dec = dispatch_decisions.get(name)
         if dec is None:
             continue

@@ -171,14 +171,31 @@ class NetworkAnalyzer:
         if sample_input is not None:
             input_shapes = self._infer_input_shapes(model, sample_input)
 
+        fx_error = None
         try:
             targets = self._analyze_fx(model, input_shapes)
             if targets:
                 return targets
         except Exception as err:
+            fx_error = err
             warnings.warn(
                 f"[SparseFlow] torch.fx symbolic trace failed: {err}\n"
-                "  Falling back to linear module-order scan mode."
+                "  Falling back to runtime-order scan mode."
+            )
+        if sample_input is not None:
+            try:
+                rt_targets = self._analyze_runtime_fallback(model, input_shapes, sample_input)
+                if rt_targets:
+                    return rt_targets
+            except Exception as err:
+                warnings.warn(
+                    f"[SparseFlow] runtime-order fallback failed: {err}\n"
+                    "  Falling back to linear module-order scan mode."
+                )
+        elif fx_error is None:
+            warnings.warn(
+                "[SparseFlow] torch.fx produced no targets and no sample input was provided; "
+                "falling back to linear module-order scan mode."
             )
         return self._analyze_fallback(model, input_shapes)
 
@@ -290,6 +307,85 @@ class NetworkAnalyzer:
                 if target is not None:
                     targets.append(target)
                     visited.add(next_name)
+
+        return targets
+
+    def _analyze_runtime_fallback(
+        self,
+        model: nn.Module,
+        input_shapes: dict,
+        sample_input: torch.Tensor,
+    ) -> List[ReplacementTarget]:
+        modules_dict = dict(model.named_modules())
+        events = []
+        hooks = []
+
+        def _target_type_from_module(mod: nn.Module) -> Optional[str]:
+            if isinstance(mod, nn.Conv1d):
+                return "conv1d"
+            if isinstance(mod, nn.Conv2d):
+                return "conv2d"
+            if isinstance(mod, nn.Conv3d):
+                return "conv3d"
+            if isinstance(mod, nn.Linear):
+                return "linear"
+            return None
+
+        def make_hook(name: str, kind: str):
+            def hook(_m, _inp, _out):
+                events.append((kind, name))
+
+            return hook
+
+        for name, module in model.named_modules():
+            if self.registry.is_spike_op(module):
+                hooks.append(module.register_forward_hook(make_hook(name, "spike")))
+            elif _target_type_from_module(module) is not None:
+                hooks.append(module.register_forward_hook(make_hook(name, "target")))
+
+        try:
+            try:
+                from spikingjelly.activation_based import functional as sj_func
+
+                sj_func.reset_net(model)
+            except ImportError:
+                pass
+            with torch.no_grad():
+                _ = model(sample_input)
+        finally:
+            for h in hooks:
+                h.remove()
+
+        targets: List[ReplacementTarget] = []
+        visited: Set[str] = set()
+        last_spike_name: Optional[str] = None
+        for kind, name in events:
+            if kind == "spike":
+                last_spike_name = name
+                continue
+            if kind != "target":
+                continue
+            if name in visited or last_spike_name is None:
+                continue
+
+            module = modules_dict.get(name)
+            if module is None:
+                continue
+            target_type = _target_type_from_module(module)
+            if target_type is None:
+                continue
+
+            target = self._make_target(
+                name,
+                module,
+                target_type,
+                last_spike_name,
+                input_shapes,
+                model=model,
+            )
+            if target is not None:
+                targets.append(target)
+                visited.add(name)
 
         return targets
 

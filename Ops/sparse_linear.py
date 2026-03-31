@@ -1,5 +1,6 @@
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, Any, Dict
@@ -94,6 +95,7 @@ class SparseLinear(nn.Module):
             self._triton_available = True
         except Exception:
             self._triton_available = False
+        self._warned_triton_runtime_error = False
 
         self._w_t = None
         self._w_t_version = -1
@@ -432,19 +434,38 @@ class SparseLinear(nn.Module):
         want_ratio = need_ratio or collect_tiles
         want_tiles = collect_tiles
 
-        result = sparse_linear_forward(
-            x=x_f16,
-            weight=self.weight,
-            bias=self.bias,
-            threshold=self.threshold,
-            w_t=w_t,
-            ag_mask_buf=ag_mask_buf,
-            tile_class_buf=tile_class_buf,
-            return_ms=self.return_ms,
-            return_avg_active_ratio=want_ratio,
-            return_tile_stats=want_tiles,
-            return_backend_meta=True,
-        )
+        try:
+            result = sparse_linear_forward(
+                x=x_f16,
+                weight=self.weight,
+                bias=self.bias,
+                threshold=self.threshold,
+                w_t=w_t,
+                ag_mask_buf=ag_mask_buf,
+                tile_class_buf=tile_class_buf,
+                return_ms=self.return_ms,
+                return_avg_active_ratio=want_ratio,
+                return_tile_stats=want_tiles,
+                return_backend_meta=True,
+            )
+        except Exception as err:
+            # Robust fallback for Triton compile/autotune/runtime failures.
+            if not self._warned_triton_runtime_error:
+                warnings.warn(
+                    "[SparseLinear] Triton sparse path failed, fallback to dense. "
+                    f"error={type(err).__name__}: {err}"
+                )
+                self._warned_triton_runtime_error = True
+            y2d = self._fallback_forward(x2d)
+            if self.collect_diag:
+                self._last_diag = {
+                    "sparse_path_executed": False,
+                    "backend": "dense_fallback",
+                    "backend_reason": "triton_runtime_error",
+                    "error_type": type(err).__name__,
+                    "error_msg": str(err),
+                }
+            return y2d, None, "dense_fallback"
 
         if not isinstance(result, tuple) or len(result) < 2:
             raise TypeError(f"sparse_linear_forward bad return: {type(result)}")

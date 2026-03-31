@@ -976,6 +976,10 @@ def _is_core_staticzero_eligible(target):
     return getattr(target, "op_type", "") in _CORE_STATICZERO_ELIGIBLE_OPS
 
 
+def _core_target_name(target):
+    return getattr(target, "conv_name", "")
+
+
 def measure_sparsity_core(
     model,
     targets,
@@ -985,7 +989,7 @@ def measure_sparsity_core(
     num_batches=10,
     spike_mode="normalized_bernoulli",
 ):
-    target_names = [t.conv_name for t in targets]
+    target_names = [_core_target_name(t) for t in targets]
     sparsity_data = {name: {"zeros": 0, "total": 0} for name in target_names}
 
     def make_hook(name):
@@ -1024,12 +1028,73 @@ def measure_sparsity_core(
 def collect_core_static_zero_layers(targets, sparsity_data):
     zero_layers = set()
     for t in targets:
-        if not _is_core_staticzero_eligible(t):
+        name = _core_target_name(t)
+        if not name or not _is_core_staticzero_eligible(t):
             continue
-        sd = sparsity_data.get(t.conv_name, {"zeros": 0, "total": 0})
+        sd = sparsity_data.get(name, {"zeros": 0, "total": 0})
         if sd["total"] > 0 and sd["zeros"] == sd["total"]:
-            zero_layers.add(t.conv_name)
+            zero_layers.add(name)
     return zero_layers
+
+
+def measure_group_sparsity_core(
+    model,
+    targets,
+    loader,
+    device,
+    T,
+    num_batches=5,
+    spike_mode="normalized_bernoulli",
+):
+    target_names = {_core_target_name(t) for t in targets}
+    for name, mod in model.named_modules():
+        if name in target_names and hasattr(mod, "collect_diag"):
+            mod.collect_diag = True
+
+    batch_count = 0
+    for imgs, _ in loader:
+        if batch_count >= num_batches:
+            break
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        sj_func.reset_net(model)
+        with torch.no_grad():
+            _ = model(inp)
+        batch_count += 1
+
+    group_data = {}
+    for name, mod in model.named_modules():
+        if name not in target_names:
+            continue
+        if not hasattr(mod, "_last_diag"):
+            continue
+        diag = getattr(mod, "_last_diag", {}) or {}
+        group_data[name] = {
+            "active_group_ratio": diag.get("active_group_ratio", -1.0),
+            "tile_zero_ratio": diag.get("tile_zero_ratio", -1.0),
+            "total_group_count": diag.get("total_group_count", -1.0),
+            "nonzero_group_count": diag.get("nonzero_group_count", -1.0),
+            "tile_zero_count": diag.get("tile_zero_count", -1.0),
+            "total_tile_count": diag.get("total_tile_count", -1.0),
+            "effective_k_ratio": diag.get("effective_k_ratio", -1.0),
+            "sparse_compute_ms": diag.get("sparse_compute_ms", -1.0),
+            "sparse_total_ms": diag.get("sparse_total_ms", -1.0),
+            "stage1_zero_tiles": diag.get("stage1_zero_tiles", -1),
+            "stage2_tiles": diag.get("stage2_tiles", -1),
+            "zero_tiles": diag.get("zero_tiles", -1),
+            "sparse_tiles": diag.get("sparse_tiles", -1),
+            "denseish_tiles": diag.get("denseish_tiles", -1),
+            "prescan_mode": diag.get("prescan_mode", "unknown"),
+            "metadata_kind": diag.get("metadata_kind", "unknown"),
+            "kernel_type": diag.get("kernel_type", "unknown"),
+            "stage1_zero_candidate": diag.get("stage1_zero_candidate", -1),
+            "stage1_denseish": diag.get("stage1_denseish", -1),
+            "stage1_uncertain": diag.get("stage1_uncertain", -1),
+        }
+
+    for name, mod in model.named_modules():
+        if name in target_names and hasattr(mod, "collect_diag"):
+            mod.collect_diag = False
+    return group_data
 
 
 def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
@@ -1077,6 +1142,29 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
         spike_mode=args.spike_mode,
     )
     zero_layers = collect_core_static_zero_layers(targets, sparsity_data)
+    if args.spike_mode in ("normalized_bernoulli", "raw_bernoulli") and zero_layers:
+        print(
+            "  [Core-AllOps] stochastic spike mode detected; "
+            "re-validating static-zero layers on a second pass for robustness ..."
+        )
+        sparsity_data_recheck = measure_sparsity_core(
+            model_baseline,
+            targets,
+            loader,
+            device,
+            args.T,
+            num_batches=args.sparsity_batches,
+            spike_mode=args.spike_mode,
+        )
+        zero_layers_recheck = collect_core_static_zero_layers(targets, sparsity_data_recheck)
+        unstable_zero_layers = set(zero_layers) - set(zero_layers_recheck)
+        if unstable_zero_layers:
+            print(
+                f"  [Core-AllOps] removed {len(unstable_zero_layers)} unstable static-zero layer(s): "
+                + ", ".join(sorted(unstable_zero_layers))
+            )
+        zero_layers = set(zero_layers) & set(zero_layers_recheck)
+
     eligible_staticzero = sum(1 for t in targets if _is_core_staticzero_eligible(t))
     print(
         f"  StaticZero eligible targets: {eligible_staticzero}/{len(targets)}, "
@@ -1084,10 +1172,92 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
     )
 
     print(
-        f"\n[5/7] Build 4 benchmark modes (Core replacer, all ops enabled, "
+        f"\n[5/7] Measure group/tile diagnostics + build 4 benchmark modes "
+        f"(Core replacer, all ops enabled, "
         f"fuse_conv_lif={'ON' if args.fuse_conv_lif else 'OFF'}) ..."
     )
     replacer = ModuleReplacer(verbose=True)
+
+    print("  - Measuring sparse diagnostics for hybrid dispatch ...")
+    model_diag = copy.deepcopy(model_baseline)
+    # Build sparse-replaced model only for collecting per-layer diagnostics.
+    replacer.replace(
+        model_diag,
+        targets,
+        block_sizes=None,
+        static_zero_layers=set(),
+        disable_static_zero=True,
+        only_static_zero=False,
+        enable_fused_conv_lif=args.fuse_conv_lif,
+    )
+    group_sparsity_data = measure_group_sparsity_core(
+        model_diag,
+        targets,
+        loader,
+        device,
+        args.T,
+        num_batches=min(args.sparsity_batches, 5),
+        spike_mode=args.spike_mode,
+    )
+    del model_diag
+
+    # Synthetic exact-zero diagnostics for static-zero layers.
+    for t in targets:
+        name = _core_target_name(t)
+        if name in zero_layers:
+            existing = group_sparsity_data.get(name, {})
+            group_sparsity_data[name] = make_synthetic_zero_diag(
+                layer_name=name,
+                source="staticzero",
+                total_group_count=existing.get("total_group_count", -1.0),
+                total_tile_count=existing.get("total_tile_count", -1.0),
+            )
+
+    # If diagnostics are unavailable but element sparsity is effectively 100%,
+    # treat as zero-fastpath source to avoid false dense routing.
+    for t in targets:
+        name = _core_target_name(t)
+        if name in zero_layers:
+            continue
+        gd = group_sparsity_data.get(name, {})
+        if gd.get("active_group_ratio", -1.0) >= 0:
+            continue
+        sd = sparsity_data.get(name, {"zeros": 0, "total": 1})
+        elem_sp = sd["zeros"] / max(sd["total"], 1)
+        if elem_sp >= 0.9999:
+            existing = group_sparsity_data.get(name, {})
+            group_sparsity_data[name] = make_synthetic_zero_diag(
+                layer_name=name,
+                source="zero_fastpath",
+                total_group_count=existing.get("total_group_count", -1.0),
+                total_tile_count=existing.get("total_tile_count", -1.0),
+            )
+
+    dispatch_decisions = dispatch_all_layers(
+        targets,
+        group_sparsity_data,
+        zero_layers=set(zero_layers),
+    )
+    hybrid_static_zero_layers, hybrid_sparse_set = decisions_to_sets(dispatch_decisions)
+
+    # Safety net: StaticZero must remain exact-zero only.
+    invalid_static_zero_layers = set(hybrid_static_zero_layers) - set(zero_layers)
+    if invalid_static_zero_layers:
+        for _name in sorted(invalid_static_zero_layers):
+            _dec = dispatch_decisions[_name]
+            _dec.backend = "sparse"
+            _dec.reason = "core_safety_remap_nonexact_staticzero_to_sparse"
+        hybrid_static_zero_layers -= invalid_static_zero_layers
+        hybrid_sparse_set |= invalid_static_zero_layers
+
+    # Keep a compact dispatch report for Core path.
+    print(
+        f"  - Hybrid dispatch sets: "
+        f"StaticZero={len(hybrid_static_zero_layers)}, Sparse={len(hybrid_sparse_set)}, "
+        f"DenseKeep={len(targets) - len(hybrid_static_zero_layers) - len(hybrid_sparse_set)}"
+    )
+    report_targets = [{"name": _core_target_name(t)} for t in targets]
+    print_dispatch_decision_report(report_targets, group_sparsity_data, dispatch_decisions)
 
     print("  - Building StaticZero only ...")
     model_staticzero = copy.deepcopy(model_baseline)
@@ -1115,28 +1285,45 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
 
     print("  - Building SparseKernel + StaticZero ...")
     model_hybrid = copy.deepcopy(model_baseline)
+    hybrid_target_names = set(hybrid_static_zero_layers) | set(hybrid_sparse_set)
+    hybrid_targets = [t for t in targets if _core_target_name(t) in hybrid_target_names]
     hy_summary = replacer.replace(
         model_hybrid,
-        targets,
+        hybrid_targets,
         block_sizes=None,
-        static_zero_layers=set(zero_layers),
+        static_zero_layers=set(hybrid_static_zero_layers),
         disable_static_zero=False,
         only_static_zero=False,
         enable_fused_conv_lif=args.fuse_conv_lif,
     )
 
+    total_targets = len(targets)
+    sz_static = len(zero_layers)
+    hy_static = len(hybrid_static_zero_layers)
+    hy_sparse = len(hybrid_sparse_set)
+    hy_dense = max(total_targets - hy_static - hy_sparse, 0)
+
     route_counts = {
         "static_zero_only": {
-            "total": sz_summary[0], "sparse": sz_summary[1], "fused": sz_summary[2],
-            "static_zero": sz_summary[3], "dense_keep": sz_summary[4],
+            "total": total_targets,
+            "sparse": 0,
+            "fused": 0,
+            "static_zero": sz_static,
+            "dense_keep": max(total_targets - sz_static, 0),
         },
         "sparse_only": {
-            "total": so_summary[0], "sparse": so_summary[1], "fused": so_summary[2],
-            "static_zero": so_summary[3], "dense_keep": so_summary[4],
+            "total": total_targets,
+            "sparse": so_summary[1],
+            "fused": so_summary[2],
+            "static_zero": so_summary[3],
+            "dense_keep": so_summary[4],
         },
         "hybrid": {
-            "total": hy_summary[0], "sparse": hy_summary[1], "fused": hy_summary[2],
-            "static_zero": hy_summary[3], "dense_keep": hy_summary[4],
+            "total": total_targets,
+            "sparse": hy_sparse,
+            "fused": hy_summary[2],
+            "static_zero": hy_static,
+            "dense_keep": hy_dense,
         },
     }
     print("\n  Replacement summary:")
@@ -1216,6 +1403,21 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
         "num_staticzero_eligible": eligible_staticzero,
         "num_staticzero_exact_zero": len(zero_layers),
         "static_zero_layers": sorted(list(zero_layers)),
+        "hybrid_static_zero_layers": sorted(list(hybrid_static_zero_layers)),
+        "hybrid_sparse_layers": sorted(list(hybrid_sparse_set)),
+        "hybrid_dense_keep_layers": sorted(
+            [
+                _core_target_name(t)
+                for t in targets
+                if _core_target_name(t) not in hybrid_static_zero_layers
+                and _core_target_name(t) not in hybrid_sparse_set
+            ]
+        ),
+        "dispatch_decisions": {name: dec.to_dict() for name, dec in dispatch_decisions.items()},
+        "dispatch_invalid_staticzero_remapped_layers": sorted(list(invalid_static_zero_layers)),
+        "stochastic_unstable_staticzero_removed_layers": (
+            sorted(list(unstable_zero_layers)) if "unstable_zero_layers" in locals() else []
+        ),
         "route_counts": route_counts,
         "dense": {
             "ms_per_batch": round(dense_res["avg_ms"], 4),
@@ -1256,6 +1458,8 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
             "consistency": "PASS" if hy_ok else "FAIL",
         },
     }
+    if group_sparsity_data:
+        results["group_sparsity"] = group_sparsity_data
 
     out_path = (
         args.out_json
@@ -1327,7 +1531,7 @@ def main():
         help=(
             "Use Core analyzer/replacer to benchmark all currently supported operator "
             "types (conv1d/conv2d/depthwise/conv3d/linear). "
-            "When enabled, run simplified dense-vs-replaced pipeline."
+            "When enabled, run full four-way pipeline (Dense / StaticZero / Sparse / Hybrid)."
         ),
     )
     parser.add_argument(
