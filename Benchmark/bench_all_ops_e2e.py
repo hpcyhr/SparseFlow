@@ -8,12 +8,14 @@ if _PROJECT_ROOT not in sys.path:
 import argparse
 import copy
 import json
+import os
 from collections import Counter, OrderedDict
 from inspect import signature
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 
 from spikingjelly.activation_based import functional as sj_func
@@ -23,7 +25,19 @@ from spikingjelly.activation_based.model import sew_resnet, spiking_resnet, spik
 from Core.analyzer import NetworkAnalyzer
 from Core.registry import SpikeOpRegistry
 from Core.replacer import ModuleReplacer
-from Models.spikformer_github import MODEL_BUILDERS as EXTERNAL_MODEL_BUILDERS
+from Models.spikformer_github import MODEL_BUILDERS as SPIKFORMER_MODEL_BUILDERS
+from Models.sdtv1_github import MODEL_BUILDERS as SDTV1_MODEL_BUILDERS
+from Models.qkformer_github import MODEL_BUILDERS as QKFORMER_MODEL_BUILDERS
+
+
+_EXTERNAL_MODEL_SOURCES = [
+    SPIKFORMER_MODEL_BUILDERS,
+    SDTV1_MODEL_BUILDERS,
+    QKFORMER_MODEL_BUILDERS,
+]
+EXTERNAL_MODEL_BUILDERS = OrderedDict()
+for _src in _EXTERNAL_MODEL_SOURCES:
+    EXTERNAL_MODEL_BUILDERS.update(_src)
 
 
 def _discover_model_builders():
@@ -40,8 +54,9 @@ def _discover_model_builders():
             fn = getattr(mod, attr_name)
             if callable(fn):
                 builders[attr_name] = fn
-    for name, fn in EXTERNAL_MODEL_BUILDERS.items():
-        builders[name] = fn
+    for source in _EXTERNAL_MODEL_SOURCES:
+        for name, fn in source.items():
+            builders[name] = fn
     return builders
 
 
@@ -83,8 +98,10 @@ def build_model(model_name, device, v_threshold=1.0, weight_init="random", sew_c
         "v_threshold": v_threshold,
         "num_classes": num_classes,
         "cnf": sew_cnf,
-        "T": T,
     }
+    # Only external transformer builders consume T at construction time.
+    if model_name in EXTERNAL_MODEL_BUILDERS:
+        builder_kwargs["T"] = T
     filtered = _filter_builder_kwargs(builder, builder_kwargs)
     set_random_seed(seed)
     model = builder(**filtered)
@@ -93,12 +110,51 @@ def build_model(model_name, device, v_threshold=1.0, weight_init="random", sew_c
     return model
 
 
+class FlatImageFolderDataset(Dataset):
+    def __init__(
+        self,
+        root,
+        transform=None,
+        exts=(".jpg", ".jpeg", ".png", ".JPEG", ".JPG", ".PNG"),
+    ):
+        self.root = root
+        self.transform = transform
+        self.samples = []
+
+        if not os.path.isdir(root):
+            raise RuntimeError(f"Dataset directory does not exist: {root}")
+
+        for name in sorted(os.listdir(root)):
+            if name.endswith(exts):
+                self.samples.append(os.path.join(root, name))
+
+        if not self.samples:
+            raise RuntimeError(f"No image files found in: {root}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path = self.samples[idx]
+        img = Image.open(path).convert("RGB")
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, 0
+
+
 def build_dataset(dataset_name, data_root):
     transform = transforms.Compose([transforms.ToTensor()])
     if dataset_name == "cifar10":
         return datasets.CIFAR10(root=data_root, train=False, download=True, transform=transform), 10
     if dataset_name == "cifar100":
         return datasets.CIFAR100(root=data_root, train=False, download=True, transform=transform), 100
+    if dataset_name == "imagenet_val_flat":
+        imagenet_transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+        ])
+        return FlatImageFolderDataset(root=data_root, transform=imagenet_transform), 1000
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
@@ -191,7 +247,7 @@ def verify_consistency(model_dense, model_replaced, loader, device, T, num_batch
 def main():
     parser = argparse.ArgumentParser(description="SparseFlow Core all-ops E2E benchmark")
     parser.add_argument("--model", type=str, default="spiking_resnet18", choices=list(MODEL_BUILDERS.keys()))
-    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "cifar100"])
+    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "cifar100", "imagenet_val_flat"])
     parser.add_argument("--T", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--v_threshold", type=float, default=1.0)
@@ -204,6 +260,8 @@ def main():
     parser.add_argument("--verify_batches", type=int, default=10)
     parser.add_argument("--core_only_linear", action="store_true",
                         help="Replace only nn.Linear targets after Core analysis.")
+    parser.add_argument("--fuse_conv_lif", action="store_true",
+                        help="Enable Conv2d+LIF fused replacement in Core pipeline (default: disabled).")
     parser.add_argument("--spike_mode", type=str, default="normalized_bernoulli",
                         choices=["normalized_bernoulli", "raw_bernoulli", "raw_repeat"])
     parser.add_argument("--gpu", type=int, default=0)
@@ -240,6 +298,7 @@ def main():
     print(f"  Dataset:     {args.dataset}")
     print(f"  T:           {args.T}")
     print(f"  Batch size:  {args.batch_size}")
+    print(f"  Fuse Conv+LIF: {'ON' if args.fuse_conv_lif else 'OFF'}")
     print()
 
     registry = SpikeOpRegistry.default()
@@ -272,6 +331,7 @@ def main():
         static_zero_layers=set(),
         disable_static_zero=True,
         only_static_zero=False,
+        enable_fused_conv_lif=args.fuse_conv_lif,
     )
     replaced, sparse_count, fused_count, static_zero_count, dense_keep_count = replace_summary
 
@@ -315,6 +375,7 @@ def main():
         "weight_init": args.weight_init,
         "seed": args.seed,
         "spike_mode": args.spike_mode,
+        "fuse_conv_lif": bool(args.fuse_conv_lif),
         "num_targets": len(targets),
         "op_type_counts": dict(sorted(op_counter.items())),
         "replace_summary": {

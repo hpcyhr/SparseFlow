@@ -1,7 +1,7 @@
 """
-SparseFlow Kernels/matmul.py 鈥?Sparse Matmul Triton Kernel v1.0
+SparseFlow Kernels/matmul.py — Sparse Matmul Triton Kernel v1.0
 
-Grouped-bitmask sparse matmul for general [M, K] 脳 [K, N] 鈫?[M, N].
+Grouped-bitmask sparse matmul for general [M, K] × [K, N] → [M, N].
 Follows the same two-stage prescan + tile-dispatch pattern as conv2d.py
 and linear.py, adapted for arbitrary matmul shapes.
 
@@ -30,20 +30,20 @@ from Utils.sparse_helpers import (
 )
 
 FALLBACK_RATIO = 0.85
+TRITON_MAX_TENSOR_NUMEL = 131072
+
+_MATMUL_CONFIGS = [
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=8),
+]
 
 # ---------------------------------------------------------------------------
 # Triton kernel
 # ---------------------------------------------------------------------------
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=8),
-    ],
-    key=['M', 'N', 'K'],
-)
+@triton.autotune(configs=_MATMUL_CONFIGS, key=['M', 'N', 'K'])
 @triton.jit
 def _sparse_matmul_kernel(
     a_ptr, b_ptr, c_ptr,
@@ -66,11 +66,11 @@ def _sparse_matmul_kernel(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     if tl.sum(tile_cls) == TILE_ZERO:
-        # All-zero tile in A 鈫?output is zero
+        # All-zero tile in A → output is zero
         pass
 
     elif tl.sum(tile_cls) == TILE_DENSEISH:
-        # Dense path 鈥?iterate all K groups
+        # Dense path — iterate all K groups
         for k_start in range(0, K, BLOCK_K):
             offs_k = k_start + tl.arange(0, BLOCK_K)
             k_mask = offs_k < K
@@ -84,21 +84,23 @@ def _sparse_matmul_kernel(
             acc += tl.dot(a_vals, b_vals)
 
     else:
-        # Sparse path 鈥?bitmask-gated groups
+        # Sparse path — bitmask-gated groups
         ag = tl.load(ag_mask_ptr + pid_m + off1)
         for g in range(NUM_GROUPS):
             g_active = (ag >> g) & 1
             if tl.sum(g_active) != 0:
-                offs_k = g * GROUP_SIZE_C + tl.arange(0, GROUP_SIZE_C)
-                k_mask = offs_k < K
+                g_base = g * GROUP_SIZE_C
+                for k_off in range(0, GROUP_SIZE_C, BLOCK_K):
+                    offs_k = g_base + k_off + tl.arange(0, BLOCK_K)
+                    k_mask = offs_k < K
 
-                a_addrs = offs_m[:, None] * K + offs_k[None, :]
-                a_vals = tl.load(a_ptr + a_addrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float16)
+                    a_addrs = offs_m[:, None] * K + offs_k[None, :]
+                    a_vals = tl.load(a_ptr + a_addrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float16)
 
-                b_addrs = offs_k[:, None] * N + offs_n[None, :]
-                b_vals = tl.load(b_ptr + b_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                    b_addrs = offs_k[:, None] * N + offs_n[None, :]
+                    b_vals = tl.load(b_ptr + b_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
 
-                acc += tl.dot(a_vals, b_vals)
+                    acc += tl.dot(a_vals, b_vals)
 
     out_addrs = offs_m[:, None] * N + offs_n[None, :]
     out_mask = m_mask[:, None] & n_mask[None, :]
@@ -152,6 +154,29 @@ def sparse_matmul_forward(
     NUM_GROUPS = triton.cdiv(K, GROUP_SIZE_C)
     BM, BN = select_row_tile_sizes(M, N)
     N_TILES_M = triton.cdiv(M, BM)
+
+    max_block_n = max(cfg.kwargs['BLOCK_N'] for cfg in _MATMUL_CONFIGS)
+    if GROUP_SIZE_C * max_block_n > TRITON_MAX_TENSOR_NUMEL:
+        c = torch.mm(a.float(), b.float())
+        tile_stats = {
+            'total_tiles': N_TILES_M,
+            'fallback': True,
+            'reason': f'group_size_too_large(gs={GROUP_SIZE_C}, max_bn={max_block_n})',
+        } if return_tile_stats else None
+        ratio = 1.0 if return_avg_active_ratio else None
+        return _finalize(c, 0.0, ratio, tile_stats)
+
+    max_block_k = max(cfg.kwargs['BLOCK_K'] for cfg in _MATMUL_CONFIGS)
+    est_smem_bytes = ((BM * max_block_k) + (max_block_k * max_block_n) + (BM * max_block_n)) * 4
+    if est_smem_bytes > 160_000:
+        c = torch.mm(a.float(), b.float())
+        tile_stats = {
+            'total_tiles': N_TILES_M,
+            'fallback': True,
+            'reason': f'estimated_shared_memory_too_large(smem={est_smem_bytes})',
+        } if return_tile_stats else None
+        ratio = 1.0 if return_avg_active_ratio else None
+        return _finalize(c, 0.0, ratio, tile_stats)
 
     a_f16 = a.half().contiguous()
     b_f16 = b.half().contiguous()

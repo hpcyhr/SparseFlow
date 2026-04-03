@@ -275,9 +275,80 @@ def _infer_batch_from_shape(input_shape: Optional[Tuple]) -> int:
     shape = tuple(input_shape) if not isinstance(input_shape, str) else ()
     if len(shape) >= 5:
         return int(shape[0]) * int(shape[1])
+    if len(shape) == 4:
+        # Transformer blocks often use [T, B, N, C].
+        return int(shape[0]) * int(shape[1])
     if len(shape) >= 1:
         return int(shape[0])
     return 0
+
+
+def _is_attention_like_module(module: Any) -> bool:
+    if module is None:
+        return False
+    for attr in ("q", "k", "v", "proj"):
+        if not hasattr(module, attr):
+            return False
+    return True
+
+
+def _attention_meta_from_target(
+    target: Any,
+    conv_module: Any,
+    layer_name: str,
+    input_shape: Optional[Tuple],
+    op_type: str,
+) -> ConvMeta:
+    shape = tuple(input_shape) if (input_shape is not None and not isinstance(input_shape, str)) else ()
+    seq_len = int(shape[-2]) if len(shape) >= 2 else int(_target_get(target, "input_h", 0))
+    batch_size = _infer_batch_from_shape(input_shape)
+
+    dim = int(_target_get(target, "input_w", 0))
+    num_heads = int(_target_get(target, "num_heads", 1))
+    head_dim = int(_target_get(target, "head_dim", 0))
+
+    if conv_module is not None:
+        if hasattr(conv_module, "dim"):
+            dim = int(getattr(conv_module, "dim"))
+        elif hasattr(conv_module, "q") and hasattr(conv_module.q, "in_features"):
+            dim = int(conv_module.q.in_features)
+        if hasattr(conv_module, "num_heads"):
+            num_heads = int(getattr(conv_module, "num_heads"))
+        if hasattr(conv_module, "head_dim"):
+            head_dim = int(getattr(conv_module, "head_dim"))
+
+    dim = max(int(dim), 1)
+    num_heads = max(int(num_heads), 1)
+    if head_dim <= 0:
+        head_dim = max(dim // num_heads, 1)
+    seq_len = max(int(seq_len), 1)
+
+    if op_type == "attention_qkav":
+        macs = float(batch_size * num_heads * 2 * seq_len * seq_len * head_dim)
+    elif op_type == "attention_linear":
+        macs = float(batch_size * num_heads * 2 * seq_len * head_dim * head_dim)
+    elif op_type == "attention_qkmix":
+        macs = float(batch_size * num_heads * 4 * seq_len * head_dim * head_dim)
+    else:
+        # Conservative fallback for unknown attention variants.
+        macs = float(batch_size * dim * dim)
+
+    return ConvMeta(
+        layer_name=layer_name,
+        c_in=dim,
+        c_out=dim,
+        kernel_size=(1, 1),
+        stride=(1, 1),
+        padding=(0, 0),
+        dilation=(1, 1),
+        groups=1,
+        h_in=1,
+        w_in=1,
+        h_out=1,
+        w_out=1,
+        batch_size=batch_size,
+        macs=macs,
+    )
 
 
 def conv_meta_from_target(target: Any) -> ConvMeta:
@@ -289,6 +360,7 @@ def conv_meta_from_target(target: Any) -> ConvMeta:
         layer_name = _target_get(target, "conv_name", "")
     input_shape = _target_get(target, "input_shape")
     op_type = _target_get(target, "op_type", "")
+    attention_ops = {"attention_qkav", "attention_linear", "attention_qkmix"}
 
     if conv_module is not None:
         # Linear target from Core ReplacementTarget / dict target
@@ -313,9 +385,14 @@ def conv_meta_from_target(target: Any) -> ConvMeta:
                 batch_size=batch_size,
                 macs=macs,
             )
+        if op_type in attention_ops or _is_attention_like_module(conv_module):
+            return _attention_meta_from_target(target, conv_module, layer_name, input_shape, op_type)
         return conv_meta_from_module(conv_module, input_shape, layer_name)
 
     # Dict target (legacy bench path) or attribute-only Core target fallback.
+    if op_type in attention_ops:
+        return _attention_meta_from_target(target, None, layer_name, input_shape, op_type)
+
     if op_type == "linear":
         c_in = int(_target_get(target, "in_features", _target_get(target, "cin", _target_get(target, "c_in", 0))))
         c_out = int(_target_get(target, "out_features", _target_get(target, "cout", _target_get(target, "c_out", 0))))

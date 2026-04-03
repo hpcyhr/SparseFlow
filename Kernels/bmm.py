@@ -1,10 +1,10 @@
 """
-SparseFlow Kernels/bmm.py 鈥?Sparse Batched Matmul Triton Kernel v1.0
+SparseFlow Kernels/bmm.py — Sparse Batched Matmul Triton Kernel v1.0
 
-Sparse BMM for [B, M, K] 脳 [B, K, N] 鈫?[B, M, N].
+Sparse BMM for [B, M, K] × [B, K, N] → [B, M, N].
 Per-batch prescan on the A tensor, then dispatches per (batch, m-tile, n-tile).
 
-Critical for Spikeformer attention (Q脳K^T, attn脳V) where Q/attn carry
+Critical for Spikeformer attention (Q×K^T, attn×V) where Q/attn carry
 spike sparsity from upstream LIF neurons.
 """
 
@@ -24,9 +24,16 @@ from Utils.sparse_helpers import (
 )
 
 FALLBACK_RATIO = 0.85
+TRITON_MAX_TENSOR_NUMEL = 131072
+
+_BMM_CONFIGS = [
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4),
+]
 
 # ---------------------------------------------------------------------------
-# Prescan kernel 鈥?per batch element
+# Prescan kernel — per batch element
 # ---------------------------------------------------------------------------
 
 @triton.jit
@@ -87,14 +94,7 @@ def _prescan_bmm_kernel(
 # Compute kernel
 # ---------------------------------------------------------------------------
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4),
-    ],
-    key=['M', 'N', 'K'],
-)
+@triton.autotune(configs=_BMM_CONFIGS, key=['M', 'N', 'K'])
 @triton.jit
 def _sparse_bmm_kernel(
     a_ptr, b_ptr, c_ptr,
@@ -148,16 +148,18 @@ def _sparse_bmm_kernel(
         for g in range(NUM_GROUPS):
             g_active = (ag >> g) & 1
             if tl.sum(g_active) != 0:
-                offs_k = g * GROUP_SIZE_C + tl.arange(0, GROUP_SIZE_C)
-                k_mask = offs_k < K
+                g_base = g * GROUP_SIZE_C
+                for k_off in range(0, GROUP_SIZE_C, BLOCK_K):
+                    offs_k = g_base + k_off + tl.arange(0, BLOCK_K)
+                    k_mask = offs_k < K
 
-                a_addrs = a_batch + offs_m[:, None] * K + offs_k[None, :]
-                a_vals = tl.load(a_ptr + a_addrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float16)
+                    a_addrs = a_batch + offs_m[:, None] * K + offs_k[None, :]
+                    a_vals = tl.load(a_ptr + a_addrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float16)
 
-                b_addrs = b_batch + offs_k[:, None] * N + offs_n[None, :]
-                b_vals = tl.load(b_ptr + b_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                    b_addrs = b_batch + offs_k[:, None] * N + offs_n[None, :]
+                    b_vals = tl.load(b_ptr + b_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
 
-                acc += tl.dot(a_vals, b_vals)
+                    acc += tl.dot(a_vals, b_vals)
 
     out_addrs = c_batch + offs_m[:, None] * N + offs_n[None, :]
     out_mask = m_mask[:, None] & n_mask[None, :]
@@ -215,6 +217,29 @@ def sparse_bmm_forward(
     BN = 32 if N >= 32 else 16
     N_TILES_M = triton.cdiv(M, BM)
     N_TILES_N = triton.cdiv(N, BN)
+
+    max_block_n = max(cfg.kwargs['BLOCK_N'] for cfg in _BMM_CONFIGS)
+    if GROUP_SIZE_C * max_block_n > TRITON_MAX_TENSOR_NUMEL:
+        c = torch.bmm(a.float(), b.float())
+        stats = {
+            'total_tiles': B_dim * N_TILES_M,
+            'fallback': True,
+            'reason': f'group_size_too_large(gs={GROUP_SIZE_C}, max_bn={max_block_n})',
+        } if return_tile_stats else None
+        ratio = 1.0 if return_avg_active_ratio else None
+        return _finalize(c, 0.0, ratio, stats)
+
+    max_block_k = max(cfg.kwargs['BLOCK_K'] for cfg in _BMM_CONFIGS)
+    est_smem_bytes = ((BM * max_block_k) + (max_block_k * max_block_n) + (BM * max_block_n)) * 4
+    if est_smem_bytes > 160_000:
+        c = torch.bmm(a.float(), b.float())
+        stats = {
+            'total_tiles': B_dim * N_TILES_M,
+            'fallback': True,
+            'reason': f'estimated_shared_memory_too_large(smem={est_smem_bytes})',
+        } if return_tile_stats else None
+        ratio = 1.0 if return_avg_active_ratio else None
+        return _finalize(c, 0.0, ratio, stats)
 
     TOTAL_META = B_dim * N_TILES_M
     a_f16 = a.half().contiguous()

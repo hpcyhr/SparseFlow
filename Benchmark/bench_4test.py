@@ -1940,8 +1940,8 @@ def main():
     print(f"\n[5/7] End-to-end latency (warmup={args.warmup}) ...")
     dense_res = measure_mode(model_baseline, loader, device, args.T, args.warmup, args.spike_mode, args.power, "Dense cuDNN")
     sz_res = measure_mode(model_static_zero_only, loader, device, args.T, args.warmup, args.spike_mode, args.power, "StaticZero only")
-    so_res = measure_mode(model_sparse_only, loader, device, args.T, args.warmup, args.spike_mode, args.power, "SparseConv only")
-    hy_res = measure_mode(model_hybrid, loader, device, args.T, args.warmup, args.spike_mode, args.power, "SparseConv + StaticZero")
+    so_res = measure_mode(model_sparse_only, loader, device, args.T, args.warmup, args.spike_mode, args.power, "SparseKernel only")
+    hy_res = measure_mode(model_hybrid, loader, device, args.T, args.warmup, args.spike_mode, args.power, "SparseKernel + StaticZero")
     for r in [dense_res, sz_res, so_res, hy_res]:
         print_mode_result(r)
 
@@ -1970,8 +1970,8 @@ def main():
             model_baseline, loader, device, args.T, target_names,
             warmup=lp_warmup, num_batches=lp_batches, spike_mode=args.spike_mode)
 
-        # 6b) SparseConv-only per-layer timing
-        print(f"  Measuring SparseConv-only per-layer timing ...")
+        # 6b) SparseKernel-only per-layer timing
+        print(f"  Measuring SparseKernel-only per-layer timing ...")
         # For sparse models, the replaced layer names still exist but the module
         # Type is now SparseConv2d / StaticZeroConv2d, hooks work the same way.
         sparse_only_layer_timing = measure_layer_timing(
@@ -1984,9 +1984,9 @@ def main():
             model_hybrid, loader, device, args.T, target_names,
             warmup=lp_warmup, num_batches=lp_batches, spike_mode=args.spike_mode)
 
-        # Print SparseConv-only layer profile
+        # Print SparseKernel-only layer profile
         print(f"\n  {'=' * 77}")
-        print(f"  {'Per-layer Compare: Dense cuDNN vs SparseConv-only':^77}")
+        print(f"  {'Per-layer Compare: Dense cuDNN vs SparseKernel-only':^77}")
         print(f"  {'=' * 77}")
         print_layer_profile(baseline_layer_timing, sparse_only_layer_timing, targets,
                             e2e_baseline_ms=dense_res["avg_ms"],
@@ -2041,8 +2041,8 @@ def main():
     print(f"  {'-'*80}")
     print(f"  {'Dense cuDNN':<28} {dense_res['avg_ms']:>12.2f} {'1.000x':>10} {'0.00%':>12} {'REF':>12}")
     print(f"  {'StaticZero only':<28} {sz_res['avg_ms']:>12.2f} {sz_speedup:>9.3f}x {sz_esave:>11.2f}% {('PASS' if sz_ok else 'FAIL'):>12}")
-    print(f"  {'SparseConv only':<28} {so_res['avg_ms']:>12.2f} {so_speedup:>9.3f}x {so_esave:>11.2f}% {('PASS' if so_ok else 'FAIL'):>12}")
-    print(f"  {'SparseConv + StaticZero':<28} {hy_res['avg_ms']:>12.2f} {hy_speedup:>9.3f}x {hy_esave:>11.2f}% {('PASS' if hy_ok else 'FAIL'):>12}")
+    print(f"  {'SparseKernel only':<28} {so_res['avg_ms']:>12.2f} {so_speedup:>9.3f}x {so_esave:>11.2f}% {('PASS' if so_ok else 'FAIL'):>12}")
+    print(f"  {'SparseKernel + StaticZero':<28} {hy_res['avg_ms']:>12.2f} {hy_speedup:>9.3f}x {hy_esave:>11.2f}% {('PASS' if hy_ok else 'FAIL'):>12}")
     print(f"{'='*96}\n")
 
 
@@ -2130,7 +2130,7 @@ def main():
             else:
                 _has_diag = gd.get('active_group_ratio', -1) >= 0
                 layer_logger.log_layer(
-                    layer_name=name, mode_used="sparseconv", replaced=True,
+                    layer_name=name, mode_used="sparsekernel", replaced=True,
                     sparse_path_executed=_has_diag,
                     input_shape=str(ishape) if ishape else "",
                     element_sparsity=elem_sp,
