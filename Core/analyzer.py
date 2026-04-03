@@ -6,7 +6,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from dataclasses import dataclass
-from typing import List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 import warnings
 import torch
 import torch.nn as nn
@@ -31,6 +31,9 @@ class ReplacementTarget:
     lif_module: Optional[nn.Module] = None
     bn_name: Optional[str] = None
     bn_module: Optional[nn.Module] = None
+
+    # optional extension payload for non-conv ops
+    extra: Optional[dict] = None
 
 
 _TRANSPARENT_MODULES = (
@@ -61,6 +64,35 @@ def _is_conv3d_node(node, modules_dict: dict) -> bool:
 
 def _is_linear_node(node, modules_dict: dict) -> bool:
     return node.op == "call_module" and isinstance(modules_dict.get(node.target), nn.Linear)
+
+
+def _is_attention_like_module(module: nn.Module) -> bool:
+    if module is None:
+        return False
+    for attr in ("q", "k", "v", "proj"):
+        if not hasattr(module, attr):
+            return False
+        if not isinstance(getattr(module, attr), nn.Linear):
+            return False
+    if not hasattr(module, "attn_lif"):
+        return False
+    return True
+
+
+def _is_attention_node(node, modules_dict: dict) -> bool:
+    if node.op != "call_module":
+        return False
+    mod = modules_dict.get(node.target)
+    return _is_attention_like_module(mod)
+
+
+def _infer_attention_variant(module: nn.Module) -> str:
+    cls = module.__class__.__name__.lower()
+    if "qkmix" in cls:
+        return "attention_qkmix"
+    if hasattr(module, "scale"):
+        return "attention_qkav"
+    return "attention_linear"
 
 
 def _is_spike_node(node, modules_dict: dict, registry: SpikeOpRegistry) -> bool:
@@ -122,6 +154,18 @@ def display_block_info(target: ReplacementTarget) -> str:
         w_s = str(w) if w > 0 else "?"
         return f"D={d_s} H={h_s} W={w_s}"
 
+    if op in ("attention_qkav", "attention_linear", "attention_qkmix"):
+        n, c = target.input_h, target.input_w
+        n_s = str(n) if n > 0 else "?"
+        c_s = str(c) if c > 0 else "?"
+        return f"N={n_s} C={c_s}"
+
+    if op in ("matmul", "bmm"):
+        m, k = target.input_h, target.input_w
+        m_s = str(m) if m > 0 else "?"
+        k_s = str(k) if k > 0 else "?"
+        return f"M={m_s} K={k_s}"
+
     return ""
 
 
@@ -171,22 +215,31 @@ class NetworkAnalyzer:
         if sample_input is not None:
             input_shapes = self._infer_input_shapes(model, sample_input)
 
+        # Always collect attention-like block targets as an extra pass.
+        attention_targets = self._analyze_attention_modules(model, input_shapes)
+        attention_names = {t.conv_name for t in attention_targets}
+
         fx_error = None
         try:
             targets = self._analyze_fx(model, input_shapes)
             if targets:
-                return targets
+                merged = self._merge_targets(targets, attention_targets, attention_names)
+                if merged:
+                    return merged
         except Exception as err:
             fx_error = err
             warnings.warn(
                 f"[SparseFlow] torch.fx symbolic trace failed: {err}\n"
                 "  Falling back to runtime-order scan mode."
             )
+
         if sample_input is not None:
             try:
                 rt_targets = self._analyze_runtime_fallback(model, input_shapes, sample_input)
                 if rt_targets:
-                    return rt_targets
+                    merged = self._merge_targets(rt_targets, attention_targets, attention_names)
+                    if merged:
+                        return merged
             except Exception as err:
                 warnings.warn(
                     f"[SparseFlow] runtime-order fallback failed: {err}\n"
@@ -197,7 +250,59 @@ class NetworkAnalyzer:
                 "[SparseFlow] torch.fx produced no targets and no sample input was provided; "
                 "falling back to linear module-order scan mode."
             )
-        return self._analyze_fallback(model, input_shapes)
+
+        fb_targets = self._analyze_fallback(model, input_shapes)
+        merged = self._merge_targets(fb_targets, attention_targets, attention_names)
+        return merged
+
+    @staticmethod
+    def _is_inside_attention_target(module_name: str, attention_names: Set[str]) -> bool:
+        for attn_name in attention_names:
+            if module_name.startswith(attn_name + "."):
+                return True
+        return False
+
+    def _merge_targets(
+        self,
+        base_targets: List[ReplacementTarget],
+        attention_targets: List[ReplacementTarget],
+        attention_names: Set[str],
+    ) -> List[ReplacementTarget]:
+        merged: List[ReplacementTarget] = []
+        seen: Set[str] = set()
+
+        for t in base_targets:
+            name = t.conv_name
+            if self._is_inside_attention_target(name, attention_names):
+                # Parent attention block replacement has priority over child linears.
+                continue
+            if name in seen:
+                continue
+            merged.append(t)
+            seen.add(name)
+
+        for t in attention_targets:
+            if t.conv_name in seen:
+                continue
+            merged.append(t)
+            seen.add(t.conv_name)
+
+        return merged
+
+    def _analyze_attention_modules(self, model: nn.Module, input_shapes: dict) -> List[ReplacementTarget]:
+        targets: List[ReplacementTarget] = []
+        for name, module in model.named_modules():
+            if not _is_attention_like_module(module):
+                continue
+            target = self._make_attention_target(
+                name=name,
+                module=module,
+                spike_name=(f"{name}.attn_lif" if hasattr(module, "attn_lif") else name),
+                input_shapes=input_shapes,
+            )
+            if target is not None:
+                targets.append(target)
+        return targets
 
     def _analyze_fx(self, model: nn.Module, input_shapes: dict) -> List[ReplacementTarget]:
         graph_module = torch.fx.symbolic_trace(model)
@@ -259,6 +364,11 @@ class NetworkAnalyzer:
                 if name not in visited:
                     found.append((name, "linear"))
                 continue
+            if _is_attention_node(node, modules_dict):
+                name = node.target
+                if name not in visited:
+                    found.append((name, "attention"))
+                continue
             if _is_spike_node(node, modules_dict, self.registry):
                 continue
 
@@ -293,6 +403,8 @@ class NetworkAnalyzer:
                     target_type = "conv3d"
                 elif isinstance(next_module, nn.Linear):
                     target_type = "linear"
+                elif _is_attention_like_module(next_module):
+                    target_type = "attention"
                 else:
                     continue
 
@@ -329,12 +441,13 @@ class NetworkAnalyzer:
                 return "conv3d"
             if isinstance(mod, nn.Linear):
                 return "linear"
+            if _is_attention_like_module(mod):
+                return "attention"
             return None
 
         def make_hook(name: str, kind: str):
             def hook(_m, _inp, _out):
                 events.append((kind, name))
-
             return hook
 
         for name, module in model.named_modules():
@@ -346,7 +459,6 @@ class NetworkAnalyzer:
         try:
             try:
                 from spikingjelly.activation_based import functional as sj_func
-
                 sj_func.reset_net(model)
             except ImportError:
                 pass
@@ -406,6 +518,8 @@ class NetworkAnalyzer:
             return self._make_conv3d_target(module_name, module, spike_name, input_shapes)
         if target_type == "linear":
             return self._make_linear_target(module_name, module, spike_name)
+        if target_type == "attention":
+            return self._make_attention_target(module_name, module, spike_name, input_shapes)
         return None
 
     def _make_conv2d_target(
@@ -554,6 +668,35 @@ class NetworkAnalyzer:
             block_size=None,
         )
 
+    def _make_attention_target(
+        self,
+        name: str,
+        module: nn.Module,
+        spike_name: str,
+        input_shapes: dict,
+    ) -> Optional[ReplacementTarget]:
+        if not _is_attention_like_module(module):
+            return None
+
+        ishape = input_shapes.get(name)
+        n, c = self._extract_nc(ishape)
+        op_type = _infer_attention_variant(module)
+        extra = {
+            "num_heads": int(getattr(module, "num_heads", 1)),
+            "head_dim": int(getattr(module, "head_dim", max(1, c // max(1, int(getattr(module, "num_heads", 1)))))),
+        }
+
+        return ReplacementTarget(
+            conv_name=name,
+            conv_module=module,
+            spike_name=spike_name,
+            op_type=op_type,
+            block_size=None,
+            input_h=n,   # token length
+            input_w=c,   # channel dim
+            extra=extra,
+        )
+
     @staticmethod
     def _extract_hw(ishape) -> Tuple[int, int]:
         if ishape is None:
@@ -579,6 +722,16 @@ class NetworkAnalyzer:
         return 0, 0, 0
 
     @staticmethod
+    def _extract_nc(ishape) -> Tuple[int, int]:
+        # For attention block input:
+        # [T, B, N, C] or [B, N, C]
+        if ishape is None:
+            return 0, 0
+        if len(ishape) >= 2:
+            return int(ishape[-2]), int(ishape[-1])
+        return 0, 0
+
+    @staticmethod
     def _infer_input_shapes(model: nn.Module, sample_input: torch.Tensor):
         input_shapes = {}
         hooks = []
@@ -589,7 +742,6 @@ class NetworkAnalyzer:
                     x = inp[0]
                     if isinstance(x, torch.Tensor):
                         input_shapes[name] = tuple(x.shape)
-
             return hook
 
         for name, module in model.named_modules():
@@ -597,7 +749,6 @@ class NetworkAnalyzer:
 
         try:
             from spikingjelly.activation_based import functional as sj_func
-
             sj_func.reset_net(model)
         except ImportError:
             pass

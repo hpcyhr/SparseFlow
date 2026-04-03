@@ -15,6 +15,7 @@ from Ops.sparse_conv2d import SparseConv2d
 from Ops.static_zero_conv2d import StaticZeroConv2d
 from Ops.static_zero_linear import StaticZeroLinear
 from Ops.sparse_fused_conv_lif import FusedSparseConvLIF
+from Ops.sparse_attention_block import SparseAttentionBlock
 
 
 def _set_module_by_name(model: nn.Module, name: str, new_module: nn.Module):
@@ -89,12 +90,6 @@ class ModuleReplacer:
                 _set_module_by_name(model, module_name, new_module)
                 replaced += 1
                 static_zero_count += 1
-                # Keep downstream BN/LIF untouched for static-zero route.
-                # Reason:
-                #   StaticZeroConv2d only guarantees exact conv(x=0) output.
-                #   BN/LIF may be stateful / non-identity (especially in SNN blocks),
-                #   so removing them can break numerical equivalence.
-                #   Only explicit fused route is allowed to fold/remove BN/LIF.
                 if self.verbose:
                     if op == "linear":
                         print(f"  [STATIC ] {module_name} ({op}) -> StaticZeroLinear")
@@ -164,7 +159,6 @@ class ModuleReplacer:
 
         if op == "depthwise_conv2d":
             from Ops.sparse_depthwise_conv2d import SparseDepthwiseConv2d
-
             sparse = SparseDepthwiseConv2d.from_dense(mod)
             return sparse.to(mod.weight.device)
 
@@ -195,7 +189,6 @@ class ModuleReplacer:
 
         if op == "conv1d":
             from Ops.sparse_conv1d import SparseConv1d
-
             if not isinstance(mod, nn.Conv1d):
                 return None
             sparse = SparseConv1d.from_dense(mod)
@@ -203,7 +196,6 @@ class ModuleReplacer:
 
         if op == "conv3d":
             from Ops.sparse_conv3d import SparseConv3d
-
             if not isinstance(mod, nn.Conv3d):
                 return None
             sparse = SparseConv3d.from_dense(mod)
@@ -211,11 +203,15 @@ class ModuleReplacer:
 
         if op == "linear":
             from Ops.sparse_linear import SparseLinear
-
             if not isinstance(mod, nn.Linear):
                 return None
             sparse = SparseLinear.from_dense(mod)
             return sparse.to(mod.weight.device)
+
+        if op in ("attention_qkav", "attention_linear", "attention_qkmix"):
+            # Replace the whole attention block with sparse event-op backed block.
+            sparse = SparseAttentionBlock.from_dense(mod, variant=op)
+            return sparse
 
         return None
 
@@ -227,6 +223,13 @@ class ModuleReplacer:
             in_f = mod.in_features
             out_f = mod.out_features
             print(f"  [REPLACE] {target.conv_name} (linear {in_f}->{out_f}) <- {target.spike_name}")
+            return
+
+        if op in ("attention_qkav", "attention_linear", "attention_qkmix"):
+            info = display_block_info(target)
+            h = getattr(mod, "num_heads", "?")
+            d = getattr(mod, "head_dim", "?")
+            print(f"  [REPLACE] {target.conv_name} ({op}, heads={h}, head_dim={d}) <- {target.spike_name}, {info}")
             return
 
         if "fused" in op and actually_fused:

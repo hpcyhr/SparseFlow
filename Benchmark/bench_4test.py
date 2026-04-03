@@ -927,7 +927,96 @@ def print_mode_result(res):
     print(f"    {res['label']:<24}{res['avg_ms']:.2f} ms/batch  (total={res['total_ms']:.1f} ms, {res['num_batches']} batches)")
 
 
-def build_fourway_models(model_baseline, targets, hybrid_static_zero_layers, hybrid_sparse_set=None):
+def _empty_runtime_hint_summary():
+    return {
+        "requested_dense_layers": 0,
+        "requested_zero_layers": 0,
+        "forced_dense": 0,
+        "forced_zero": 0,
+        "missing_module": 0,
+        "not_hintable": 0,
+    }
+
+
+def _apply_runtime_backend_hints(
+    model,
+    force_dense_layers=None,
+    force_zero_layers=None,
+    verbose=True,
+    label="",
+):
+    """Apply runtime backend hints to sparse modules.
+
+    This does NOT change the replacement topology; it only pre-sets sparse module
+    runtime policy flags (`_force_dense` / `_force_zero`) where supported.
+    """
+    dense_layers = set(force_dense_layers or [])
+    zero_layers = set(force_zero_layers or [])
+    # Zero hint has priority if overlap exists.
+    dense_layers -= zero_layers
+
+    summary = _empty_runtime_hint_summary()
+    summary["requested_dense_layers"] = len(dense_layers)
+    summary["requested_zero_layers"] = len(zero_layers)
+
+    modules = dict(model.named_modules())
+    for name in sorted(dense_layers | zero_layers):
+        mod = modules.get(name)
+        if mod is None:
+            summary["missing_module"] += 1
+            continue
+
+        want_zero = name in zero_layers
+        want_dense = name in dense_layers and not want_zero
+        touched = False
+
+        if hasattr(mod, "_force_zero"):
+            mod._force_zero = bool(want_zero)
+            touched = True
+        if hasattr(mod, "_force_dense"):
+            mod._force_dense = bool(want_dense and not want_zero)
+            touched = True
+        if hasattr(mod, "_warmup_left"):
+            mod._warmup_left = 0
+            touched = True
+        if hasattr(mod, "_ema_active_ratio"):
+            if want_zero:
+                mod._ema_active_ratio = 0.0
+            elif want_dense:
+                thr = float(getattr(mod, "_dense_threshold", 0.85))
+                mod._ema_active_ratio = thr + 1e-3
+            touched = True
+
+        if not touched:
+            summary["not_hintable"] += 1
+            continue
+
+        if want_zero:
+            summary["forced_zero"] += 1
+        elif want_dense:
+            summary["forced_dense"] += 1
+
+    if verbose:
+        prefix = f"  [{label}] " if label else "  "
+        print(
+            prefix
+            + "runtime hints: "
+            + f"force_dense={summary['forced_dense']}, "
+            + f"force_zero={summary['forced_zero']}, "
+            + f"missing={summary['missing_module']}, "
+            + f"not_hintable={summary['not_hintable']}"
+        )
+    return summary
+
+
+def build_fourway_models(
+    model_baseline,
+    targets,
+    hybrid_static_zero_layers,
+    hybrid_sparse_set=None,
+    sparse_only_force_dense_layers=None,
+    sparse_only_force_zero_layers=None,
+):
     if hybrid_static_zero_layers is None:
         hybrid_static_zero_layers = set()
     if hybrid_sparse_set is None:
@@ -942,6 +1031,13 @@ def build_fourway_models(model_baseline, targets, hybrid_static_zero_layers, hyb
     _, so_sp, _, so_sz, so_dk = replace_model(
         model_sparse_only, targets, fused=False, static_zero_layers=set(),
         only_static_zero=False, selective_sparse_set=None)
+    so_hint = _apply_runtime_backend_hints(
+        model_sparse_only,
+        force_dense_layers=sparse_only_force_dense_layers,
+        force_zero_layers=sparse_only_force_zero_layers,
+        verbose=True,
+        label="Sparse-only",
+    )
 
     model_hybrid = copy.deepcopy(model_baseline)
     _, hy_sp, _, hy_sz, hy_dk = replace_model(
@@ -951,10 +1047,16 @@ def build_fourway_models(model_baseline, targets, hybrid_static_zero_layers, hyb
 
     counts = {
         "static_zero_only": {"num_sparse_conv": sz_sp, "num_static_zero": sz_sz, "num_dense_keep": sz_dk},
-        "sparse_only": {"num_sparse_conv": so_sp, "num_static_zero": so_sz, "num_dense_keep": so_dk},
+        "sparse_only": {
+            "num_sparse_conv": so_sp,
+            "num_static_zero": so_sz,
+            "num_dense_keep": so_dk,
+            "runtime_force_dense": so_hint["forced_dense"],
+            "runtime_force_zero": so_hint["forced_zero"],
+        },
         "hybrid": {"num_sparse_conv": hy_sp, "num_static_zero": hy_sz, "num_dense_keep": hy_dk},
     }
-    return model_static_zero_only, model_sparse_only, model_hybrid, counts
+    return model_static_zero_only, model_sparse_only, model_hybrid, counts, so_hint
 
 
 def _print_core_target_report(targets):
@@ -1294,6 +1396,21 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
         only_static_zero=False,
         enable_fused_conv_lif=args.fuse_conv_lif,
     )
+    core_target_names = {_core_target_name(t) for t in targets}
+    sparse_only_force_dense_layers = set()
+    if args.sparse_only_dispatch_dense:
+        sparse_only_force_dense_layers = {
+            n for n in core_target_names
+            if n not in hybrid_sparse_set and n not in zero_layers
+        }
+    sparse_only_force_zero_layers = set(zero_layers) if args.sparse_only_promote_zero else set()
+    sparse_only_hint_summary = _apply_runtime_backend_hints(
+        model_sparse,
+        force_dense_layers=sparse_only_force_dense_layers,
+        force_zero_layers=sparse_only_force_zero_layers,
+        verbose=True,
+        label="Sparse-only",
+    )
 
     print("  - Building SparseKernel + StaticZero ...")
     model_hybrid = copy.deepcopy(model_baseline)
@@ -1329,6 +1446,8 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
             "fused": so_summary[2],
             "static_zero": so_summary[3],
             "dense_keep": so_summary[4],
+            "runtime_force_dense": sparse_only_hint_summary["forced_dense"],
+            "runtime_force_zero": sparse_only_hint_summary["forced_zero"],
         },
         "hybrid": {
             "total": total_targets,
@@ -1344,6 +1463,20 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
             f"    {mode_name}: total={c['total']}, sparse={c['sparse']}, "
             f"fused={c['fused']}, static_zero={c['static_zero']}, dense_keep={c['dense_keep']}"
         )
+
+    if args.inference_mode:
+        n_so = prepare_for_timing(model_sparse)
+        n_hy = prepare_for_timing(model_hybrid)
+        print(f"  [Timing] inference_mode enabled: sparse_only={n_so}, hybrid={n_hy}")
+
+    if args.launch_all_tiles:
+        n_so_launch = set_launch_mode(model_sparse, launch_all=True)
+        n_hy_launch = set_launch_mode(model_hybrid, launch_all=True)
+        print(f"  [Timing] launch_all_tiles enabled: sparse_only={n_so_launch}, hybrid={n_hy_launch}")
+
+    if args.inference_mode or args.launch_all_tiles:
+        print(f"  [Timing] sparse_only sync state: {count_sync_state(model_sparse)}")
+        print(f"  [Timing] hybrid sync state: {count_sync_state(model_hybrid)}")
 
     print(f"\n[6/7] End-to-end latency (warmup={args.warmup}) ...")
     dense_res = measure_mode(model_baseline, loader, device, args.T, args.warmup, args.spike_mode, args.power, "Dense cuDNN")
@@ -1431,6 +1564,11 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
             sorted(list(unstable_zero_layers)) if "unstable_zero_layers" in locals() else []
         ),
         "route_counts": route_counts,
+        "sparse_only_runtime_hints": {
+            "dispatch_dense_enabled": bool(args.sparse_only_dispatch_dense),
+            "promote_zero_enabled": bool(args.sparse_only_promote_zero),
+            **sparse_only_hint_summary,
+        },
         "dense": {
             "ms_per_batch": round(dense_res["avg_ms"], 4),
             "total_ms": round(dense_res["total_ms"], 4),
@@ -1456,6 +1594,8 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
             "cosine_sim": round(so_cos, 8),
             "pred_agreement_pct": round(so_agr * 100.0, 4),
             "max_abs_err": round(so_mabs, 6),
+            "runtime_force_dense": int(sparse_only_hint_summary.get("forced_dense", 0)),
+            "runtime_force_zero": int(sparse_only_hint_summary.get("forced_zero", 0)),
             "consistency": "PASS" if so_ok else "FAIL",
         },
         "hybrid": {
@@ -1556,6 +1696,30 @@ def main():
         action="store_true",
         help="Enable Conv2d+LIF fused replacement in Core pipeline (default: disabled).",
     )
+    parser.add_argument(
+        "--sparse_only_dispatch_dense",
+        dest="sparse_only_dispatch_dense",
+        action="store_true",
+        default=True,
+        help=(
+            "In Sparse-only mode, force dense runtime path for layers that dispatch "
+            "marks as dense (keeps sparse modules but avoids low-gain sparse execution)."
+        ),
+    )
+    parser.add_argument(
+        "--no_sparse_only_dispatch_dense",
+        dest="sparse_only_dispatch_dense",
+        action="store_false",
+        help="Disable dispatch-driven dense runtime hints in Sparse-only mode.",
+    )
+    parser.add_argument(
+        "--sparse_only_promote_zero",
+        action="store_true",
+        help=(
+            "In Sparse-only mode, also force zero-runtime path for exact-zero layers. "
+            "Default OFF to keep Sparse-only separate from StaticZero semantics."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1591,6 +1755,8 @@ def main():
     print(f"  Power (TDP):  {args.power} W")
     print(f"  Min spatial:  {args.min_spatial_size}x{args.min_spatial_size}")
     print(f"  Layer profile: {'ON' if args.layer_profile else 'OFF'}")
+    print(f"  Sparse-only dispatch-dense hint: {'ON' if args.sparse_only_dispatch_dense else 'OFF'}")
+    print(f"  Sparse-only promote-zero hint:  {'ON' if args.sparse_only_promote_zero else 'OFF'}")
     print()
 
     print(f"[1/7] Building {args.model} ...")
@@ -1733,8 +1899,22 @@ def main():
 
     print_dispatch_decision_report(targets, group_sparsity_data, dispatch_decisions)
 
-    model_static_zero_only, model_sparse_only, model_hybrid, route_counts = build_fourway_models(
-        model_baseline, targets, hybrid_static_zero_layers, hybrid_sparse_set=hybrid_sparse_set)
+    sparse_only_force_dense_layers = set()
+    if args.sparse_only_dispatch_dense:
+        sparse_only_force_dense_layers = {
+            t["name"] for t in targets
+            if t["name"] not in hybrid_sparse_set and t["name"] not in zero_layers
+        }
+    sparse_only_force_zero_layers = set(zero_layers) if args.sparse_only_promote_zero else set()
+
+    model_static_zero_only, model_sparse_only, model_hybrid, route_counts, sparse_only_hint_summary = build_fourway_models(
+        model_baseline,
+        targets,
+        hybrid_static_zero_layers,
+        hybrid_sparse_set=hybrid_sparse_set,
+        sparse_only_force_dense_layers=sparse_only_force_dense_layers,
+        sparse_only_force_zero_layers=sparse_only_force_zero_layers,
+    )
     print(f"\n  Replacement finished:")
     for mode_name, rc in route_counts.items():
         print(f"    {mode_name}: {rc['num_sparse_conv']} Sparse + {rc['num_static_zero']} StaticZero + {rc['num_dense_keep']} DenseKeep")
@@ -1901,6 +2081,11 @@ def main():
         "num_zero_layers": len(zero_layers),
         "static_zero_layers": sorted(list(zero_layers)),
         "route_counts": route_counts,
+        "sparse_only_runtime_hints": {
+            "dispatch_dense_enabled": bool(args.sparse_only_dispatch_dense),
+            "promote_zero_enabled": bool(args.sparse_only_promote_zero),
+            **sparse_only_hint_summary,
+        },
         "hybrid_static_zero_layers": sorted(list(hybrid_static_zero_layers)),
         "hybrid_sparse_layers": sorted(list(hybrid_sparse_set)),
         "hybrid_dense_keep_layers": sorted([t["name"] for t in targets if t["name"] not in hybrid_static_zero_layers and t["name"] not in hybrid_sparse_set]),
@@ -1908,7 +2093,15 @@ def main():
         "dispatch_invalid_staticzero_remapped_layers": sorted(list(invalid_static_zero_layers)) if "invalid_static_zero_layers" in locals() else [],
         "dense": {"ms_per_batch": round(dense_res["avg_ms"], 2), "energy_j": round(dense_res["energy_j"], 4)},
         "static_zero_only": {"ms_per_batch": round(sz_res["avg_ms"], 2), "speedup": round(sz_speedup, 4), "energy_saving_pct": round(sz_esave, 2), "cosine_sim": round(sz_cos, 8), "consistency": "PASS" if sz_ok else "FAIL"},
-        "sparse_only": {"ms_per_batch": round(so_res["avg_ms"], 2), "speedup": round(so_speedup, 4), "energy_saving_pct": round(so_esave, 2), "cosine_sim": round(so_cos, 8), "consistency": "PASS" if so_ok else "FAIL"},
+        "sparse_only": {
+            "ms_per_batch": round(so_res["avg_ms"], 2),
+            "speedup": round(so_speedup, 4),
+            "energy_saving_pct": round(so_esave, 2),
+            "cosine_sim": round(so_cos, 8),
+            "runtime_force_dense": int(sparse_only_hint_summary.get("forced_dense", 0)),
+            "runtime_force_zero": int(sparse_only_hint_summary.get("forced_zero", 0)),
+            "consistency": "PASS" if so_ok else "FAIL",
+        },
         "hybrid": {"ms_per_batch": round(hy_res["avg_ms"], 2), "speedup": round(hy_speedup, 4), "energy_saving_pct": round(hy_esave, 2), "cosine_sim": round(hy_cos, 8), "consistency": "PASS" if hy_ok else "FAIL"},
     }
     # NEW: include layer profile data in JSON

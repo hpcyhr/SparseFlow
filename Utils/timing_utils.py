@@ -1,5 +1,6 @@
+# Utils/timing_utils.py
 """
-Utils/timing_utils.py — Timing hygiene and A/B tile launch utilities.
+Utils/timing_utils.py - Timing hygiene and A/B tile launch utilities.
 
 Usage in bench_4test.py:
     from Utils.timing_utils import prepare_for_timing, set_launch_mode, count_sync_state
@@ -16,75 +17,83 @@ Usage in bench_4test.py:
 
     # Verify clean state before timing:
     print(count_sync_state(model_sparse_only))
+
+v26 notes:
+- prepare_for_timing now covers both SparseConv2d and SparseLinear (any module
+  that implements set_inference_mode(bool)).
+- set_launch_mode now applies to any module implementing
+  set_launch_all_tiles(bool) (currently SparseConv2d).
+- count_sync_state now reports over all sparse policy modules (conv + linear).
 """
 
-import torch
 import torch.nn as nn
 from typing import Dict
 
 
+def _iter_sparse_policy_modules(model: nn.Module):
+    """Yield modules that expose sparse runtime policy knobs.
+
+    Criteria are capability-based so new sparse ops can be included without
+    changing this file:
+    - has set_inference_mode(...), or
+    - has _inference_mode / _force_dense / _force_zero state attributes.
+    """
+    for name, module in model.named_modules():
+        if (
+            hasattr(module, "set_inference_mode")
+            or hasattr(module, "_inference_mode")
+            or hasattr(module, "_force_dense")
+            or hasattr(module, "_force_zero")
+        ):
+            yield name, module
+
+
 def prepare_for_timing(model: nn.Module) -> int:
-    """Set all SparseConv2d modules to sync-free inference mode.
+    """Set sparse policy modules to sync-free inference mode.
 
     This ensures that during timed region:
-    - inference_mode=True: _should_collect_ratio() → False (no periodic calibration)
+    - inference_mode=True: _should_collect_ratio() -> False (no periodic calibration)
     - collect_diag=False: no diagnostic data collection
     - profile_runtime=False: no per-op timing stamps
 
-    Combined with the P0 fix in conv2d.py, this guarantees zero GPU→CPU
-    synchronizations in the sparse forward path (with Mode B), or exactly
-    one sync per layer (with Mode A from nonzero()).
+    Combined with the sync-gating fixes in sparse kernels, this minimizes
+    GPU->CPU synchronizations during timed runs.
 
-    Returns number of modules configured.
+    Returns number of modules configured (conv + linear sparse modules).
     """
-    from Ops.sparse_conv2d import SparseConv2d
-
     count = 0
-    for name, module in model.named_modules():
-        if isinstance(module, SparseConv2d):
+    for _, module in _iter_sparse_policy_modules(model):
+        if hasattr(module, "set_inference_mode"):
             module.set_inference_mode(True)
             count += 1
     return count
 
 
 def set_launch_mode(model: nn.Module, launch_all: bool) -> int:
-    """Set tile launch mode for all SparseConv2d modules.
+    """Set tile launch mode for all modules that support it.
 
     Args:
         launch_all: If True, use Mode B (launch all tiles, zero tiles early-return).
                     If False, use Mode A (build active tile IDs, launch only active).
 
-    Mode B advantages:
-    - Eliminates the nonzero() GPU→CPU sync in _build_active_tile_ids.
-    - With prepare_for_timing(), achieves truly zero syncs per forward.
-    - Zero tiles execute ~2 memory ops then return — very cheap.
-
-    Mode A advantages:
-    - Launches fewer kernel programs (only active tiles).
-    - May win at very high sparsity (>95%) where most tiles are zero.
-    - Handles the all-tiles-zero edge case without launching any tile.
-
     Returns number of modules configured.
     """
-    from Ops.sparse_conv2d import SparseConv2d
-
     count = 0
-    for name, module in model.named_modules():
-        if isinstance(module, SparseConv2d):
+    for _, module in model.named_modules():
+        if hasattr(module, "set_launch_all_tiles"):
             module.set_launch_all_tiles(launch_all)
             count += 1
     return count
 
 
 def count_sync_state(model: nn.Module) -> Dict[str, int]:
-    """Count SparseConv2d modules by sync-relevant state.
+    """Count sparse policy modules by sync-relevant state.
 
     Use to verify timing readiness before measure_mode().
 
-    Expected clean state: all counters zero except 'total' and 'launch_all'/'launch_active'.
+    Expected clean state: all counters zero except 'total' and
+    launch mode counters.
     """
-    from Ops.sparse_conv2d import SparseConv2d
-
     stats = {
         "total": 0,
         "inference_mode": 0,
@@ -97,22 +106,24 @@ def count_sync_state(model: nn.Module) -> Dict[str, int]:
         "launch_active": 0,
     }
 
-    for name, module in model.named_modules():
-        if isinstance(module, SparseConv2d):
-            stats["total"] += 1
-            if module._inference_mode:
-                stats["inference_mode"] += 1
-            if module.collect_diag:
-                stats["collect_diag"] += 1
-            if module.profile_runtime:
-                stats["profile_runtime"] += 1
-            if module._warmup_left > 0:
-                stats["warmup_pending"] += 1
-            if module._force_zero:
-                stats["force_zero"] += 1
-            if module._force_dense:
-                stats["force_dense"] += 1
-            if module.launch_all_tiles:
+    for _, module in _iter_sparse_policy_modules(model):
+        stats["total"] += 1
+
+        if bool(getattr(module, "_inference_mode", False)):
+            stats["inference_mode"] += 1
+        if bool(getattr(module, "collect_diag", False)):
+            stats["collect_diag"] += 1
+        if bool(getattr(module, "profile_runtime", False)):
+            stats["profile_runtime"] += 1
+        if int(getattr(module, "_warmup_left", 0)) > 0:
+            stats["warmup_pending"] += 1
+        if bool(getattr(module, "_force_zero", False)):
+            stats["force_zero"] += 1
+        if bool(getattr(module, "_force_dense", False)):
+            stats["force_dense"] += 1
+
+        if hasattr(module, "launch_all_tiles"):
+            if bool(getattr(module, "launch_all_tiles", False)):
                 stats["launch_all"] += 1
             else:
                 stats["launch_active"] += 1
@@ -121,15 +132,10 @@ def count_sync_state(model: nn.Module) -> Dict[str, int]:
 
 
 def estimate_sync_count(model: nn.Module) -> Dict[str, int]:
-    """Estimate the number of GPU→CPU syncs per forward pass.
+    """Estimate the number of GPU->CPU syncs per forward pass.
 
-    Based on current module configuration and the v25 sync gating:
-    - Each SparseConv2d with inference_mode=True and launch_all_tiles=True: 0 syncs
-    - Each SparseConv2d with inference_mode=True and launch_all_tiles=False: 1 sync
-    - Each SparseConv2d with inference_mode=False: up to 6 syncs (when calib fires)
+    Heuristic based on current module configuration.
     """
-    from Ops.sparse_conv2d import SparseConv2d
-
     result = {
         "zero_sync_modules": 0,
         "one_sync_modules": 0,
@@ -138,27 +144,40 @@ def estimate_sync_count(model: nn.Module) -> Dict[str, int]:
         "total_max_syncs_per_forward": 0,
     }
 
-    for name, module in model.named_modules():
-        if isinstance(module, SparseConv2d):
-            if module._force_zero or module._force_dense:
-                result["zero_sync_modules"] += 1
-            elif module._inference_mode:
-                if module.launch_all_tiles:
+    for _, module in _iter_sparse_policy_modules(model):
+        force_zero = bool(getattr(module, "_force_zero", False))
+        force_dense = bool(getattr(module, "_force_dense", False))
+        inference_mode = bool(getattr(module, "_inference_mode", False))
+        has_launch_toggle = hasattr(module, "launch_all_tiles")
+        launch_all = bool(getattr(module, "launch_all_tiles", False))
+
+        if force_zero or force_dense:
+            result["zero_sync_modules"] += 1
+            continue
+
+        if has_launch_toggle:
+            if inference_mode:
+                if launch_all:
                     result["zero_sync_modules"] += 1
                 else:
                     result["one_sync_modules"] += 1
                     result["total_min_syncs_per_forward"] += 1
                     result["total_max_syncs_per_forward"] += 1
             else:
-                # Without inference_mode, periodic calibration may trigger syncs.
-                # Min: 0 (non-calib step, launch_all) or 1 (non-calib, launch_active)
-                # Max: 6 (calib step)
-                if module.launch_all_tiles:
+                if launch_all:
                     result["zero_sync_modules"] += 1
                     result["total_max_syncs_per_forward"] += 6
                 else:
                     result["one_sync_modules"] += 1
                     result["total_min_syncs_per_forward"] += 1
                     result["total_max_syncs_per_forward"] += 6
+        else:
+            # Modules without tile-launch mode (e.g., SparseLinear):
+            # inference_mode avoids periodic calibration syncs.
+            if inference_mode:
+                result["zero_sync_modules"] += 1
+            else:
+                result["multi_sync_modules"] += 1
+                result["total_max_syncs_per_forward"] += 6
 
     return result
