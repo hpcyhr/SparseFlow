@@ -57,4 +57,3 @@ class BenchmarkTimer:
             times_ms.append((t1 - t0) * 1000.0)
         avg_ms = float(sum(times_ms) / len(times_ms))
         return {"avg_ms": avg_ms, "times_ms": times_ms}
-

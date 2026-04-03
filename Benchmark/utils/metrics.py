@@ -28,4 +28,3 @@ def correctness_metrics(dense_out: torch.Tensor, sparse_out: torch.Tensor) -> Di
         "cosine_similarity": cosine_similarity(dense_out, sparse_out),
         "max_abs_error": max_abs_error(dense_out, sparse_out),
     }
-
