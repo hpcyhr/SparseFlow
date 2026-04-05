@@ -1073,6 +1073,41 @@ def _print_core_target_report(targets):
         print(f"    - {op_name}: {count}")
 
 
+def _normalize_core_targets_for_fuse_mode(targets, fuse_conv_lif):
+    """
+    Analyzer may mark conv targets as fused_conv* based on topology.
+    When fuse_conv_lif is OFF, normalize them back to plain conv2d_* so
+    reports and counters reflect actual replacement behavior.
+    """
+    if fuse_conv_lif:
+        return 0
+
+    remap = {
+        "fused_conv3x3_lif": "conv2d_3x3",
+        "fused_conv3x3s2_lif": "conv2d_3x3_s2",
+        "fused_conv1x1_lif": "conv2d_1x1",
+    }
+
+    changed = 0
+    for t in targets:
+        old_op = getattr(t, "op_type", "")
+        new_op = remap.get(old_op, old_op)
+        if new_op == old_op:
+            continue
+        t.op_type = new_op
+        # Clear fused-only payload to avoid accidental downstream confusion.
+        if hasattr(t, "lif_name"):
+            t.lif_name = None
+        if hasattr(t, "lif_module"):
+            t.lif_module = None
+        if hasattr(t, "bn_name"):
+            t.bn_name = None
+        if hasattr(t, "bn_module"):
+            t.bn_module = None
+        changed += 1
+    return changed
+
+
 _CORE_STATICZERO_ELIGIBLE_OPS = {
     "conv2d_3x3",
     "conv2d_1x1",
@@ -1091,6 +1126,111 @@ def _is_core_staticzero_eligible(target):
 
 def _core_target_name(target):
     return getattr(target, "conv_name", "")
+
+
+def _core_target_op_type(target):
+    return getattr(target, "op_type", "unknown")
+
+
+def _safe_speedup(base_ms, opt_ms):
+    if opt_ms <= 1e-9:
+        return float("inf")
+    return base_ms / opt_ms
+
+
+def _fmt_speedup(x):
+    if not math.isfinite(x):
+        return "inf"
+    return f"{x:.3f}x"
+
+
+def _build_core_replaced_speedup_summary(targets, baseline_timing, opt_timing):
+    per_op = defaultdict(
+        lambda: {
+            "count": 0,
+            "base_sum_ms": 0.0,
+            "opt_sum_ms": 0.0,
+            "layer_speedup_sum": 0.0,
+            "layer_speedup_count": 0,
+        }
+    )
+    all_stat = {
+        "count": 0,
+        "base_sum_ms": 0.0,
+        "opt_sum_ms": 0.0,
+        "layer_speedup_sum": 0.0,
+        "layer_speedup_count": 0,
+    }
+
+    for t in targets:
+        name = _core_target_name(t)
+        op = _core_target_op_type(t)
+        b = float(baseline_timing.get(name, 0.0))
+        s = float(opt_timing.get(name, 0.0))
+
+        st = per_op[op]
+        st["count"] += 1
+        st["base_sum_ms"] += b
+        st["opt_sum_ms"] += s
+
+        all_stat["count"] += 1
+        all_stat["base_sum_ms"] += b
+        all_stat["opt_sum_ms"] += s
+
+        if s > 1e-6:
+            sp = b / s
+            st["layer_speedup_sum"] += sp
+            st["layer_speedup_count"] += 1
+            all_stat["layer_speedup_sum"] += sp
+            all_stat["layer_speedup_count"] += 1
+
+    def _finalize(st):
+        weighted = _safe_speedup(st["base_sum_ms"], st["opt_sum_ms"])
+        mean_layer = (
+            st["layer_speedup_sum"] / st["layer_speedup_count"]
+            if st["layer_speedup_count"] > 0
+            else float("inf")
+        )
+        return {
+            "count": int(st["count"]),
+            "base_sum_ms": round(st["base_sum_ms"], 6),
+            "opt_sum_ms": round(st["opt_sum_ms"], 6),
+            "weighted_speedup": round(weighted, 6) if math.isfinite(weighted) else float("inf"),
+            "mean_layer_speedup": round(mean_layer, 6) if math.isfinite(mean_layer) else float("inf"),
+            "valid_layer_speedup_count": int(st["layer_speedup_count"]),
+        }
+
+    by_op = {k: _finalize(v) for k, v in sorted(per_op.items(), key=lambda kv: kv[0])}
+    return {
+        "all_replaced": _finalize(all_stat),
+        "by_op_type": by_op,
+    }
+
+
+def _print_core_replaced_speedup_summary(summary, mode_label):
+    print(f"\n  [Replaced-Operator Avg Speedup] {mode_label}")
+    print(
+        f"  {'OpType':<24} {'Count':>6} {'Base(ms)':>10} "
+        f"{'Mode(ms)':>10} {'W-Speedup':>10} {'AvgLayer':>10}"
+    )
+    print(f"  {'-'*76}")
+    for op_name, st in summary["by_op_type"].items():
+        print(
+            f"  {op_name:<24} {st['count']:>6} {st['base_sum_ms']:>10.3f} "
+            f"{st['opt_sum_ms']:>10.3f} {_fmt_speedup(st['weighted_speedup']):>10} "
+            f"{_fmt_speedup(st['mean_layer_speedup']):>10}"
+        )
+
+    all_st = summary["all_replaced"]
+    print(f"  {'-'*76}")
+    print(
+        f"  {'ALL_REPLACED':<24} {all_st['count']:>6} {all_st['base_sum_ms']:>10.3f} "
+        f"{all_st['opt_sum_ms']:>10.3f} {_fmt_speedup(all_st['weighted_speedup']):>10} "
+        f"{_fmt_speedup(all_st['mean_layer_speedup']):>10}"
+    )
+    print(
+        "  Note: W-Speedup=ΣBase/ΣMode, AvgLayer=mean(Base_i/Mode_i) over valid layers."
+    )
 
 
 def measure_sparsity_core(
@@ -1224,6 +1364,15 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
         print("\n  No replaceable layers found by Core analyzer.")
         return
 
+    normalized_cnt = _normalize_core_targets_for_fuse_mode(
+        targets, fuse_conv_lif=args.fuse_conv_lif
+    )
+    if normalized_cnt > 0:
+        print(
+            f"  [Core-AllOps] fuse_conv_lif=OFF: normalized {normalized_cnt} "
+            "fused_conv* targets to plain conv2d_*"
+        )
+
     if args.core_only_linear:
         linear_targets = [t for t in targets if t.op_type == "linear"]
         print(
@@ -1236,11 +1385,6 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
             return
 
     _print_core_target_report(targets)
-    if not args.fuse_conv_lif:
-        print(
-            "  [Note] 'fused_conv*' in the table is analyzer target type; "
-            "actual replacement uses non-fused sparse conv when --fuse_conv_lif is OFF."
-        )
     op_counter = Counter(t.op_type for t in targets)
 
     print(
@@ -1497,6 +1641,103 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
     print(f"  Speedup Sparse-only:     {so_speedup:.3f}x")
     print(f"  Speedup Hybrid:          {hy_speedup:.3f}x")
 
+    layer_profile_data = {}
+    replaced_operator_speedup = {}
+    if args.layer_profile:
+        lp_warmup = args.layer_profile_warmup
+        lp_batches = args.layer_profile_batches
+        target_names = [_core_target_name(t) for t in targets]
+
+        print(
+            f"\n  [LayerProfile] profiling replaced operators "
+            f"(warmup={lp_warmup}, batches={lp_batches}) ..."
+        )
+        baseline_layer_timing = measure_layer_timing(
+            model_baseline,
+            loader,
+            device,
+            args.T,
+            target_names,
+            warmup=lp_warmup,
+            num_batches=lp_batches,
+            spike_mode=args.spike_mode,
+        )
+        staticzero_layer_timing = measure_layer_timing(
+            model_staticzero,
+            loader,
+            device,
+            args.T,
+            target_names,
+            warmup=lp_warmup,
+            num_batches=lp_batches,
+            spike_mode=args.spike_mode,
+        )
+        sparse_only_layer_timing = measure_layer_timing(
+            model_sparse,
+            loader,
+            device,
+            args.T,
+            target_names,
+            warmup=lp_warmup,
+            num_batches=lp_batches,
+            spike_mode=args.spike_mode,
+        )
+        hybrid_layer_timing = measure_layer_timing(
+            model_hybrid,
+            loader,
+            device,
+            args.T,
+            target_names,
+            warmup=lp_warmup,
+            num_batches=lp_batches,
+            spike_mode=args.spike_mode,
+        )
+
+        replaced_operator_speedup = {
+            "static_zero_only": _build_core_replaced_speedup_summary(
+                targets, baseline_layer_timing, staticzero_layer_timing
+            ),
+            "sparse_only": _build_core_replaced_speedup_summary(
+                targets, baseline_layer_timing, sparse_only_layer_timing
+            ),
+            "hybrid": _build_core_replaced_speedup_summary(
+                targets, baseline_layer_timing, hybrid_layer_timing
+            ),
+        }
+        _print_core_replaced_speedup_summary(
+            replaced_operator_speedup["static_zero_only"], "StaticZero only"
+        )
+        _print_core_replaced_speedup_summary(
+            replaced_operator_speedup["sparse_only"], "SparseKernel only"
+        )
+        _print_core_replaced_speedup_summary(
+            replaced_operator_speedup["hybrid"], "SparseKernel + StaticZero"
+        )
+
+        layer_profile_data = {
+            "baseline_layer_ms": {k: round(v, 6) for k, v in baseline_layer_timing.items()},
+            "static_zero_only_layer_ms": {k: round(v, 6) for k, v in staticzero_layer_timing.items()},
+            "sparse_only_layer_ms": {k: round(v, 6) for k, v in sparse_only_layer_timing.items()},
+            "hybrid_layer_ms": {k: round(v, 6) for k, v in hybrid_layer_timing.items()},
+            "per_layer_speedup_static_zero_only": {},
+            "per_layer_speedup_sparse_only": {},
+            "per_layer_speedup_hybrid": {},
+        }
+        for name in target_names:
+            b = baseline_layer_timing.get(name, 0.0)
+            s_sz = staticzero_layer_timing.get(name, 0.0)
+            s_so = sparse_only_layer_timing.get(name, 0.0)
+            s_hy = hybrid_layer_timing.get(name, 0.0)
+            layer_profile_data["per_layer_speedup_static_zero_only"][name] = (
+                round(b / s_sz, 6) if s_sz > 1e-6 else float("inf")
+            )
+            layer_profile_data["per_layer_speedup_sparse_only"][name] = (
+                round(b / s_so, 6) if s_so > 1e-6 else float("inf")
+            )
+            layer_profile_data["per_layer_speedup_hybrid"][name] = (
+                round(b / s_hy, 6) if s_hy > 1e-6 else float("inf")
+            )
+
     print(f"\n[7/7] Consistency check ({args.verify_batches} batches) ...")
     sz_cos, sz_agr, sz_mabs = verify_consistency(
         model_baseline, model_staticzero, loader, device, args.T,
@@ -1529,6 +1770,19 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
     print(f"  {'StaticZero only':<28} {sz_res['avg_ms']:>12.2f} {sz_speedup:>9.3f}x {sz_esave:>11.2f}% {('PASS' if sz_ok else 'FAIL'):>12}")
     print(f"  {'SparseKernel only':<28} {so_res['avg_ms']:>12.2f} {so_speedup:>9.3f}x {so_esave:>11.2f}% {('PASS' if so_ok else 'FAIL'):>12}")
     print(f"  {'SparseKernel + StaticZero':<28} {hy_res['avg_ms']:>12.2f} {hy_speedup:>9.3f}x {hy_esave:>11.2f}% {('PASS' if hy_ok else 'FAIL'):>12}")
+    if replaced_operator_speedup:
+        so_all = replaced_operator_speedup["sparse_only"]["all_replaced"]
+        hy_all = replaced_operator_speedup["hybrid"]["all_replaced"]
+        print(
+            f"\n  Replaced-op avg speedup (Sparse-only): "
+            f"W={_fmt_speedup(so_all['weighted_speedup'])}, "
+            f"AvgLayer={_fmt_speedup(so_all['mean_layer_speedup'])}"
+        )
+        print(
+            f"  Replaced-op avg speedup (Hybrid):      "
+            f"W={_fmt_speedup(hy_all['weighted_speedup'])}, "
+            f"AvgLayer={_fmt_speedup(hy_all['mean_layer_speedup'])}"
+        )
     print(f"{'='*96}\n")
 
     results = {
@@ -1610,6 +1864,10 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
             "consistency": "PASS" if hy_ok else "FAIL",
         },
     }
+    if layer_profile_data:
+        results["layer_profile"] = layer_profile_data
+    if replaced_operator_speedup:
+        results["replaced_operator_speedup"] = replaced_operator_speedup
     if group_sparsity_data:
         results["group_sparsity"] = group_sparsity_data
 
