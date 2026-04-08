@@ -202,6 +202,18 @@ def sparse_grouped_conv2d_forward(
     subgroup_group_size = choose_group_size(cin_per_group)
     subgroup_num_groups = (cin_per_group + subgroup_group_size - 1) // subgroup_group_size
 
+    if w_cl_groups is None:
+        built_layouts: List[torch.Tensor] = []
+        for group_idx in range(groups):
+            cout_start = group_idx * cout_per_group
+            cout_end = cout_start + cout_per_group
+            w_g = weight[cout_start:cout_end, :, :, :].contiguous()
+            if k == (3, 3):
+                built_layouts.append(w_g.half().permute(0, 2, 3, 1).contiguous())
+            else:
+                built_layouts.append(w_g.half().reshape(cout_per_group, cin_per_group).contiguous())
+        w_cl_groups = built_layouts
+
     w_cl_groups = _normalize_group_list(w_cl_groups, groups)
     ag_mask_bufs = _normalize_group_list(ag_mask_bufs, groups)
     tile_class_bufs = _normalize_group_list(tile_class_bufs, groups)

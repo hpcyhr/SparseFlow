@@ -200,6 +200,16 @@ def _build_conv1d_metadata(
         )
 
 
+def _decode_active_channels(mask: int, num_groups: int, group_size_c: int, c_in: int):
+    channels = []
+    for g in range(int(num_groups)):
+        if ((int(mask) >> g) & 1) != 0:
+            cs = g * group_size_c
+            ce = min(cs + group_size_c, c_in)
+            channels.extend(range(cs, ce))
+    return channels
+
+
 _CFG_CONV1D = [
     Config({"BLOCK_N": 32}, num_warps=4, num_stages=2),
     Config({"BLOCK_N": 64}, num_warps=4, num_stages=2),
@@ -310,6 +320,89 @@ def _sparse_conv1d_compute_kernel(
         out_old + acc,
         mask=m_mask[:, None] & n_mask[None, :],
     )
+
+
+def _execute_sparse_tiles_conv1d(
+    *,
+    x_f32: torch.Tensor,  # [N, C_IN, L_IN]
+    w_f32: torch.Tensor,  # [C_OUT, C_IN, KS]
+    y: torch.Tensor,      # [N, C_OUT, L_OUT], bias baseline prefilled
+    ag_mask_buf: torch.Tensor,
+    tile_ids: torch.Tensor,
+    launch_all_tiles: bool,
+    n_tiles_l: int,
+    bl: int,
+    c_in: int,
+    group_size_c: int,
+    num_groups: int,
+    all_ones_mask: int,
+    ks: int,
+    stride: int,
+    padding: int,
+):
+    import torch.nn.functional as Fn
+
+    device = x_f32.device
+    n_batch = int(x_f32.shape[0])
+    c_out = int(w_f32.shape[0])
+    l_out = int(y.shape[2])
+    total_tiles = n_batch * n_tiles_l
+
+    ag_mask_host = ag_mask_buf[:total_tiles].detach().cpu()
+    if launch_all_tiles:
+        tile_ids_host = range(total_tiles)
+    else:
+        tile_ids_host = tile_ids.detach().cpu().tolist()
+
+    x_pad = Fn.pad(x_f32, (padding, padding))
+    x_unfold = x_pad.unfold(2, ks, stride)  # [N, C_IN, L_OUT, KS]
+    w_all = w_f32.reshape(c_out, c_in * ks)
+    mask_channel_cache = {}
+
+    visited_tiles = 0
+    executed_tiles = 0
+
+    for tile_id in tile_ids_host:
+        tile_id = int(tile_id)
+        visited_tiles += 1
+
+        ag_mask = int(ag_mask_host[tile_id].item())
+        if ag_mask == 0:
+            continue
+
+        n_idx = tile_id // n_tiles_l
+        t_idx = tile_id % n_tiles_l
+        l0 = t_idx * bl
+        l1 = min(l0 + bl, l_out)
+        if l1 <= l0:
+            continue
+
+        if ag_mask == all_ones_mask:
+            x_tile = x_unfold[n_idx, :, l0:l1, :]  # [C, L, KS]
+            x_mat = x_tile.permute(1, 0, 2).reshape(l1 - l0, c_in * ks)
+            w_mat = w_all
+        else:
+            c_idx = mask_channel_cache.get(ag_mask, None)
+            if c_idx is None:
+                channels = _decode_active_channels(ag_mask, num_groups, group_size_c, c_in)
+                if not channels:
+                    continue
+                c_idx = torch.tensor(channels, dtype=torch.long, device=device)
+                mask_channel_cache[ag_mask] = c_idx
+
+            x_tile = x_unfold[n_idx, c_idx, l0:l1, :]
+            c_sel = int(c_idx.numel())
+            x_mat = x_tile.permute(1, 0, 2).reshape(l1 - l0, c_sel * ks)
+            w_mat = w_f32[:, c_idx, :].reshape(c_out, c_sel * ks)
+
+        y_tile = torch.matmul(x_mat, w_mat.t())  # [tile_len, C_OUT]
+        y[n_idx, :, l0:l1] += y_tile.t().contiguous()
+        executed_tiles += 1
+
+    return {
+        "visited_tiles": int(visited_tiles),
+        "executed_tiles": int(executed_tiles),
+    }
 
 
 def sparse_conv1d_forward(
@@ -536,35 +629,30 @@ def sparse_conv1d_forward(
     if bias is not None:
         y = y + bias.detach().float().view(1, -1, 1)
 
+    x_f32 = x.float()
+    w_f32 = weight.float().contiguous()
+
     if return_ms:
         start_ev = torch.cuda.Event(enable_timing=True)
         end_ev = torch.cuda.Event(enable_timing=True)
         start_ev.record()
 
-    def _grid(meta):
-        return (launch_count, triton.cdiv(C_OUT, meta["BLOCK_N"]))
-
-    _sparse_conv1d_compute_kernel[_grid](
-        x_f16,
-        w_f16,
-        ag_mask_buf,
-        tile_ids_ptr,
-        y,
-        N_batch=N,
-        C_IN=C_IN,
-        C_OUT=C_OUT,
-        L_IN=L_IN,
-        L_OUT=L_OUT,
-        N_TILES_L=N_TILES_L,
-        KS=kernel_size,
-        STRIDE=stride,
-        PADDING=padding,
-        GROUP_SIZE_C=GROUP_SIZE_C,
-        NUM_GROUPS=NUM_GROUPS,
-        ALL_ONES_MASK=ALL_ONES_MASK,
-        DENSE_K=DENSE_K,
-        BLOCK_M=BL,
-        USE_TILE_IDS=use_tile_ids,
+    exec_meta = _execute_sparse_tiles_conv1d(
+        x_f32=x_f32,
+        w_f32=w_f32,
+        y=y,
+        ag_mask_buf=ag_mask_buf,
+        tile_ids=tile_ids_ptr,
+        launch_all_tiles=launch_all_tiles,
+        n_tiles_l=N_TILES_L,
+        bl=BL,
+        c_in=C_IN,
+        group_size_c=GROUP_SIZE_C,
+        num_groups=NUM_GROUPS,
+        all_ones_mask=ALL_ONES_MASK,
+        ks=kernel_size,
+        stride=stride,
+        padding=padding,
     )
 
     sparse_ms = 0.0
@@ -577,12 +665,16 @@ def sparse_conv1d_forward(
     # 8) structured outputs
     # ------------------------------------------------------------------
     backend_meta = {
-        "backend": "sparse_triton",
-        "reason": "conv1d_unified_v1",
+        "backend": "sparse_hybrid",
+        "reason": "conv1d_unified_v2",
+        "compute_engine": "python_tile_executor",
         "total_tiles": N_TILES,
         "launch_count": launch_count,
         "launch_mode": "all_tiles" if launch_all_tiles else "active_only",
     }
+    backend_meta.update(exec_meta)
+    if active_tiles_for_meta is None:
+        active_tiles_for_meta = int(exec_meta.get("executed_tiles", 0))
     if active_tiles_for_meta is not None:
         backend_meta["active_tiles"] = int(active_tiles_for_meta)
     if avg_active_ratio is not None:
