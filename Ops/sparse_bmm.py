@@ -14,6 +14,7 @@ from typing import Any, Dict
 
 import torch
 import torch.nn as nn
+from Utils.config import PRESCAN_ACTIVITY_EPS, SPARSE_DENSE_RATIO_THRESHOLD
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
@@ -25,8 +26,8 @@ class SparseBMM(nn.Module):
 
     def __init__(
         self,
-        threshold: float = 1e-6,
-        fallback_ratio: float = 0.85,
+        threshold: float = PRESCAN_ACTIVITY_EPS,
+        fallback_ratio: float = SPARSE_DENSE_RATIO_THRESHOLD,
         return_ms: bool = False,
         profile_runtime: bool = False,
     ):
@@ -57,7 +58,7 @@ class SparseBMM(nn.Module):
         self.meta_source = "measured"
         self.diag_source = "measured"
         self.support_status = "supported"
-        self.score_family = "unknown"
+        self.score_family = "bmm"
 
     def _stamp(self, device: torch.device) -> float:
         if self.profile_runtime and device.type == "cuda":

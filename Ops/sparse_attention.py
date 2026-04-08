@@ -20,6 +20,7 @@ from typing import Any, Dict
 
 import torch
 import torch.nn as nn
+from Utils.config import PRESCAN_ACTIVITY_EPS
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
@@ -33,7 +34,7 @@ class SparseAttention(nn.Module):
         self,
         num_heads: int = 8,
         head_dim: int = 64,
-        threshold: float = 1e-6,
+        threshold: float = PRESCAN_ACTIVITY_EPS,
         return_ms: bool = False,
         profile_runtime: bool = False,
     ):

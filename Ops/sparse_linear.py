@@ -12,6 +12,7 @@ if _PROJECT_ROOT not in sys.path:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from Utils.config import PRESCAN_ACTIVITY_EPS, SPARSE_DENSE_RATIO_THRESHOLD
 
 
 @dataclass
@@ -59,9 +60,9 @@ class SparseLinear(nn.Module):
         in_features: int,
         out_features: int,
         bias: bool = True,
-        threshold: float = 1e-6,
+        threshold: float = PRESCAN_ACTIVITY_EPS,
         return_ms: bool = False,
-        dense_threshold: float = 0.85,
+        dense_threshold: float = SPARSE_DENSE_RATIO_THRESHOLD,
         warmup_steps: int = 8,
         calib_every: int = 32,
         ema_decay: float = 0.9,
@@ -128,12 +129,17 @@ class SparseLinear(nn.Module):
         self.diag_source = "measured"
         self.support_status = "supported"
         self.score_family = "linear"
+        self._runtime_dispatch_calls = 0
+        self._runtime_dispatch_disagree = 0
+        self._runtime_last_expected = ""
+        self._runtime_last_backend = ""
+        self._runtime_last_disagree = False
 
     @classmethod
     def from_dense(
         cls,
         linear: nn.Linear,
-        threshold: float = 1e-6,
+        threshold: float = PRESCAN_ACTIVITY_EPS,
         return_ms: bool = False,
         **kwargs,
     ) -> "SparseLinear":
@@ -322,6 +328,17 @@ class SparseLinear(nn.Module):
         else:
             self._force_dense = False
 
+    def _record_runtime_dispatch(self, runtime_backend: str):
+        expected = str(getattr(self, "sf_dispatch_decision", getattr(self, "sf_backend_mode", "")))
+        self._runtime_dispatch_calls += 1
+        self._runtime_last_expected = expected
+        self._runtime_last_backend = runtime_backend
+        disagree = bool(expected) and expected != runtime_backend
+        self._runtime_last_disagree = disagree
+        if disagree:
+            self._runtime_dispatch_disagree += 1
+        return expected, disagree
+
     # ------------------------------------------------------------------
     # forward
     # ------------------------------------------------------------------
@@ -355,6 +372,7 @@ class SparseLinear(nn.Module):
             self.backend_family = "exact_zero"
             self.diag_path = "zero_force"
             self.fallback_reason = "force_zero_policy"
+            expected_backend, disagree = self._record_runtime_dispatch("staticzero")
             if self.profile_runtime:
                 self._profile.zero_path_hits += 1
                 self._profile.last_path = "zero(force)"
@@ -367,6 +385,14 @@ class SparseLinear(nn.Module):
                     "backend_family": self.backend_family,
                     "diag_path": self.diag_path,
                     "fallback_reason": self.fallback_reason,
+                    "egd_dispatch_decision": expected_backend,
+                    "runtime_backend_decision": "staticzero",
+                    "egd_runtime_disagree": bool(disagree),
+                    "egd_runtime_disagree_count": int(self._runtime_dispatch_disagree),
+                    "egd_runtime_calls": int(self._runtime_dispatch_calls),
+                    "egd_runtime_disagree_rate": (
+                        float(self._runtime_dispatch_disagree) / max(float(self._runtime_dispatch_calls), 1.0)
+                    ),
                     "runtime_total_ms": self._profile.last_total_ms if self.profile_runtime else -1.0,
                 })
             return self._restore_output(y2d, restore_meta)
@@ -391,20 +417,24 @@ class SparseLinear(nn.Module):
             )
             if backend_kind == "dense_fallback":
                 path = "dense(fallback)"
+                runtime_backend = "dense"
                 if self.profile_runtime:
                     self._profile.dense_path_hits += 1
             elif backend_kind == "zero_tiles_only":
                 path = "zero(tile_compaction)"
+                runtime_backend = "staticzero"
                 if self.profile_runtime:
                     self._profile.zero_path_hits += 1
             else:
                 path = "sparse"
+                runtime_backend = "sparse"
                 if self.profile_runtime:
                     self._profile.sparse_path_hits += 1
         else:
             y2d = self._fallback_forward(x2d)
             avg_active_ratio = None
             path = "dense"
+            runtime_backend = "dense"
             self.fallback_reason = "dense_runtime_or_policy"
             if self.profile_runtime:
                 self._profile.dense_path_hits += 1
@@ -426,6 +456,20 @@ class SparseLinear(nn.Module):
             self.backend_family = "exact_zero"
             self.diag_path = "zero_promoted"
             self.fallback_reason = "zero_promoted_policy"
+            runtime_backend = "staticzero"
+
+        expected_backend, disagree = self._record_runtime_dispatch(runtime_backend)
+        if self.collect_diag:
+            self._last_diag.update({
+                "egd_dispatch_decision": expected_backend,
+                "runtime_backend_decision": runtime_backend,
+                "egd_runtime_disagree": bool(disagree),
+                "egd_runtime_disagree_count": int(self._runtime_dispatch_disagree),
+                "egd_runtime_calls": int(self._runtime_dispatch_calls),
+                "egd_runtime_disagree_rate": (
+                    float(self._runtime_dispatch_disagree) / max(float(self._runtime_dispatch_calls), 1.0)
+                ),
+            })
 
         if self.profile_runtime:
             t0 = self._stamp()
@@ -628,6 +672,14 @@ class SparseLinear(nn.Module):
             "backend_family": self.backend_family,
             "diag_path": self.diag_path,
             "fallback_reason": self.fallback_reason,
+            "egd_dispatch_decision": self._runtime_last_expected,
+            "runtime_backend_decision": self._runtime_last_backend,
+            "egd_runtime_disagree": bool(self._runtime_last_disagree),
+            "egd_runtime_disagree_count": int(self._runtime_dispatch_disagree),
+            "egd_runtime_calls": int(self._runtime_dispatch_calls),
+            "egd_runtime_disagree_rate": (
+                float(self._runtime_dispatch_disagree) / max(float(self._runtime_dispatch_calls), 1.0)
+            ),
             "meta_source": self.meta_source,
             "diag_source": self.diag_source,
             "support_status": self.support_status,
@@ -696,6 +748,14 @@ class SparseLinear(nn.Module):
                 "backend_family": self.backend_family,
                 "diag_path": self.diag_path,
                 "fallback_reason": self.fallback_reason,
+                "egd_dispatch_decision": self._runtime_last_expected,
+                "runtime_backend_decision": self._runtime_last_backend or "dense",
+                "egd_runtime_disagree": bool(self._runtime_last_disagree),
+                "egd_runtime_disagree_count": int(self._runtime_dispatch_disagree),
+                "egd_runtime_calls": int(self._runtime_dispatch_calls),
+                "egd_runtime_disagree_rate": (
+                    float(self._runtime_dispatch_disagree) / max(float(self._runtime_dispatch_calls), 1.0)
+                ),
                 "dense_fallback_ms": self._last_dense_ms,
                 "sparse_path_executed": False,
             })
@@ -714,6 +774,15 @@ class SparseLinear(nn.Module):
         diag.setdefault("score_family", self.score_family)
         diag.setdefault("sparse_total_ms", float(self._last_sparse_ms))
         diag.setdefault("dense_fallback_ms", float(self._last_dense_ms))
+        diag.setdefault("egd_dispatch_decision", self._runtime_last_expected)
+        diag.setdefault("runtime_backend_decision", self._runtime_last_backend)
+        diag.setdefault("egd_runtime_disagree", bool(self._runtime_last_disagree))
+        diag.setdefault("egd_runtime_disagree_count", int(self._runtime_dispatch_disagree))
+        diag.setdefault("egd_runtime_calls", int(self._runtime_dispatch_calls))
+        diag.setdefault(
+            "egd_runtime_disagree_rate",
+            float(self._runtime_dispatch_disagree) / max(float(self._runtime_dispatch_calls), 1.0),
+        )
         return diag
 
     def extra_repr(self) -> str:

@@ -1,19 +1,15 @@
 """
-SparseFlow Kernels/attention.py — Sparse Attention Matmul Kernels v1.0
+SparseFlow Kernels/attention.py - Sparse attention helper kernels.
 
-Specialized attention-related matmul kernels for Spikeformer-class models:
-  1. sparse_qk_forward:   Q × K^T  where Q is sparse (spike-encoded queries)
-  2. sparse_attn_v_forward: attn × V  where attn is sparse (post-threshold attention)
+Maturity: experimental (usable, still evolving).
 
-These are thin wrappers around the BMM kernel (Kernels/bmm.py) with
-attention-specific preprocessing (head reshape, transpose, scaling).
-Kept as a separate file because attention has its own shape conventions
-(B, num_heads, seq_len, head_dim) and scaling semantics.
+This file wraps attention-specific matmul flows around Kernels/bmm.py:
+- qk stage: Q @ K^T
+- av stage: Attn @ V
 
-Does NOT implement full multi-head attention — just the sparse matmul
-steps.  The surrounding logic (head split, softmax, residual) stays
-in the model or Ops/ wrapper.
+Softmax, masking, and residual logic remain in model/Ops wrappers.
 """
+
 
 import math
 import torch
@@ -25,18 +21,19 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from Kernels.bmm import sparse_bmm_forward
+from Utils.config import PRESCAN_ACTIVITY_EPS
 
 
 def sparse_qk_forward(
     q: torch.Tensor,        # [B, num_heads, seq_len, head_dim]
     k: torch.Tensor,        # [B, num_heads, seq_len, head_dim]
     scale: float = None,
-    threshold: float = 1e-6,
+    threshold: float = PRESCAN_ACTIVITY_EPS,
     return_ms: bool = False,
     return_tile_stats: bool = False,
 ):
     """
-    Sparse Q × K^T for attention score computation.
+    Sparse Q 脳 K^T for attention score computation.
 
     Q is expected sparse (spike-derived queries).  K^T is transposed internally.
     Result: [B, num_heads, seq_len, seq_len] attention logits.
@@ -62,7 +59,7 @@ def sparse_qk_forward(
     # K^T: [B*H, head_dim, seq_len]
     k_t = k_flat.transpose(1, 2).contiguous()
 
-    # Sparse BMM: Q @ K^T → [B*H, seq_len, seq_len]
+    # Sparse BMM: Q @ K^T 鈫?[B*H, seq_len, seq_len]
     result = sparse_bmm_forward(
         a=q_flat,
         b=k_t,
@@ -86,12 +83,12 @@ def sparse_qk_forward(
 def sparse_attn_v_forward(
     attn: torch.Tensor,      # [B, num_heads, seq_len, seq_len]
     v: torch.Tensor,         # [B, num_heads, seq_len, head_dim]
-    threshold: float = 1e-6,
+    threshold: float = PRESCAN_ACTIVITY_EPS,
     return_ms: bool = False,
     return_tile_stats: bool = False,
 ):
     """
-    Sparse attn × V for attention output computation.
+    Sparse attn 脳 V for attention output computation.
 
     attn is expected sparse when using spike-based thresholding instead
     of softmax (common in Spikeformer variants).

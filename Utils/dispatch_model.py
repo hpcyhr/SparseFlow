@@ -44,6 +44,19 @@ import math
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Optional, Tuple, Union
 
+from Utils.config import (
+    NUMERIC_EPS,
+    DISPATCH_MIN_CONFIDENCE,
+    DISPATCH_R_MARGIN,
+    DISPATCH_R_MIN,
+    DISPATCH_TAU_1X1,
+    DISPATCH_TAU_3X3,
+    DISPATCH_TAU_ATTN_LINEAR,
+    DISPATCH_TAU_ATTN_MATMUL,
+    DISPATCH_TAU_LINEAR,
+    DISPATCH_TAU_MARGIN,
+)
+
 # =============================================================================
 # Dispatch thresholds and guards
 # =============================================================================
@@ -62,7 +75,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 #   overhead.  500K is a mid-range estimate.
 #   Calibrate: profile prescan latency on representative layers, convert to
 #   MACs at GPU peak throughput, and set 蟿_3x3 to that value.
-TAU_3x3 = 500_000
+TAU_3x3 = DISPATCH_TAU_3X3
 
 # 蟿_1x1 (TAU_1x1):
 #   Minimum saved MACs per tile for 1脳1 kernels.
@@ -70,14 +83,14 @@ TAU_3x3 = 500_000
 #   GEMM call with near-peak throughput.  The sparse kernel must save
 #   proportionally more to overcome this stronger baseline.
 #   Calibrate: same procedure as 蟿_3x3 but comparing against cuDNN 1脳1 perf.
-TAU_1x1 = 1_000_000
+TAU_1x1 = DISPATCH_TAU_1X1
 
 # Linear thresholds (execution-grounded, empirically calibrated)
-TAU_LINEAR = 800_000
+TAU_LINEAR = DISPATCH_TAU_LINEAR
 
 # Attention thresholds (split by family)
-TAU_ATTN_LINEAR = 900_000
-TAU_ATTN_MATMUL = 1_200_000
+TAU_ATTN_LINEAR = DISPATCH_TAU_ATTN_LINEAR
+TAU_ATTN_MATMUL = DISPATCH_TAU_ATTN_MATMUL
 
 # R_min (R_MIN):
 #   Minimum saved work fraction for sparse to be viable.
@@ -88,11 +101,11 @@ TAU_ATTN_MATMUL = 1_200_000
 #   overhead 鈥?guaranteed slower.
 #   Calibrate: find the AGR at which sparse kernel latency equals dense
 #   kernel latency on a compute-heavy layer; R_min = 1 - that AGR.
-R_MIN = 0.15
+R_MIN = DISPATCH_R_MIN
 
 # Keep margins explicit for future stability tuning (default no extra margin).
-R_MARGIN = 0.0
-TAU_MARGIN = 0.0
+R_MARGIN = DISPATCH_R_MARGIN
+TAU_MARGIN = DISPATCH_TAU_MARGIN
 
 
 # =============================================================================
@@ -103,7 +116,7 @@ def clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
 
 
-_EPS = 1e-6
+_EPS = NUMERIC_EPS
 
 
 def _pair(x) -> Tuple[int, int]:
@@ -201,7 +214,7 @@ class DispatchDecision:
     meta_source: str = "measured"       # measured | estimated | fallback | shortcut
     diag_source: str = "measured"       # measured | missing | shortcut
     support_status: str = "supported"   # supported | unsupported_groups | unsupported_op | exact_zero_shortcut
-    score_family: str = "unknown"       # conv | linear | attn_linear | attn_matmul | none | unknown
+    score_family: str = "unknown"       # conv | linear | attn_linear | attn_matmul | matmul | bmm | none | unknown
     tile_source: str = "diag"           # diag | meta_geometry | estimated_default | unknown
     fallback_reason: str = ""           # short fallback/debug code
 
@@ -212,6 +225,8 @@ class DispatchDecision:
     agr_nz: float = 0.0        # AGR over non-zero tiles: AGR / (1 - TZR)
     n_tiles: float = 0.0       # total tile count (measured or estimated)
     tau: float = 0.0           # threshold used for this layer's kernel family
+    agr_p90: float = -1.0      # p90 AGR from calibration batches (if available)
+    r_worst: float = -1.0      # conservative saved-work lower bound (1 - AGR_p90)
 
     # 鈹€鈹€ Backward-compatible fields 鈹€鈹€
     score_sparse: float = 0.0  # S_l / tau (normalized: >1 鈫?sparse)
@@ -414,9 +429,9 @@ def _attention_meta_from_target(
     seq_len = max(int(seq_len), 1)
 
     score_op_type = "attention_matmul"
-    if op_type == "attention_qkav":
+    if op_type in ("attention_qkav", "attention_matmul"):
         macs = float(batch_size * num_heads * 2 * seq_len * seq_len * head_dim)
-    elif op_type == "attention_linear":
+    elif op_type in ("attention_linear", "attention_proj_linear"):
         score_op_type = "attention_proj_linear"
         macs = float(batch_size * num_heads * 2 * seq_len * head_dim * head_dim)
     elif op_type == "attention_qkmix":
@@ -500,6 +515,65 @@ def _linear_meta_from_target(
         h_out=1,
         w_out=1,
         batch_size=batch_size,
+        macs=macs,
+    )
+
+
+def _matmul_like_meta_from_target(
+    target: Any,
+    layer_name: str,
+    input_shape: Optional[Tuple],
+    op_type: str,
+) -> ConvMeta:
+    in_shape = _shape_tuple(input_shape)
+    out_shape = _shape_tuple(_target_get(target, "output_shape"))
+
+    # Expect [..., M, K] @ [..., K, N] -> [..., M, N]
+    k_dim = int(in_shape[-1]) if len(in_shape) >= 1 else int(_target_get(target, "k", 0))
+    m_dim = int(in_shape[-2]) if len(in_shape) >= 2 else int(_target_get(target, "m", 0))
+    n_dim = int(out_shape[-1]) if len(out_shape) >= 1 else int(_target_get(target, "n", 0))
+
+    if n_dim <= 0:
+        n_dim = int(_target_get(target, "out_features", _target_get(target, "c_out", 0)))
+
+    if len(out_shape) >= 3:
+        batch = max(_prod(out_shape[:-2]), 1)
+    elif len(in_shape) >= 3:
+        batch = max(_prod(in_shape[:-2]), 1)
+    else:
+        batch = int(_target_get(target, "batch_size", 1))
+        if batch <= 0:
+            batch = 1
+
+    if m_dim <= 0 and len(out_shape) >= 2:
+        m_dim = int(out_shape[-2])
+    if m_dim <= 0:
+        m_dim = 1
+    if k_dim <= 0:
+        k_dim = 1
+    if n_dim <= 0:
+        n_dim = 1
+
+    macs = float(batch * m_dim * k_dim * n_dim)
+    meta_source = "measured" if len(in_shape) > 0 and len(out_shape) > 0 else "estimated"
+    return ConvMeta(
+        layer_name=layer_name,
+        op_type=op_type,
+        meta_source=meta_source,
+        c_in=k_dim,
+        c_out=n_dim,
+        in_features=k_dim,
+        out_features=n_dim,
+        kernel_size=(1, 1),
+        stride=(1, 1),
+        padding=(0, 0),
+        dilation=(1, 1),
+        groups=1,
+        h_in=1,
+        w_in=1,
+        h_out=1,
+        w_out=1,
+        batch_size=batch,
         macs=macs,
     )
 
@@ -592,7 +666,14 @@ def op_meta_from_target(target: Any) -> ConvMeta:
     layer_name = _target_layer_name(target)
     input_shape = _target_get(target, "input_shape")
     op_type = str(_target_get(target, "op_type", ""))
-    attention_ops = {"attention_qkav", "attention_linear", "attention_qkmix"}
+    attention_ops = {
+        "attention_qkav",
+        "attention_linear",
+        "attention_qkmix",
+        "attention_matmul",
+        "attention_proj_linear",
+    }
+    matmul_ops = {"matmul", "bmm"}
 
     if conv_module is not None:
         if hasattr(conv_module, "in_features") and hasattr(conv_module, "out_features"):
@@ -604,6 +685,8 @@ def op_meta_from_target(target: Any) -> ConvMeta:
 
     if op_type in attention_ops:
         return _attention_meta_from_target(target, None, layer_name, input_shape, op_type)
+    if op_type in matmul_ops:
+        return _matmul_like_meta_from_target(target, layer_name, input_shape, op_type)
     if op_type == "linear":
         return _linear_meta_from_target(target, None, layer_name, input_shape)
     if op_type.startswith("conv") or op_type.startswith("fused_conv") or op_type == "depthwise_conv2d":
@@ -693,6 +776,10 @@ def _get_n_tiles(diag: Dict[str, Any], meta: ConvMeta) -> Tuple[float, str]:
 def _select_tau(meta: ConvMeta, diag: Dict[str, Any]) -> Tuple[float, str]:
     op_type = str(getattr(meta, "op_type", "unknown")).lower()
     kernel_type = str(diag.get("kernel_type", "")).lower()
+    if op_type == "matmul" or kernel_type == "matmul":
+        return TAU_ATTN_MATMUL, "matmul"
+    if op_type == "bmm" or kernel_type == "bmm":
+        return TAU_ATTN_MATMUL, "bmm"
     if op_type == "linear":
         return TAU_LINEAR, "linear"
     if op_type == "attention_proj_linear":
@@ -777,6 +864,8 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
     R_l_simple = 1.0 - agr
     R_l = R_l_exec
     r_mismatch = abs(R_l_exec - R_l_simple)
+    agr_p90 = float(diag.get("active_group_ratio_p90", -1.0))
+    r_worst = (1.0 - agr_p90) if agr_p90 >= 0 else -1.0
 
     n_tiles, tile_source = _get_n_tiles(diag, meta)
     dec.tile_source = tile_source
@@ -832,6 +921,8 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
     dec.I_l = I_l
     dec.S_l = S_l
     dec.agr_nz = agr_nz
+    dec.agr_p90 = agr_p90
+    dec.r_worst = r_worst
     dec.n_tiles = n_tiles
     dec.nz_fraction = nz_frac
     dec.tau = tau
@@ -862,7 +953,12 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
     if r_mismatch > 1e-4:
         reason_suffix += "|R_mismatch_check"
 
-    if R_l < r_gate:
+    if r_worst >= 0 and r_worst < r_gate:
+        dec.backend = "dense"
+        dec.reason_code = "R_guard_worst"
+        dec.reason = f"R_worst={r_worst:.3f}<R_min={r_gate:.3f}{reason_suffix}"
+        dec.fallback_reason = dec.reason_code
+    elif R_l < r_gate:
         dec.backend = "dense"
         dec.reason_code = "R_guard"
         dec.reason = f"R={R_l:.3f}<R_min={r_gate:.3f}{reason_suffix}"
@@ -889,6 +985,15 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
         confidence *= 0.8
     dec.confidence = clamp01(confidence)
 
+    # Confidence gate:
+    # estimated/fallback metadata rows can be printed and analyzed, but they
+    # should not force sparse execution when confidence is too low.
+    if dec.backend == "sparse" and dec.confidence < DISPATCH_MIN_CONFIDENCE:
+        dec.backend = "dense"
+        dec.reason_code = "low_confidence"
+        dec.reason = f"low_confidence<{DISPATCH_MIN_CONFIDENCE:.2f}{reason_suffix}"
+        dec.fallback_reason = dec.reason_code
+
     return dec
 
 # =============================================================================
@@ -911,7 +1016,7 @@ def _make_staticzero_decision(layer_name: str) -> DispatchDecision:
         diag_source="shortcut",
         support_status="exact_zero_shortcut",
         score_family="none",
-        tile_source="shortcut",
+        tile_source="unknown",
         confidence=1.0,
         agr=0.0,
         tzr=1.0,

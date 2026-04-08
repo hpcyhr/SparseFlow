@@ -1,16 +1,11 @@
 """
-SparseFlow Kernels/matmul.py — Sparse Matmul Triton Kernel v1.0
+SparseFlow Kernels/matmul.py - Sparse Matmul Triton kernel.
 
-Grouped-bitmask sparse matmul for general [M, K] × [K, N] → [M, N].
-Follows the same two-stage prescan + tile-dispatch pattern as conv2d.py
-and linear.py, adapted for arbitrary matmul shapes.
+Maturity: main_path (production-facing sparse kernel).
 
-The key difference from linear.py:
-  - linear.py assumes x=[B, C_IN], weight=[C_OUT, C_IN] (fixed module)
-  - matmul.py handles arbitrary A=[M, K], B=[K, N] tensors (functional API)
-  - No weight caching / EMA policy at this level (that lives in Ops/)
-
-Supported: fp16 inputs, fp32 accumulation, grouped-bitmask prescan on A.
+Grouped-bitmask sparse matmul for [M, K] x [K, N] -> [M, N].
+Follows the same two-stage prescan + tile-dispatch pattern as conv2d/linear,
+adapted for functional matmul APIs.
 """
 
 import torch
@@ -28,8 +23,9 @@ from Utils.sparse_helpers import (
     choose_group_size, select_row_tile_sizes,
     build_row_metadata, popcount_buf,
 )
+from Utils.config import PRESCAN_ACTIVITY_EPS, SPARSE_DENSE_RATIO_THRESHOLD
 
-FALLBACK_RATIO = 0.85
+FALLBACK_RATIO = SPARSE_DENSE_RATIO_THRESHOLD
 TRITON_MAX_TENSOR_NUMEL = 131072
 
 _MATMUL_CONFIGS = [
@@ -66,11 +62,11 @@ def _sparse_matmul_kernel(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     if tl.sum(tile_cls) == TILE_ZERO:
-        # All-zero tile in A → output is zero
+        # All-zero tile in A 鈫?output is zero
         pass
 
     elif tl.sum(tile_cls) == TILE_DENSEISH:
-        # Dense path — iterate all K groups
+        # Dense path 鈥?iterate all K groups
         for k_start in range(0, K, BLOCK_K):
             offs_k = k_start + tl.arange(0, BLOCK_K)
             k_mask = offs_k < K
@@ -84,7 +80,7 @@ def _sparse_matmul_kernel(
             acc += tl.dot(a_vals, b_vals)
 
     else:
-        # Sparse path — bitmask-gated groups
+        # Sparse path 鈥?bitmask-gated groups
         ag = tl.load(ag_mask_ptr + pid_m + off1)
         for g in range(NUM_GROUPS):
             g_active = (ag >> g) & 1
@@ -114,7 +110,7 @@ def _sparse_matmul_kernel(
 def sparse_matmul_forward(
     a: torch.Tensor,       # [M, K]
     b: torch.Tensor,       # [K, N]
-    threshold: float = 1e-6,
+    threshold: float = PRESCAN_ACTIVITY_EPS,
     ag_mask_buf: torch.Tensor = None,
     tile_class_buf: torch.Tensor = None,
     return_ms: bool = False,
@@ -262,3 +258,4 @@ def sparse_matmul_forward(
         }
 
     return _finalize(c, ms, avg_ratio, tile_stats)
+

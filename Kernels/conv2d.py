@@ -1,12 +1,12 @@
 """
-SparseFlow Conv2d Triton Kernels — v25.0
+SparseFlow Conv2d Triton Kernels 鈥?v25.0
 
 Maturity: main_path (production-facing sparse kernel).
 
 Changes from v24:
   [P0] sparse_conv2d_forward: all .item() syncs gated behind need_stats flag.
        When return_avg_active_ratio=False AND return_tile_stats=False, the
-       function performs ZERO GPU→CPU synchronizations.
+       function performs ZERO GPU鈫扖PU synchronizations.
   [P1] New launch_all_tiles parameter for A/B tile launch comparison.
        Mode A (False): existing active-tile-ID launch via nonzero().
        Mode B (True): launch all N_TILES, zero tiles early-return in kernel.
@@ -19,6 +19,7 @@ import torch
 import triton
 import triton.language as tl
 from triton import autotune, Config
+from Utils.config import PRESCAN_ACTIVITY_EPS, SPARSE_DENSE_RATIO_THRESHOLD
 
 # ---------------------------------------------------------------------------
 # Tile classification constants
@@ -29,7 +30,7 @@ TILE_DENSEISH = 2
 TILE_UNCERTAIN = 3
 TILE_ZERO_CANDIDATE = 4
 
-FALLBACK_RATIO = 0.85
+FALLBACK_RATIO = SPARSE_DENSE_RATIO_THRESHOLD
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -76,7 +77,7 @@ def _popcount_buf(ag_mask_buf, N_TILES):
 
 
 def _check_dense_fallback(ag_mask_buf, N_TILES, NUM_GROUPS, fallback_ratio=FALLBACK_RATIO):
-    """NOTE: calls .mean().item() → GPU→CPU sync. Only use in gated paths."""
+    """NOTE: calls .mean().item() 鈫?GPU鈫扖PU sync. Only use in gated paths."""
     if NUM_GROUPS == 0:
         return False
     pc = _popcount_buf(ag_mask_buf, N_TILES)
@@ -85,7 +86,7 @@ def _check_dense_fallback(ag_mask_buf, N_TILES, NUM_GROUPS, fallback_ratio=FALLB
 
 
 def _build_active_tile_ids(tile_class_buf, N_TILES):
-    """NOTE: calls torch.nonzero() → GPU→CPU sync. Only use in Mode A path."""
+    """NOTE: calls torch.nonzero() 鈫?GPU鈫扖PU sync. Only use in Mode A path."""
     tc = tile_class_buf[:N_TILES]
     active = torch.nonzero(tc != TILE_ZERO, as_tuple=False).flatten()
     if active.numel() == 0:
@@ -134,7 +135,7 @@ def tile_coarse_classify_kernel(
         c_rep = g * GROUP_SIZE_C
         if c_rep < C_IN:
             vals = tl.load(x_ptr + (n_idx * C_IN + c_rep) * HW + safe_h * W_IN + safe_w, mask=hw_mask, other=0.0)
-            is_active = (tl.max(vals, axis=0) > THRESHOLD).to(tl.int32)
+            is_active = (tl.max(tl.abs(vals), axis=0) > THRESHOLD).to(tl.int32)
             rough_mask = rough_mask + is_active * (1 << g)
 
     if tl.sum(rough_mask == ALL_ONES_MASK) > 0:
@@ -178,7 +179,7 @@ def tile_coarse_classify_1x1_kernel(
         c_rep = g * GROUP_SIZE_C
         if c_rep < C_IN:
             vals = tl.load(x_ptr + (n_idx * C_IN + c_rep) * HW + out_h * W_IN + out_w, mask=m_mask, other=0.0)
-            is_active = (tl.max(vals, axis=0) > THRESHOLD).to(tl.int32)
+            is_active = (tl.max(tl.abs(vals), axis=0) > THRESHOLD).to(tl.int32)
             rough_mask = rough_mask + is_active * (1 << g)
 
     if tl.sum(rough_mask == ALL_ONES_MASK) > 0:
@@ -235,12 +236,16 @@ def zero_candidate_refine_kernel(
     while (tl.sum(g_idx) < NUM_GROUPS) & (tl.sum(found_nz) == 0):
         g_val = tl.sum(g_idx)
         group_max = tl.zeros([1], dtype=tl.float32)
+        # NOTE:
+        # c_off starts at 1 by design. Stage-1 coarse pass already inspected
+        # the representative channel (offset 0) for each group. Stage-2a only
+        # refines the remaining channels to avoid redundant reads.
         for c_off in range(1, GROUP_SIZE_C):
             c = g_val * GROUP_SIZE_C + c_off
             if c < C_IN:
                 vals = tl.load(x_ptr + (n_idx * C_IN + c) * HW + safe_h * W_IN + safe_w,
                                mask=hw_mask, other=0.0)
-                group_max = tl.maximum(group_max, tl.max(vals, axis=0))
+                group_max = tl.maximum(group_max, tl.max(tl.abs(vals), axis=0))
         is_active = (group_max > THRESHOLD).to(tl.int32)
         mask = mask + is_active * (1 << g_val)
         found_nz = found_nz + is_active
@@ -254,12 +259,13 @@ def zero_candidate_refine_kernel(
     while tl.sum(g_idx) < NUM_GROUPS:
         g_val = tl.sum(g_idx)
         group_max = tl.zeros([1], dtype=tl.float32)
+        # See note above: offset 0 is intentionally skipped in Stage-2a.
         for c_off in range(1, GROUP_SIZE_C):
             c = g_val * GROUP_SIZE_C + c_off
             if c < C_IN:
                 vals = tl.load(x_ptr + (n_idx * C_IN + c) * HW + safe_h * W_IN + safe_w,
                                mask=hw_mask, other=0.0)
-                group_max = tl.maximum(group_max, tl.max(vals, axis=0))
+                group_max = tl.maximum(group_max, tl.max(tl.abs(vals), axis=0))
         is_active = (group_max > THRESHOLD).to(tl.int32)
         mask = mask + is_active * (1 << g_val)
         if tl.sum(mask == ALL_ONES_MASK) > 0:
@@ -307,11 +313,15 @@ def zero_candidate_refine_1x1_kernel(
     while (tl.sum(g_idx) < NUM_GROUPS) & (tl.sum(found_nz) == 0):
         g_val = tl.sum(g_idx)
         group_max = tl.zeros([1], dtype=tl.float32)
+        # NOTE:
+        # c_off starts at 1 by design. Stage-1 coarse pass already inspected
+        # the representative channel (offset 0) for each group. Stage-2a only
+        # refines the remaining channels to avoid redundant reads.
         for c_off in range(1, GROUP_SIZE_C):
             c = g_val * GROUP_SIZE_C + c_off
             if c < C_IN:
                 vals = tl.load(x_ptr + (n_idx * C_IN + c) * HW + out_h * W_IN + out_w, mask=m_mask, other=0.0)
-                group_max = tl.maximum(group_max, tl.max(vals, axis=0))
+                group_max = tl.maximum(group_max, tl.max(tl.abs(vals), axis=0))
         is_active = (group_max > THRESHOLD).to(tl.int32)
         mask = mask + is_active * (1 << g_val)
         found_nz = found_nz + is_active
@@ -325,11 +335,12 @@ def zero_candidate_refine_1x1_kernel(
     while tl.sum(g_idx) < NUM_GROUPS:
         g_val = tl.sum(g_idx)
         group_max = tl.zeros([1], dtype=tl.float32)
+        # See note above: offset 0 is intentionally skipped in Stage-2a.
         for c_off in range(1, GROUP_SIZE_C):
             c = g_val * GROUP_SIZE_C + c_off
             if c < C_IN:
                 vals = tl.load(x_ptr + (n_idx * C_IN + c) * HW + out_h * W_IN + out_w, mask=m_mask, other=0.0)
-                group_max = tl.maximum(group_max, tl.max(vals, axis=0))
+                group_max = tl.maximum(group_max, tl.max(tl.abs(vals), axis=0))
         is_active = (group_max > THRESHOLD).to(tl.int32)
         mask = mask + is_active * (1 << g_val)
         if tl.sum(mask == ALL_ONES_MASK) > 0:
@@ -388,7 +399,7 @@ def group_bitmask_refine_kernel(
             c = g_val * GROUP_SIZE_C + c_off
             if c < C_IN:
                 vals = tl.load(x_ptr + (n_idx * C_IN + c) * HW + safe_h * W_IN + safe_w, mask=hw_mask, other=0.0)
-                group_max = tl.maximum(group_max, tl.max(vals, axis=0))
+                group_max = tl.maximum(group_max, tl.max(tl.abs(vals), axis=0))
         mask = mask + (group_max > THRESHOLD).to(tl.int32) * (1 << g_val)
         if tl.sum(mask == ALL_ONES_MASK) > 0:
             g = tl.full([1], NUM_GROUPS, dtype=tl.int32)
@@ -437,7 +448,7 @@ def group_bitmask_refine_1x1_kernel(
             c = g_val * GROUP_SIZE_C + c_off
             if c < C_IN:
                 vals = tl.load(x_ptr + (n_idx * C_IN + c) * HW + out_h * W_IN + out_w, mask=m_mask, other=0.0)
-                group_max = tl.maximum(group_max, tl.max(vals, axis=0))
+                group_max = tl.maximum(group_max, tl.max(tl.abs(vals), axis=0))
         mask = mask + (group_max > THRESHOLD).to(tl.int32) * (1 << g_val)
         if tl.sum(mask == ALL_ONES_MASK) > 0:
             g = tl.full([1], NUM_GROUPS, dtype=tl.int32)
@@ -1070,13 +1081,13 @@ def sparse_conv3x3s2_nhwc_kernel_8x16(
 
 
 # ===================================================================
-# Python entry point — v25: sync-gated + A/B tile launch switch
+# Python entry point 鈥?v25: sync-gated + A/B tile launch switch
 # ===================================================================
 
 def sparse_conv2d_forward(
     x, weight, bias,
     kernel_size=3, stride=1, padding=0, dilation=1, groups=1,
-    threshold=1e-6, w_cl=None,
+    threshold=PRESCAN_ACTIVITY_EPS, w_cl=None,
     ag_mask_buf=None, tile_class_buf=None,
     return_ms=False, fallback_ratio=FALLBACK_RATIO,
     return_avg_active_ratio=False, return_tile_stats=False,
@@ -1287,3 +1298,5 @@ def sparse_conv2d_forward(
     }
 
     return _finalize_return(y, sparse_ms, avg_active_ratio, tile_stats_base, backend_meta)
+
+

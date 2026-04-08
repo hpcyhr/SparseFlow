@@ -22,6 +22,7 @@ import time
 import math
 import sys
 from pathlib import Path
+from Utils.config import PRESCAN_ACTIVITY_EPS, SPARSE_DENSE_RATIO_THRESHOLD
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
@@ -76,8 +77,8 @@ class SparseConv2d(nn.Module):
         self,
         in_channels, out_channels, kernel_size,
         stride=1, padding=0, dilation=1, groups=1, bias=True,
-        block_size=None, threshold=1e-6, return_ms=False,
-        dense_threshold: float = 0.85,
+        block_size=None, threshold=PRESCAN_ACTIVITY_EPS, return_ms=False,
+        dense_threshold: float = SPARSE_DENSE_RATIO_THRESHOLD,
         warmup_steps: int = 8, calib_every: int = 32,
         ema_decay: float = 0.9, zero_streak_needed: int = 2,
         profile_runtime: bool = False,
@@ -158,6 +159,11 @@ class SparseConv2d(nn.Module):
         self.diag_source = "measured"
         self.support_status = "supported"
         self.score_family = "conv"
+        self._runtime_dispatch_calls = 0
+        self._runtime_dispatch_disagree = 0
+        self._runtime_last_expected = ""
+        self._runtime_last_backend = ""
+        self._runtime_last_disagree = False
 
     # ----------------------------------------------------------------
     # NEW [P1]: runtime A/B switch
@@ -304,6 +310,17 @@ class SparseConv2d(nn.Module):
             return True
         return (self._forward_count % self._calib_every) == 0
 
+    def _record_runtime_dispatch(self, runtime_backend: str):
+        expected = str(getattr(self, "sf_dispatch_decision", getattr(self, "sf_backend_mode", "")))
+        self._runtime_dispatch_calls += 1
+        self._runtime_last_expected = expected
+        self._runtime_last_backend = runtime_backend
+        disagree = bool(expected) and expected != runtime_backend
+        self._runtime_last_disagree = disagree
+        if disagree:
+            self._runtime_dispatch_disagree += 1
+        return expected, disagree
+
     def _update_policy(self, avg_active_ratio):
         if avg_active_ratio is None:
             return
@@ -329,7 +346,7 @@ class SparseConv2d(nn.Module):
             self._force_dense = False
 
     @classmethod
-    def from_dense(cls, conv: nn.Conv2d, block_size=None, threshold=1e-6,
+    def from_dense(cls, conv: nn.Conv2d, block_size=None, threshold=PRESCAN_ACTIVITY_EPS,
                    return_ms=False, **kwargs):
         sparse = cls(
             in_channels=conv.in_channels, out_channels=conv.out_channels,
@@ -371,6 +388,7 @@ class SparseConv2d(nn.Module):
             self.backend_family = ZERO_BACKEND_FAMILY
             self.diag_path = "zero_force"
             self.fallback_reason = "force_zero_policy"
+            expected_backend, disagree = self._record_runtime_dispatch("staticzero")
             if self.profile_runtime:
                 self._profile.zero_path_hits += 1
                 self._profile.last_path = "zero(force)"
@@ -383,6 +401,14 @@ class SparseConv2d(nn.Module):
                     "backend_family": self.backend_family,
                     "diag_path": self.diag_path,
                     "fallback_reason": self.fallback_reason,
+                    "egd_dispatch_decision": expected_backend,
+                    "runtime_backend_decision": "staticzero",
+                    "egd_runtime_disagree": bool(disagree),
+                    "egd_runtime_disagree_count": int(self._runtime_dispatch_disagree),
+                    "egd_runtime_calls": int(self._runtime_dispatch_calls),
+                    "egd_runtime_disagree_rate": (
+                        float(self._runtime_dispatch_disagree) / max(float(self._runtime_dispatch_calls), 1.0)
+                    ),
                     "runtime_total_ms": self._profile.last_total_ms if self.profile_runtime else -1.0,
                 })
             return y
@@ -424,20 +450,24 @@ class SparseConv2d(nn.Module):
             y4d, avg_active_ratio, backend_kind = self._triton_forward(x4d, need_ratio=need_ratio)
             if backend_kind == "dense_fallback":
                 path = "dense(fallback)"
+                runtime_backend = "dense"
                 if self.profile_runtime:
                     self._profile.dense_path_hits += 1
             elif backend_kind == "zero_tiles_only":
                 path = "zero(tile_compaction)"
+                runtime_backend = "staticzero"
                 if self.profile_runtime:
                     self._profile.zero_path_hits += 1
             else:
                 path = "sparse"
+                runtime_backend = "sparse"
                 if self.profile_runtime:
                     self._profile.sparse_path_hits += 1
         else:
             y4d = self._fallback_forward(x4d)
             avg_active_ratio = None
             path = "dense"
+            runtime_backend = "dense"
             self.fallback_reason = "dense_runtime_or_policy"
             if self.profile_runtime:
                 self._profile.dense_path_hits += 1
@@ -460,6 +490,20 @@ class SparseConv2d(nn.Module):
             self.backend_family = ZERO_BACKEND_FAMILY
             self.diag_path = "zero_promoted"
             self.fallback_reason = "zero_promoted_policy"
+            runtime_backend = "staticzero"
+
+        expected_backend, disagree = self._record_runtime_dispatch(runtime_backend)
+        if self.collect_diag:
+            self._last_diag.update({
+                "egd_dispatch_decision": expected_backend,
+                "runtime_backend_decision": runtime_backend,
+                "egd_runtime_disagree": bool(disagree),
+                "egd_runtime_disagree_count": int(self._runtime_dispatch_disagree),
+                "egd_runtime_calls": int(self._runtime_dispatch_calls),
+                "egd_runtime_disagree_rate": (
+                    float(self._runtime_dispatch_disagree) / max(float(self._runtime_dispatch_calls), 1.0)
+                ),
+            })
 
         # Reshape back 4D → 5D
         if reshaped:
@@ -640,6 +684,14 @@ class SparseConv2d(nn.Module):
             'backend_family': self.backend_family,
             'diag_path': self.diag_path,
             'fallback_reason': self.fallback_reason,
+            'egd_dispatch_decision': self._runtime_last_expected,
+            'runtime_backend_decision': self._runtime_last_backend,
+            'egd_runtime_disagree': bool(self._runtime_last_disagree),
+            'egd_runtime_disagree_count': int(self._runtime_dispatch_disagree),
+            'egd_runtime_calls': int(self._runtime_dispatch_calls),
+            'egd_runtime_disagree_rate': (
+                float(self._runtime_dispatch_disagree) / max(float(self._runtime_dispatch_calls), 1.0)
+            ),
             'meta_source': self.meta_source,
             'diag_source': self.diag_source,
             'support_status': self.support_status,
@@ -698,6 +750,14 @@ class SparseConv2d(nn.Module):
                 "backend_family": self.backend_family,
                 "diag_path": self.diag_path,
                 "fallback_reason": self.fallback_reason,
+                "egd_dispatch_decision": self._runtime_last_expected,
+                "runtime_backend_decision": self._runtime_last_backend or "dense",
+                "egd_runtime_disagree": bool(self._runtime_last_disagree),
+                "egd_runtime_disagree_count": int(self._runtime_dispatch_disagree),
+                "egd_runtime_calls": int(self._runtime_dispatch_calls),
+                "egd_runtime_disagree_rate": (
+                    float(self._runtime_dispatch_disagree) / max(float(self._runtime_dispatch_calls), 1.0)
+                ),
                 "dense_fallback_ms": self._last_dense_ms,
                 "sparse_path_executed": False,
             })
@@ -715,6 +775,15 @@ class SparseConv2d(nn.Module):
         diag.setdefault("score_family", self.score_family)
         diag.setdefault("sparse_total_ms", float(self._last_sparse_ms))
         diag.setdefault("dense_fallback_ms", float(self._last_dense_ms))
+        diag.setdefault("egd_dispatch_decision", self._runtime_last_expected)
+        diag.setdefault("runtime_backend_decision", self._runtime_last_backend)
+        diag.setdefault("egd_runtime_disagree", bool(self._runtime_last_disagree))
+        diag.setdefault("egd_runtime_disagree_count", int(self._runtime_dispatch_disagree))
+        diag.setdefault("egd_runtime_calls", int(self._runtime_dispatch_calls))
+        diag.setdefault(
+            "egd_runtime_disagree_rate",
+            float(self._runtime_dispatch_disagree) / max(float(self._runtime_dispatch_calls), 1.0),
+        )
         return diag
 
     def extra_repr(self):

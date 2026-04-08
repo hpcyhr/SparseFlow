@@ -1,12 +1,14 @@
 """
-SparseFlow Kernels/bmm.py — Sparse Batched Matmul Triton Kernel v1.0
+SparseFlow Kernels/bmm.py - Sparse Batched Matmul Triton kernel.
 
-Sparse BMM for [B, M, K] × [B, K, N] → [B, M, N].
-Per-batch prescan on the A tensor, then dispatches per (batch, m-tile, n-tile).
+Maturity: main_path (production-facing sparse kernel).
 
-Critical for Spikeformer attention (Q×K^T, attn×V) where Q/attn carry
-spike sparsity from upstream LIF neurons.
+Sparse BMM for [B, M, K] x [B, K, N] -> [B, M, N].
+Per-batch prescan on A, then dispatch per (batch, m-tile, n-tile).
+
+Critical for spike-transformer attention stages (QK^T and AttnV).
 """
+
 
 import torch
 import triton
@@ -22,8 +24,9 @@ from Utils.sparse_helpers import (
     TILE_ZERO, TILE_SPARSE, TILE_DENSEISH,
     choose_group_size, popcount_buf,
 )
+from Utils.config import PRESCAN_ACTIVITY_EPS, SPARSE_DENSE_RATIO_THRESHOLD
 
-FALLBACK_RATIO = 0.85
+FALLBACK_RATIO = SPARSE_DENSE_RATIO_THRESHOLD
 TRITON_MAX_TENSOR_NUMEL = 131072
 
 _BMM_CONFIGS = [
@@ -33,7 +36,7 @@ _BMM_CONFIGS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Prescan kernel — per batch element
+# Prescan kernel 鈥?per batch element
 # ---------------------------------------------------------------------------
 
 @triton.jit
@@ -173,7 +176,7 @@ def _sparse_bmm_kernel(
 def sparse_bmm_forward(
     a: torch.Tensor,       # [B, M, K]
     b: torch.Tensor,       # [B, K, N]
-    threshold: float = 1e-6,
+    threshold: float = PRESCAN_ACTIVITY_EPS,
     ag_mask_buf: torch.Tensor = None,
     tile_class_buf: torch.Tensor = None,
     return_ms: bool = False,

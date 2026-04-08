@@ -1,27 +1,34 @@
 """
-性能分析工具 — 延迟、吞吐、稀疏率统计
+Lightweight hook-based profiler for SparseFlow sparse operators.
+
+This utility is intentionally minimal and is mainly used for quick debugging/
+inspection rather than benchmark-grade reporting.
 """
+
+from __future__ import annotations
+
+from typing import Any, Dict
 
 import torch
 import torch.nn as nn
-from typing import Dict, Any
+
+from Utils.config import NUMERIC_EPS
 
 
 class SparseProfiler:
-    """
-    Hook-based 性能分析器，统计每个 SparseConv2d 的：
-    - 稀疏率 (sparsity)
-    - Stage-2 延迟 (sparse_ms)
-    - 跳过的 block 比例
-    """
+    """Collect per-layer sparsity and sparse-kernel timing via forward hooks."""
 
     def __init__(self):
         self.stats: Dict[str, Dict[str, Any]] = {}
         self._hooks = []
 
     def attach(self, model: nn.Module):
-        """挂载 hook 到模型中所有 SparseConv2d"""
-        from sparseflow.ops.sparse_conv2d import SparseConv2d
+        """Attach hooks to all SparseConv2d modules in `model`."""
+        try:
+            from Ops.sparse_conv2d import SparseConv2d
+        except Exception:
+            # Optional compatibility path for pip-installed package layout.
+            from sparseflow.ops.sparse_conv2d import SparseConv2d  # type: ignore
 
         for name, module in model.named_modules():
             if isinstance(module, SparseConv2d):
@@ -31,27 +38,27 @@ class SparseProfiler:
                     "total_sparse_ms": 0.0,
                     "call_count": 0,
                 }
-                h = module.register_forward_hook(self._make_hook(name))
-                self._hooks.append(h)
+                hook = module.register_forward_hook(self._make_hook(name))
+                self._hooks.append(hook)
 
     def _make_hook(self, name: str):
-        def hook(module, inp, out):
+        def hook(module, inp, _out):
             x = inp[0]
             if x.dim() == 5:
-                T, B, C, H, W = x.shape
-                x = x.reshape(T * B, C, H, W)
+                t, b, c, h, w = x.shape
+                x = x.reshape(t * b, c, h, w)
             st = self.stats[name]
-            st["total_zeros"] += (x.abs() <= 1e-6).sum().item()
+            st["total_zeros"] += (x.abs() <= NUMERIC_EPS).sum().item()
             st["total_elems"] += x.numel()
             st["call_count"] += 1
-            # sparse_ms 由 SparseConv2d 在 forward 中记录到 module._last_sparse_ms
             if hasattr(module, "_last_sparse_ms"):
-                st["total_sparse_ms"] += module._last_sparse_ms
+                st["total_sparse_ms"] += float(module._last_sparse_ms)
+
         return hook
 
     def detach(self):
-        for h in self._hooks:
-            h.remove()
+        for hook in self._hooks:
+            hook.remove()
         self._hooks.clear()
 
     def report(self) -> str:
@@ -61,7 +68,7 @@ class SparseProfiler:
         for name, st in self.stats.items():
             if st["total_elems"] == 0:
                 continue
-            sparsity = st["total_zeros"] / st["total_elems"] * 100
+            sparsity = st["total_zeros"] / st["total_elems"] * 100.0
             lines.append(
                 f"{name:<40} {sparsity:>8.2f}% {st['call_count']:>6} "
                 f"{st['total_sparse_ms']:>9.2f}"

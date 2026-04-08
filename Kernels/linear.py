@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 from triton import autotune, Config
+from Utils.config import PRESCAN_ACTIVITY_EPS
 
 
 TILE_ZERO = 0
@@ -393,7 +394,7 @@ def sparse_linear_forward(
     x,
     weight,
     bias=None,
-    threshold=1e-6,
+    threshold=PRESCAN_ACTIVITY_EPS,
     w_t=None,
     ag_mask_buf=None,
     tile_class_buf=None,
