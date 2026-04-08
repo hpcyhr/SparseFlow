@@ -1,13 +1,11 @@
 """
-SparseFlow Kernels/conv1d.py 鈥?Sparse Conv1d Triton Kernel v1.0
+SparseFlow Kernels/conv1d.py - Sparse Conv1d kernel.
 
-1D convolution [N, C_IN, L] 鈫?[N, C_OUT, L_OUT] with grouped-bitmask
-sparsity exploitation on the input channel dimension.
+Maturity: prototype/stats_only (not a primary performance path).
 
-Follows the same prescan + sparse-compute pattern as conv2d.py.
-Useful for temporal spike processing in 1D SNN layers.
-
-Supported: kernel_size={1,3,5,7}, stride=1, groups=1, dilation=1.
+Conv1d [N, Cin, L] -> [N, Cout, Lout] with grouped-bitmask prescan.
+Useful for temporal experiments; API compatibility is prioritized over
+aggressive optimization in this branch.
 """
 
 import torch

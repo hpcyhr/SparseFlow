@@ -1,6 +1,8 @@
 """
 SparseFlow Conv2d Triton Kernels — v25.0
 
+Maturity: main_path (production-facing sparse kernel).
+
 Changes from v24:
   [P0] sparse_conv2d_forward: all .item() syncs gated behind need_stats flag.
        When return_avg_active_ratio=False AND return_tile_stats=False, the

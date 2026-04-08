@@ -23,6 +23,13 @@ class StaticZeroLinear(nn.Module):
         else:
             self.bias_buf = None
         self._forward_count = 0
+        self.collect_diag = False
+        self.profile_runtime = False
+        self._last_diag: Dict[str, Any] = {}
+        self._last_sparse_ms = 0.0
+        self.backend_family = "exact_zero"
+        self.diag_path = "staticzero_linear"
+        self.fallback_reason = "exact_zero_shortcut"
 
     @classmethod
     def from_linear(cls, linear: nn.Linear) -> "StaticZeroLinear":
@@ -39,6 +46,8 @@ class StaticZeroLinear(nn.Module):
             b = self.bias_buf.to(device=x.device, dtype=torch.float32)
             view_shape = [1] * (y.dim() - 1) + [self.out_features]
             y = y + b.view(*view_shape)
+        if self.collect_diag:
+            self._last_diag = self.get_diag()
         return y
 
     def get_diag(self) -> Dict[str, Any]:
@@ -46,11 +55,13 @@ class StaticZeroLinear(nn.Module):
             "backend_family": "exact_zero",
             "zero_reason": "static_zero_input_linear",
             "diag_path": "staticzero_linear",
+            "fallback_reason": self.fallback_reason,
             "has_bias": self.bias_buf is not None,
             "out_features": self.out_features,
             "forward_count": self._forward_count,
+            "sparse_path_executed": False,
+            "sparse_total_ms": 0.0,
         }
 
     def extra_repr(self) -> str:
         return f"out_features={self.out_features}, has_bias={self.bias_buf is not None}"
-

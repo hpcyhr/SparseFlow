@@ -6,15 +6,18 @@ python bench_resnet.py --model resnet50 --dataset cifar100 --batch_size 8 --T 16
 nsys profile -o profile_h56 --trace=cuda,nvtx,osrt --force-overwrite true python bench_resnet.py --model resnet50 --dataset cifar100 --T 16
 
 
-python bench_4test.py   --model spiking_resnet101   
--dataset imagenet_val_flat   
---T 8   
---batch_size 32   
---gpu 3   
---weight_init random   
---seed 42   
---spike_mode normalized_bernoulli   
---layer_profile   
---layer_profile_warmup 5   
---layer_profile_batches 20 
---data_root /home/yhr/SparseFlow/data/imagenet_val_flat
+python bench_4test.py \
+  --model spiking_resnet18 \
+  --dataset imagenet_val_flat \
+  --T 8 \
+  --batch_size 32 \
+  --gpu 3 \
+  --weight_init random \
+  --seed 42 \
+  --spike_mode normalized_bernoulli \
+  --layer_profile \
+  --layer_profile_warmup 5 \
+  --layer_profile_batches 20 \
+  --data_root /home/yhr/SparseFlow/data/imagenet_val_flat \
+  --v_threshold 0.5 \
+  --replace_all_ops

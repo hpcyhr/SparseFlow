@@ -21,3 +21,5 @@ dist/
 *.so
 
 *.json
+
+*.log

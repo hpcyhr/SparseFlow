@@ -1,38 +1,33 @@
 """
-SparseFlow Ops/sparse_attention.py — SparseAttention nn.Module
+SparseFlow Ops/sparse_attention.py - SparseAttention nn.Module.
 
-Wraps Kernels/attention.py for Spikeformer-class models.
-Provides sparse Q×K^T and attn×V as a single module with
-configurable num_heads and head_dim.
+This module accelerates attention matmul stages:
+  - qk: Q @ K^T
+  - av: Attn @ V
 
-This module does NOT implement softmax or the full MHA block —
-it only accelerates the two matmul steps.  The surrounding
-softmax / residual / projection logic stays in the model.
-
-Usage:
-    attn_module = SparseAttention(num_heads=8, head_dim=64)
-    attn_logits = attn_module.qk(q, k)   # sparse Q × K^T
-    attn_out    = attn_module.av(attn, v) # sparse attn × V
+It keeps the wrapper contract consistent with other SparseFlow Ops:
+  collect_diag, profile_runtime, _last_diag, _last_sparse_ms,
+  backend_family, diag_path, fallback_reason.
 """
 
+from __future__ import annotations
+
+import math
+import time
 import sys
 from pathlib import Path
-from typing import Dict, Any, Optional
-import math
+from typing import Any, Dict
+
+import torch
+import torch.nn as nn
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-import torch
-import torch.nn as nn
-
 
 class SparseAttention(nn.Module):
-    """
-    Sparse attention matmul module for Spikeformer.
-    No learnable parameters — purely functional.
-    """
+    """Sparse attention matmul wrapper for spike-based transformer blocks."""
 
     def __init__(
         self,
@@ -40,90 +35,188 @@ class SparseAttention(nn.Module):
         head_dim: int = 64,
         threshold: float = 1e-6,
         return_ms: bool = False,
+        profile_runtime: bool = False,
     ):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.scale = 1.0 / math.sqrt(head_dim)
-        self.threshold = threshold
-        self.return_ms = return_ms
+        self.num_heads = int(num_heads)
+        self.head_dim = int(head_dim)
+        self.scale = 1.0 / math.sqrt(max(self.head_dim, 1))
+        self.threshold = float(threshold)
+        self.return_ms = bool(return_ms)
+        self.profile_runtime = bool(profile_runtime)
 
         self._triton_available = False
         try:
             import triton  # noqa: F401
             self._triton_available = True
         except Exception:
-            pass
+            self._triton_available = False
 
-        self._last_sparse_ms = 0.0
-        self._last_diag: Dict[str, Any] = {}
         self.collect_diag = False
+        self._last_diag: Dict[str, Any] = {}
+        self._last_sparse_ms = 0.0
+        self._last_dense_ms = 0.0
+
+        # Standardized observability contract
+        self.backend_family = "sparse_attention"
+        self.diag_path = "runtime"
+        self.fallback_reason = ""
+        self.meta_source = "measured"
+        self.diag_source = "measured"
+        self.support_status = "supported"
+        self.score_family = "attn_matmul"
+
+    def _stamp(self, device: torch.device) -> float:
+        if self.profile_runtime and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        return time.perf_counter()
+
+    def _elapsed_ms(self, t0: float, device: torch.device) -> float:
+        if self.profile_runtime and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        return (time.perf_counter() - t0) * 1000.0
 
     def qk(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-        """
-        Sparse Q × K^T → attention logits.
+        """Sparse Q @ K^T -> attention logits."""
+        if self.collect_diag:
+            self._last_diag = {
+                "sparse_path_executed": False,
+                "op_stage": "attn_matmul_qk",
+                "score_family": "attn_matmul",
+            }
 
-        Args:
-            q: [B, num_heads, seq_len, head_dim]
-            k: [B, num_heads, seq_len, head_dim]
-
-        Returns:
-            attn_logits: [B, num_heads, seq_len, seq_len]
-        """
+        t0 = self._stamp(q.device)
         if not self._triton_available or not q.is_cuda:
-            return self._dense_qk(q, k)
+            y = torch.matmul(q.float(), k.float().transpose(-2, -1)) * self.scale
+            self.backend_family = "dense_torch"
+            self.diag_path = "dense_fallback"
+            self.fallback_reason = "triton_unavailable_or_cpu"
+            self._last_dense_ms = 0.0
+            self._last_sparse_ms = 0.0
+            if self.collect_diag:
+                self._last_diag.update({
+                    "backend": "dense_fallback",
+                    "backend_family": self.backend_family,
+                    "diag_path": self.diag_path,
+                    "fallback_reason": self.fallback_reason,
+                    "runtime_total_ms": self._elapsed_ms(t0, q.device),
+                })
+            return y
 
         from Kernels.attention import sparse_qk_forward
 
         result = sparse_qk_forward(
-            q=q, k=k,
+            q=q,
+            k=k,
             scale=self.scale,
             threshold=self.threshold,
             return_ms=self.return_ms,
             return_tile_stats=self.collect_diag,
         )
-        attn_logits = result[0]
-        self._last_sparse_ms = result[1]
-        if self.collect_diag and len(result) > 2:
-            self._last_diag['qk_stats'] = result[2]
-        return attn_logits
+        y = result[0]
+        ms = float(result[1])
+        self._last_sparse_ms = ms
+        self._last_dense_ms = 0.0
+        self.backend_family = "sparse_attention"
+        self.diag_path = "attn_matmul_qk"
+        self.fallback_reason = ""
+        if self.collect_diag:
+            self._last_diag = {
+                "sparse_path_executed": True,
+                "op_stage": "attn_matmul_qk",
+                "backend": "sparse_triton",
+                "backend_family": self.backend_family,
+                "diag_path": self.diag_path,
+                "fallback_reason": self.fallback_reason,
+                "meta_source": self.meta_source,
+                "diag_source": self.diag_source,
+                "support_status": self.support_status,
+                "score_family": "attn_matmul",
+                "sparse_total_ms": self._last_sparse_ms,
+                "runtime_total_ms": self._elapsed_ms(t0, q.device),
+            }
+            if len(result) > 2:
+                self._last_diag["tile_stats"] = result[2]
+        return y
 
     def av(self, attn: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """
-        Sparse attn × V → attention output.
+        """Sparse Attn @ V -> attention output."""
+        if self.collect_diag:
+            self._last_diag = {
+                "sparse_path_executed": False,
+                "op_stage": "attn_matmul_av",
+                "score_family": "attn_matmul",
+            }
 
-        Args:
-            attn: [B, num_heads, seq_len, seq_len]
-            v:    [B, num_heads, seq_len, head_dim]
-
-        Returns:
-            output: [B, num_heads, seq_len, head_dim]
-        """
+        t0 = self._stamp(attn.device)
         if not self._triton_available or not attn.is_cuda:
-            return self._dense_av(attn, v)
+            y = torch.matmul(attn.float(), v.float())
+            self.backend_family = "dense_torch"
+            self.diag_path = "dense_fallback"
+            self.fallback_reason = "triton_unavailable_or_cpu"
+            self._last_dense_ms = 0.0
+            self._last_sparse_ms = 0.0
+            if self.collect_diag:
+                self._last_diag.update({
+                    "backend": "dense_fallback",
+                    "backend_family": self.backend_family,
+                    "diag_path": self.diag_path,
+                    "fallback_reason": self.fallback_reason,
+                    "runtime_total_ms": self._elapsed_ms(t0, attn.device),
+                })
+            return y
 
         from Kernels.attention import sparse_attn_v_forward
 
         result = sparse_attn_v_forward(
-            attn=attn, v=v,
+            attn=attn,
+            v=v,
             threshold=self.threshold,
             return_ms=self.return_ms,
             return_tile_stats=self.collect_diag,
         )
-        output = result[0]
-        self._last_sparse_ms += result[1]
-        if self.collect_diag and len(result) > 2:
-            self._last_diag['av_stats'] = result[2]
-        return output
+        y = result[0]
+        ms = float(result[1])
+        self._last_sparse_ms = ms
+        self._last_dense_ms = 0.0
+        self.backend_family = "sparse_attention"
+        self.diag_path = "attn_matmul_av"
+        self.fallback_reason = ""
+        if self.collect_diag:
+            self._last_diag = {
+                "sparse_path_executed": True,
+                "op_stage": "attn_matmul_av",
+                "backend": "sparse_triton",
+                "backend_family": self.backend_family,
+                "diag_path": self.diag_path,
+                "fallback_reason": self.fallback_reason,
+                "meta_source": self.meta_source,
+                "diag_source": self.diag_source,
+                "support_status": self.support_status,
+                "score_family": "attn_matmul",
+                "sparse_total_ms": self._last_sparse_ms,
+                "runtime_total_ms": self._elapsed_ms(t0, attn.device),
+            }
+            if len(result) > 2:
+                self._last_diag["tile_stats"] = result[2]
+        return y
 
-    def _dense_qk(self, q, k):
-        return torch.matmul(q.float(), k.float().transpose(-2, -1)) * self.scale
-
-    def _dense_av(self, attn, v):
-        return torch.matmul(attn.float(), v.float())
+    def get_diag(self) -> Dict[str, Any]:
+        diag = dict(self._last_diag or {})
+        diag.setdefault("backend_family", self.backend_family)
+        diag.setdefault("diag_path", self.diag_path)
+        diag.setdefault("fallback_reason", self.fallback_reason)
+        diag.setdefault("meta_source", self.meta_source)
+        diag.setdefault("diag_source", self.diag_source)
+        diag.setdefault("support_status", self.support_status)
+        diag.setdefault("score_family", self.score_family)
+        diag.setdefault("sparse_total_ms", float(self._last_sparse_ms))
+        diag.setdefault("dense_fallback_ms", float(self._last_dense_ms))
+        return diag
 
     def extra_repr(self):
         return (
             f"num_heads={self.num_heads}, head_dim={self.head_dim}, "
-            f"scale={self.scale:.4f}, threshold={self.threshold}"
+            f"threshold={self.threshold}, return_ms={self.return_ms}, "
+            f"profile_runtime={self.profile_runtime}, score_family=attn_matmul"
         )

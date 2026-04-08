@@ -150,6 +150,14 @@ class SparseConv2d(nn.Module):
         self._last_diag = {}
         self.profile_runtime = profile_runtime
         self._profile = _ProfileStats()
+        # Standardized observability contract
+        self.backend_family = "sparse_conv2d"
+        self.diag_path = "runtime"
+        self.fallback_reason = ""
+        self.meta_source = "measured"
+        self.diag_source = "measured"
+        self.support_status = "supported"
+        self.score_family = "conv"
 
     # ----------------------------------------------------------------
     # NEW [P1]: runtime A/B switch
@@ -345,18 +353,38 @@ class SparseConv2d(nn.Module):
             self._profile.calls += 1
             t_total = self._stamp()
         if self.collect_diag:
-            self._last_diag = {'sparse_path_executed': False}
+            self._last_diag = {
+                'sparse_path_executed': False,
+                'backend_family': self.backend_family,
+                'diag_path': self.diag_path,
+                'fallback_reason': self.fallback_reason,
+                'meta_source': self.meta_source,
+                'diag_source': self.diag_source,
+                'support_status': self.support_status,
+                'score_family': self.score_family,
+            }
 
         # Force-zero path (no sync — boolean flag)
         if self._force_zero:
             y = self._zero_output_5d(x) if x.dim() == 5 else self._zero_output_4d(x)
             self._last_sparse_ms = 0.0
+            self.backend_family = ZERO_BACKEND_FAMILY
+            self.diag_path = "zero_force"
+            self.fallback_reason = "force_zero_policy"
             if self.profile_runtime:
                 self._profile.zero_path_hits += 1
                 self._profile.last_path = "zero(force)"
                 total_ms = self._elapsed_ms(t_total)
                 self._profile_add("total_ms", total_ms)
                 self._profile_set_last("last_total_ms", total_ms)
+            if self.collect_diag:
+                self._last_diag.update({
+                    "backend": "staticzero",
+                    "backend_family": self.backend_family,
+                    "diag_path": self.diag_path,
+                    "fallback_reason": self.fallback_reason,
+                    "runtime_total_ms": self._profile.last_total_ms if self.profile_runtime else -1.0,
+                })
             return y
 
         # Reshape 5D → 4D
@@ -410,6 +438,7 @@ class SparseConv2d(nn.Module):
             y4d = self._fallback_forward(x4d)
             avg_active_ratio = None
             path = "dense"
+            self.fallback_reason = "dense_runtime_or_policy"
             if self.profile_runtime:
                 self._profile.dense_path_hits += 1
 
@@ -428,6 +457,9 @@ class SparseConv2d(nn.Module):
         if self._force_zero and avg_active_ratio == 0.0:
             y4d = self._zero_output_4d(x4d)
             path = "zero(promoted)"
+            self.backend_family = ZERO_BACKEND_FAMILY
+            self.diag_path = "zero_promoted"
+            self.fallback_reason = "zero_promoted_policy"
 
         # Reshape back 4D → 5D
         if reshaped:
@@ -530,16 +562,33 @@ class SparseConv2d(nn.Module):
 
         # --- Update internal state ---
         backend_kind = backend_meta.get("backend", "sparse_triton") if backend_meta else "sparse_triton"
+        backend_reason = backend_meta.get("reason", "") if backend_meta else ""
         if backend_kind == "dense_fallback":
             self._last_sparse_ms = 0.0
             self._last_dense_ms = float(sparse_ms)
+            self.backend_family = "dense_torch"
+            self.diag_path = "dense_fallback"
+            self.fallback_reason = backend_reason or "dense_fallback"
             if self.profile_runtime:
                 self._profile_add("dense_fallback_ms", self._last_dense_ms)
                 self._profile_set_last("last_dense_fallback_ms", self._last_dense_ms)
                 self._profile_set_last("last_sparse_kernel_ms", 0.0)
+        elif backend_kind == "zero_tiles_only":
+            self._last_sparse_ms = float(sparse_ms)
+            self._last_dense_ms = 0.0
+            self.backend_family = ZERO_BACKEND_FAMILY
+            self.diag_path = "zero_tiles_only"
+            self.fallback_reason = backend_reason or "zero_tiles_only"
+            if self.profile_runtime:
+                self._profile_add("sparse_kernel_ms", self._last_sparse_ms)
+                self._profile_set_last("last_sparse_kernel_ms", self._last_sparse_ms)
+                self._profile_set_last("last_dense_fallback_ms", 0.0)
         else:
             self._last_sparse_ms = float(sparse_ms)
             self._last_dense_ms = 0.0
+            self.backend_family = "sparse_conv2d"
+            self.diag_path = "sparse_kernel"
+            self.fallback_reason = ""
             if self.profile_runtime:
                 self._profile_add("sparse_kernel_ms", self._last_sparse_ms)
                 self._profile_set_last("last_sparse_kernel_ms", self._last_sparse_ms)
@@ -588,6 +637,13 @@ class SparseConv2d(nn.Module):
         self._last_diag = {
             'sparse_path_executed': True,
             'metadata_kind': 'three_stage_nhwc_v25',
+            'backend_family': self.backend_family,
+            'diag_path': self.diag_path,
+            'fallback_reason': self.fallback_reason,
+            'meta_source': self.meta_source,
+            'diag_source': self.diag_source,
+            'support_status': self.support_status,
+            'score_family': self.score_family,
             'group_size': GROUP_SIZE_C, 'num_groups': NUM_GROUPS,
             'nonzero_group_count': active_g, 'total_group_count': total_g,
             'active_group_ratio': agr,
@@ -595,6 +651,7 @@ class SparseConv2d(nn.Module):
             'tile_zero_ratio': zt / max(N_TILES, 1),
             'effective_k_ratio': agr,
             'sparse_compute_ms': sparse_ms, 'sparse_total_ms': sparse_ms,
+            'dense_fallback_ms': self._last_dense_ms if self._last_dense_ms > 0 else -1.0,
             'zero_check_ms': -1.0, 'metadata_ms': -1.0,
             'zero_tiles': zt, 'sparse_tiles': st, 'denseish_tiles': dt,
             'prescan_mode': 'three_stage_nhwc_v25',
@@ -624,6 +681,10 @@ class SparseConv2d(nn.Module):
         y = F.conv2d(x, self.weight, self.bias,
                      self.stride, self.padding, self.dilation, self.groups)
         self._last_sparse_ms = 0.0
+        self.backend_family = "dense_torch"
+        self.diag_path = "dense_fallback"
+        if not self.fallback_reason:
+            self.fallback_reason = "dense_fallback"
         if self.profile_runtime:
             self._last_dense_ms = self._elapsed_ms(t0)
             self._profile_add("dense_fallback_ms", self._last_dense_ms)
@@ -631,7 +692,30 @@ class SparseConv2d(nn.Module):
             self._profile_set_last("last_sparse_kernel_ms", 0.0)
         else:
             self._last_dense_ms = 0.0
+        if self.collect_diag:
+            self._last_diag.update({
+                "backend": "dense_fallback",
+                "backend_family": self.backend_family,
+                "diag_path": self.diag_path,
+                "fallback_reason": self.fallback_reason,
+                "dense_fallback_ms": self._last_dense_ms,
+                "sparse_path_executed": False,
+            })
         return y
+
+    def get_diag(self) -> Dict[str, Any]:
+        """Return standardized per-layer diagnostics from the latest forward."""
+        diag = dict(self._last_diag or {})
+        diag.setdefault("backend_family", self.backend_family)
+        diag.setdefault("diag_path", self.diag_path)
+        diag.setdefault("fallback_reason", self.fallback_reason)
+        diag.setdefault("meta_source", self.meta_source)
+        diag.setdefault("diag_source", self.diag_source)
+        diag.setdefault("support_status", self.support_status)
+        diag.setdefault("score_family", self.score_family)
+        diag.setdefault("sparse_total_ms", float(self._last_sparse_ms))
+        diag.setdefault("dense_fallback_ms", float(self._last_dense_ms))
+        return diag
 
     def extra_repr(self):
         bs = self.block_size if self.block_size is not None else "auto"

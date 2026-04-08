@@ -1,3 +1,9 @@
+"""
+SparseFlow Kernels/linear.py
+
+Maturity: main_path (production-facing sparse kernel).
+"""
+
 import torch
 import triton
 import triton.language as tl

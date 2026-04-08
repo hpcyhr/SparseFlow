@@ -34,29 +34,6 @@ def _get_default_spike_ops():
     return _DEFAULT_SPIKE_OPS
 
 
-def _is_attention_like_module(module: nn.Module) -> bool:
-    """
-    Structural check for spike-attention blocks in external transformer models.
-
-    We intentionally use a capability-based check rather than class-name matching
-    to keep this registry stable across model files.
-    """
-    if module is None:
-        return False
-
-    for attr in ("q", "k", "v", "proj"):
-        if not hasattr(module, attr):
-            return False
-        if not isinstance(getattr(module, attr), nn.Linear):
-            return False
-
-    # spike-attention blocks in this repo have an attention spike node
-    if not hasattr(module, "attn_lif"):
-        return False
-
-    return True
-
-
 class SpikeOpRegistry:
     """
     Spike op + replaceable target op registry.
@@ -66,7 +43,11 @@ class SpikeOpRegistry:
     - nn.Conv2d (including depthwise subset)
     - nn.Conv3d
     - nn.Linear
-    - attention-like blocks (structural match, see is_target_attention_like)
+
+    Note:
+    Functional event-driven operators (matmul / bmm / attention stages) are
+    supported by SparseFlow Ops wrappers and dispatch metadata, but they are
+    not discovered by this module-type registry path.
     """
 
     def __init__(self):
@@ -110,9 +91,6 @@ class SpikeOpRegistry:
             module.groups == module.in_channels
             and module.out_channels == module.in_channels
         )
-
-    def is_target_attention_like(self, module: nn.Module) -> bool:
-        return _is_attention_like_module(module)
 
     @property
     def spike_op_types(self) -> Tuple:

@@ -15,7 +15,6 @@ from Ops.sparse_conv2d import SparseConv2d
 from Ops.static_zero_conv2d import StaticZeroConv2d
 from Ops.static_zero_linear import StaticZeroLinear
 from Ops.sparse_fused_conv_lif import FusedSparseConvLIF
-from Ops.sparse_attention_block import SparseAttentionBlock
 
 
 def _set_module_by_name(model: nn.Module, name: str, new_module: nn.Module):
@@ -32,6 +31,47 @@ def _set_module_by_name(model: nn.Module, name: str, new_module: nn.Module):
 def _eligible_direct_fusion_conv_name(conv_name: str) -> bool:
     leaf = conv_name.rsplit(".", 1)[-1]
     return leaf in ("conv1", "conv2")
+
+
+def _score_family_from_op(op: str) -> str:
+    op = str(op or "").lower()
+    if op == "linear":
+        return "linear"
+    if op in ("attention_linear", "attention_qkmix", "attn_linear"):
+        return "attn_linear"
+    if op in ("attention_qkav", "attn_matmul"):
+        return "attn_matmul"
+    if op.startswith("conv") or op.startswith("fused_conv") or op == "depthwise_conv2d":
+        return "conv"
+    return "unknown"
+
+
+def _attach_observability(
+    module: nn.Module,
+    *,
+    layer_name: str,
+    operator_type: str,
+    backend_mode: str,
+    fallback_reason: str = "",
+    meta_source: str = "measured",
+    diag_source: str = "measured",
+    support_status: str = "supported",
+):
+    """Attach standardized SparseFlow metadata on replaced modules.
+
+    This is a lightweight, backward-compatible metadata channel used by
+    profiling/logging code paths without changing forward semantics.
+    """
+    setattr(module, "sf_layer_name", layer_name)
+    setattr(module, "sf_operator_type", operator_type)
+    setattr(module, "sf_operator_family", _score_family_from_op(operator_type))
+    setattr(module, "sf_backend_mode", backend_mode)
+    setattr(module, "sf_backend_family", getattr(module, "backend_family", backend_mode))
+    setattr(module, "sf_diag_path", getattr(module, "diag_path", "runtime"))
+    setattr(module, "sf_fallback_reason", fallback_reason)
+    setattr(module, "sf_meta_source", meta_source)
+    setattr(module, "sf_diag_source", diag_source)
+    setattr(module, "sf_support_status", support_status)
 
 
 class ModuleReplacer:
@@ -87,9 +127,25 @@ class ModuleReplacer:
                     new_module = StaticZeroLinear.from_linear(target.conv_module)
                 else:
                     new_module = StaticZeroConv2d.from_conv(target.conv_module)
+                _attach_observability(
+                    new_module,
+                    layer_name=module_name,
+                    operator_type=op,
+                    backend_mode="staticzero",
+                    fallback_reason="exact_zero_shortcut",
+                    meta_source="shortcut",
+                    diag_source="shortcut",
+                    support_status="exact_zero_shortcut",
+                )
                 _set_module_by_name(model, module_name, new_module)
                 replaced += 1
                 static_zero_count += 1
+                # Keep downstream BN/LIF untouched for static-zero route.
+                # Reason:
+                #   StaticZeroConv2d only guarantees exact conv(x=0) output.
+                #   BN/LIF may be stateful / non-identity (especially in SNN blocks),
+                #   so removing them can break numerical equivalence.
+                #   Only explicit fused route is allowed to fold/remove BN/LIF.
                 if self.verbose:
                     if op == "linear":
                         print(f"  [STATIC ] {module_name} ({op}) -> StaticZeroLinear")
@@ -115,6 +171,16 @@ class ModuleReplacer:
                 continue
 
             _set_module_by_name(model, module_name, new_module)
+            _attach_observability(
+                new_module,
+                layer_name=module_name,
+                operator_type=op,
+                backend_mode="sparse",
+                fallback_reason="",
+                meta_source="measured",
+                diag_source="measured",
+                support_status="supported",
+            )
             replaced += 1
 
             actually_fused = (
@@ -159,6 +225,7 @@ class ModuleReplacer:
 
         if op == "depthwise_conv2d":
             from Ops.sparse_depthwise_conv2d import SparseDepthwiseConv2d
+
             sparse = SparseDepthwiseConv2d.from_dense(mod)
             return sparse.to(mod.weight.device)
 
@@ -189,6 +256,7 @@ class ModuleReplacer:
 
         if op == "conv1d":
             from Ops.sparse_conv1d import SparseConv1d
+
             if not isinstance(mod, nn.Conv1d):
                 return None
             sparse = SparseConv1d.from_dense(mod)
@@ -196,6 +264,7 @@ class ModuleReplacer:
 
         if op == "conv3d":
             from Ops.sparse_conv3d import SparseConv3d
+
             if not isinstance(mod, nn.Conv3d):
                 return None
             sparse = SparseConv3d.from_dense(mod)
@@ -203,15 +272,11 @@ class ModuleReplacer:
 
         if op == "linear":
             from Ops.sparse_linear import SparseLinear
+
             if not isinstance(mod, nn.Linear):
                 return None
             sparse = SparseLinear.from_dense(mod)
             return sparse.to(mod.weight.device)
-
-        if op in ("attention_qkav", "attention_linear", "attention_qkmix"):
-            # Replace the whole attention block with sparse event-op backed block.
-            sparse = SparseAttentionBlock.from_dense(mod, variant=op)
-            return sparse
 
         return None
 
@@ -223,13 +288,6 @@ class ModuleReplacer:
             in_f = mod.in_features
             out_f = mod.out_features
             print(f"  [REPLACE] {target.conv_name} (linear {in_f}->{out_f}) <- {target.spike_name}")
-            return
-
-        if op in ("attention_qkav", "attention_linear", "attention_qkmix"):
-            info = display_block_info(target)
-            h = getattr(mod, "num_heads", "?")
-            d = getattr(mod, "head_dim", "?")
-            print(f"  [REPLACE] {target.conv_name} ({op}, heads={h}, head_dim={d}) <- {target.spike_name}, {info}")
             return
 
         if "fused" in op and actually_fused:

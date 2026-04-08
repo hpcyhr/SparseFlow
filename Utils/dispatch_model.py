@@ -1,5 +1,5 @@
 """
-Utils/dispatch_model.py — Execution-Grounded Dispatch (EGD), v28.
+Utils/dispatch_model.py 鈥?Execution-Grounded Dispatch (EGD), v28.
 
 Decides per-layer backend: "dense", "sparse", or "staticzero".
 
@@ -8,12 +8,12 @@ Design principle:
   does at runtime, not from a hand-crafted cost model with many coefficients.
 
 SparseFlow execution semantics:
-  1. Zero tiles → early return (cost ≈ 0)
-  2. Non-zero tiles → iterate groups, skip inactive groups via bitmask
+  1. Zero tiles 鈫?early return (cost 鈮?0)
+  2. Non-zero tiles 鈫?iterate groups, skip inactive groups via bitmask
 
 Therefore, the fraction of dense work saved by sparse execution is:
 
-    R_l = z_l + (1 - z_l) × (1 - a_l)
+    R_l = z_l + (1 - z_l) 脳 (1 - a_l)
 
   where z_l = TZR (tile-zero ratio) and a_l = AGR_nz (active group ratio
   over non-zero tiles).  Algebraically, R_l = 1 - AGR_overall.
@@ -26,57 +26,73 @@ Per-tile compute intensity (how much dense work each tile represents):
 
 Dispatch score (saved MACs per tile):
 
-    S_l = R_l × I_l
+    S_l = R_l 脳 I_l
 
 Decision:
-  - exact-zero input → staticzero
-  - R_l < R_min → dense  (savings too thin for per-group bitmask overhead)
-  - S_l > τ_k → sparse   (saved MACs per tile exceed prescan/metadata cost)
-  - else → dense
+  - exact-zero input 鈫?staticzero
+  - R_l < R_min 鈫?dense  (savings too thin for per-group bitmask overhead)
+  - S_l > 蟿_k 鈫?sparse   (saved MACs per tile exceed prescan/metadata cost)
+  - else 鈫?dense
 
-Only 3 constants: R_min, τ_3x3, τ_1x1.
-All have direct physical meaning tied to the sparse kernel's execution cost.
+Thresholds are execution-grounded but empirically calibrated:
+R_min, 蟿_3x3, 蟿_1x1, 蟿_linear, 蟿_attn_*.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 # =============================================================================
-# Dispatch constants  (3 total)
+# Dispatch thresholds and guards
 # =============================================================================
 #
-# τ_3x3 (TAU_3x3):
-#   Minimum saved MACs per tile for 3×3 (and larger) kernels.
+# NOTE:
+# These thresholds are semantically grounded in SparseFlow's execution path
+# (tile skip + group skip), but are empirically calibrated rather than strict
+# first-principles hardware costs.
+#
+# 蟿_3x3 (TAU_3x3):
+#   Minimum saved MACs per tile for 3脳3 (and larger) kernels.
 #   Physical meaning: the per-tile cost of prescan + metadata + bitmask
-#   dispatch.  Prescan reads ~C_in × BLOCK_M values per tile and performs
+#   dispatch.  Prescan reads ~C_in 脳 BLOCK_M values per tile and performs
 #   per-group activity classification.  For typical layers (C_in=64-256,
 #   BLOCK_M=16-64), this is ~200K-1M MACs equivalent in memory + compute
 #   overhead.  500K is a mid-range estimate.
 #   Calibrate: profile prescan latency on representative layers, convert to
-#   MACs at GPU peak throughput, and set τ_3x3 to that value.
+#   MACs at GPU peak throughput, and set 蟿_3x3 to that value.
 TAU_3x3 = 500_000
 
-# τ_1x1 (TAU_1x1):
-#   Minimum saved MACs per tile for 1×1 kernels.
-#   Higher than τ_3x3 because cuDNN reduces 1×1 conv to a highly-optimized
+# 蟿_1x1 (TAU_1x1):
+#   Minimum saved MACs per tile for 1脳1 kernels.
+#   Higher than 蟿_3x3 because cuDNN reduces 1脳1 conv to a highly-optimized
 #   GEMM call with near-peak throughput.  The sparse kernel must save
 #   proportionally more to overcome this stronger baseline.
-#   Calibrate: same procedure as τ_3x3 but comparing against cuDNN 1×1 perf.
+#   Calibrate: same procedure as 蟿_3x3 but comparing against cuDNN 1脳1 perf.
 TAU_1x1 = 1_000_000
+
+# Linear thresholds (execution-grounded, empirically calibrated)
+TAU_LINEAR = 800_000
+
+# Attention thresholds (split by family)
+TAU_ATTN_LINEAR = 900_000
+TAU_ATTN_MATMUL = 1_200_000
 
 # R_min (R_MIN):
 #   Minimum saved work fraction for sparse to be viable.
 #   Physical meaning: at very low R_l (high AGR), the sparse kernel iterates
 #   almost all groups with per-group bitmask checks, and the savings from
 #   the few skipped groups are consumed by this overhead.  Below R_min=0.15,
-#   the sparse kernel does ≥85% of the dense kernel's work plus bitmask
-#   overhead — guaranteed slower.
+#   the sparse kernel does 鈮?5% of the dense kernel's work plus bitmask
+#   overhead 鈥?guaranteed slower.
 #   Calibrate: find the AGR at which sparse kernel latency equals dense
 #   kernel latency on a compute-heavy layer; R_min = 1 - that AGR.
 R_MIN = 0.15
+
+# Keep margins explicit for future stability tuning (default no extra margin).
+R_MARGIN = 0.0
+TAU_MARGIN = 0.0
 
 
 # =============================================================================
@@ -148,10 +164,17 @@ def _estimate_block_m(h_out: int, w_out: int) -> int:
 # =============================================================================
 
 @dataclass
-class ConvMeta:
+class OpMeta:
     layer_name: str = ""
+    op_type: str = "unknown"
+    meta_source: str = "measured"
     c_in: int = 0
     c_out: int = 0
+    in_features: int = 0
+    out_features: int = 0
+    num_heads: int = 0
+    seq_len: int = 0
+    head_dim: int = 0
     kernel_size: Tuple[int, int] = (3, 3)
     stride: Tuple[int, int] = (1, 1)
     padding: Tuple[int, int] = (1, 1)
@@ -165,27 +188,39 @@ class ConvMeta:
     macs: float = 0.0
 
 
+# Backward-compatible alias.
+ConvMeta = OpMeta
+
+
 @dataclass
 class DispatchDecision:
     backend: str = "dense"
     reason: str = ""
+    reason_code: str = "init"
+    confidence: float = 1.0
+    meta_source: str = "measured"       # measured | estimated | fallback | shortcut
+    diag_source: str = "measured"       # measured | missing | shortcut
+    support_status: str = "supported"   # supported | unsupported_groups | unsupported_op | exact_zero_shortcut
+    score_family: str = "unknown"       # conv | linear | attn_linear | attn_matmul | none | unknown
+    tile_source: str = "diag"           # diag | meta_geometry | estimated_default | unknown
+    fallback_reason: str = ""           # short fallback/debug code
 
-    # ── Core dispatch score fields (v28) ──
+    # 鈹€鈹€ Core dispatch score fields (v28) 鈹€鈹€
     R_l: float = 0.0           # saved work fraction: TZR + (1-TZR)(1-AGR_nz)
     I_l: float = 0.0           # per-tile intensity: MACs / N_tiles
-    S_l: float = 0.0           # dispatch score: R_l × I_l (saved MACs per tile)
+    S_l: float = 0.0           # dispatch score: R_l 脳 I_l (saved MACs per tile)
     agr_nz: float = 0.0        # AGR over non-zero tiles: AGR / (1 - TZR)
     n_tiles: float = 0.0       # total tile count (measured or estimated)
     tau: float = 0.0           # threshold used for this layer's kernel family
 
-    # ── Backward-compatible fields ──
-    score_sparse: float = 0.0  # S_l / tau (normalized: >1 → sparse)
+    # 鈹€鈹€ Backward-compatible fields 鈹€鈹€
+    score_sparse: float = 0.0  # S_l / tau (normalized: >1 鈫?sparse)
 
     effective_benefit: float = 0.0   # alias for R_l
     total_overhead: float = 0.0      # tau / I_l (overhead as fraction of work)
     net_benefit: float = 0.0         # R_l - tau/I_l
 
-    # ── Input measurements ──
+    # 鈹€鈹€ Input measurements 鈹€鈹€
     agr: float = -1.0          # overall AGR (active_group_ratio from kernel)
     tzr: float = -1.0          # tile zero ratio
     macs: float = 0.0
@@ -194,7 +229,7 @@ class DispatchDecision:
     active_groups: float = 0.0
     total_groups: float = 0.0
 
-    # ── Derived features for backward compat with bench reports ──
+    # 鈹€鈹€ Derived features for backward compat with bench reports 鈹€鈹€
     efficiency: float = 0.0
     nz_fraction: float = 0.0
     denseish_among_nz: float = 0.0
@@ -253,6 +288,8 @@ def conv_meta_from_module(conv_module, sample_x_shape: Optional[Tuple] = None,
 
     return ConvMeta(
         layer_name=layer_name,
+        op_type="conv",
+        meta_source="measured",
         c_in=c_in, c_out=c_out,
         kernel_size=ks, stride=st, padding=pad, dilation=dil,
         groups=groups,
@@ -263,24 +300,77 @@ def conv_meta_from_module(conv_module, sample_x_shape: Optional[Tuple] = None,
     )
 
 
+def op_meta_from_module(conv_module, sample_x_shape: Optional[Tuple] = None,
+                        layer_name: str = "") -> OpMeta:
+    """Generalized metadata entry-point.
+
+    Backward compatible wrapper around the historical conv-oriented helper.
+    """
+    return conv_meta_from_module(conv_module, sample_x_shape=sample_x_shape, layer_name=layer_name)
+
+
 def _target_get(target: Any, key: str, default=None):
     if isinstance(target, dict):
         return target.get(key, default)
     return getattr(target, key, default)
 
 
-def _infer_batch_from_shape(input_shape: Optional[Tuple]) -> int:
-    if input_shape is None:
+def _shape_tuple(input_shape: Optional[Tuple]) -> Tuple[int, ...]:
+    if input_shape is None or isinstance(input_shape, str):
+        return ()
+    try:
+        return tuple(int(v) for v in tuple(input_shape))
+    except Exception:
+        return ()
+
+
+def _prod(values) -> int:
+    vals = [int(v) for v in values]
+    if not vals:
         return 0
-    shape = tuple(input_shape) if not isinstance(input_shape, str) else ()
+    out = 1
+    for v in vals:
+        out *= v
+    return int(out)
+
+
+def _infer_conv_batch_from_shape(input_shape: Optional[Tuple]) -> int:
+    shape = _shape_tuple(input_shape)
     if len(shape) >= 5:
-        return int(shape[0]) * int(shape[1])
+        # [T, B, C, H, W] or similar: treat all leading dims before C/H/W as batch.
+        return max(_prod(shape[:-3]), 0)
     if len(shape) == 4:
-        # Transformer blocks often use [T, B, N, C].
-        return int(shape[0]) * int(shape[1])
-    if len(shape) >= 1:
-        return int(shape[0])
+        # [B, C, H, W]
+        return max(int(shape[0]), 0)
+    if len(shape) == 3:
+        # [B, C, L] for conv1d-like tensors.
+        return max(int(shape[0]), 0)
     return 0
+
+
+def _infer_linear_rows_from_shape(input_shape: Optional[Tuple]) -> int:
+    shape = _shape_tuple(input_shape)
+    if len(shape) >= 2:
+        # nn.Linear applies over last dim; all leading dims are batch rows.
+        return max(_prod(shape[:-1]), 0)
+    if len(shape) == 1:
+        return max(int(shape[0]), 0)
+    return 0
+
+
+def _infer_attention_batch_from_shape(input_shape: Optional[Tuple]) -> int:
+    shape = _shape_tuple(input_shape)
+    if len(shape) >= 3:
+        # Attention uses [..., N, C], so leading dims are batch-like.
+        return max(_prod(shape[:-2]), 0)
+    if len(shape) == 2:
+        return max(int(shape[0]), 0)
+    return 0
+
+
+def _infer_batch_from_shape(input_shape: Optional[Tuple]) -> int:
+    # Backward-compatible alias.
+    return _infer_linear_rows_from_shape(input_shape)
 
 
 def _is_attention_like_module(module: Any) -> bool:
@@ -299,9 +389,9 @@ def _attention_meta_from_target(
     input_shape: Optional[Tuple],
     op_type: str,
 ) -> ConvMeta:
-    shape = tuple(input_shape) if (input_shape is not None and not isinstance(input_shape, str)) else ()
+    shape = _shape_tuple(input_shape)
     seq_len = int(shape[-2]) if len(shape) >= 2 else int(_target_get(target, "input_h", 0))
-    batch_size = _infer_batch_from_shape(input_shape)
+    batch_size = _infer_attention_batch_from_shape(input_shape)
 
     dim = int(_target_get(target, "input_w", 0))
     num_heads = int(_target_get(target, "num_heads", 1))
@@ -323,20 +413,32 @@ def _attention_meta_from_target(
         head_dim = max(dim // num_heads, 1)
     seq_len = max(int(seq_len), 1)
 
+    score_op_type = "attention_matmul"
     if op_type == "attention_qkav":
         macs = float(batch_size * num_heads * 2 * seq_len * seq_len * head_dim)
     elif op_type == "attention_linear":
+        score_op_type = "attention_proj_linear"
         macs = float(batch_size * num_heads * 2 * seq_len * head_dim * head_dim)
     elif op_type == "attention_qkmix":
+        score_op_type = "attention_proj_linear"
         macs = float(batch_size * num_heads * 4 * seq_len * head_dim * head_dim)
     else:
         # Conservative fallback for unknown attention variants.
+        score_op_type = "attention_matmul"
         macs = float(batch_size * dim * dim)
 
+    meta_source = "measured" if batch_size > 0 and seq_len > 0 and dim > 0 else "estimated"
     return ConvMeta(
         layer_name=layer_name,
+        op_type=score_op_type,
+        meta_source=meta_source,
         c_in=dim,
         c_out=dim,
+        in_features=dim,
+        out_features=dim,
+        num_heads=num_heads,
+        seq_len=seq_len,
+        head_dim=head_dim,
         kernel_size=(1, 1),
         stride=(1, 1),
         padding=(0, 0),
@@ -351,104 +453,172 @@ def _attention_meta_from_target(
     )
 
 
-def conv_meta_from_target(target: Any) -> ConvMeta:
-    conv_module = _target_get(target, "module")
-    if conv_module is None:
-        conv_module = _target_get(target, "conv_module")
-    layer_name = _target_get(target, "name", "")
-    if not layer_name:
-        layer_name = _target_get(target, "conv_name", "")
-    input_shape = _target_get(target, "input_shape")
-    op_type = _target_get(target, "op_type", "")
-    attention_ops = {"attention_qkav", "attention_linear", "attention_qkmix"}
+def _target_layer_name(target: Any) -> str:
+    name = _target_get(target, "name", "")
+    if not name:
+        name = _target_get(target, "conv_name", "")
+    return str(name)
 
-    if conv_module is not None:
-        # Linear target from Core ReplacementTarget / dict target
-        if hasattr(conv_module, "in_features") and hasattr(conv_module, "out_features"):
-            c_in = int(conv_module.in_features)
-            c_out = int(conv_module.out_features)
-            batch_size = _infer_batch_from_shape(input_shape)
-            macs = float(batch_size * c_in * c_out) if batch_size > 0 else 0.0
-            return ConvMeta(
-                layer_name=layer_name,
-                c_in=c_in,
-                c_out=c_out,
-                kernel_size=(1, 1),
-                stride=(1, 1),
-                padding=(0, 0),
-                dilation=(1, 1),
-                groups=1,
-                h_in=1,
-                w_in=1,
-                h_out=1,
-                w_out=1,
-                batch_size=batch_size,
-                macs=macs,
-            )
-        if op_type in attention_ops or _is_attention_like_module(conv_module):
-            return _attention_meta_from_target(target, conv_module, layer_name, input_shape, op_type)
-        return conv_meta_from_module(conv_module, input_shape, layer_name)
 
-    # Dict target (legacy bench path) or attribute-only Core target fallback.
-    if op_type in attention_ops:
-        return _attention_meta_from_target(target, None, layer_name, input_shape, op_type)
-
-    if op_type == "linear":
+def _linear_meta_from_target(
+    target: Any,
+    linear_module: Optional[Any],
+    layer_name: str,
+    input_shape: Optional[Tuple],
+) -> ConvMeta:
+    if linear_module is not None:
+        c_in = int(getattr(linear_module, "in_features", 0))
+        c_out = int(getattr(linear_module, "out_features", 0))
+    else:
         c_in = int(_target_get(target, "in_features", _target_get(target, "cin", _target_get(target, "c_in", 0))))
         c_out = int(_target_get(target, "out_features", _target_get(target, "cout", _target_get(target, "c_out", 0))))
-        batch_size = _infer_batch_from_shape(input_shape)
-        macs = float(batch_size * c_in * c_out) if batch_size > 0 else 0.0
-        return ConvMeta(
-            layer_name=layer_name,
-            c_in=c_in,
-            c_out=c_out,
-            kernel_size=(1, 1),
-            stride=(1, 1),
-            padding=(0, 0),
-            dilation=(1, 1),
-            groups=1,
-            h_in=1,
-            w_in=1,
-            h_out=1,
-            w_out=1,
-            batch_size=batch_size,
-            macs=macs,
-        )
 
-    ks = _pair(_target_get(target, "kernel_size", (3, 3)))
-    st = _pair(_target_get(target, "stride", (1, 1)))
-    pad = _pair(_target_get(target, "padding", (1, 1)))
-    dil = _pair(_target_get(target, "dilation", (1, 1)))
-    groups = int(_target_get(target, "groups", 1))
-    c_in = int(_target_get(target, "cin", _target_get(target, "c_in", 0)))
-    c_out = int(_target_get(target, "cout", _target_get(target, "c_out", 0)))
+    batch_size = _infer_linear_rows_from_shape(input_shape)
+    meta_source = "measured" if batch_size > 0 else "estimated"
+    if batch_size <= 0:
+        batch_size = int(_target_get(target, "batch_size", 0))
+    if batch_size <= 0:
+        batch_size = 1
+        meta_source = "fallback"
 
-    h_in, w_in, batch_size = 0, 0, 1
-    if input_shape is not None:
-        shape = tuple(input_shape) if not isinstance(input_shape, str) else ()
-        if len(shape) == 5:
-            batch_size = shape[0] * shape[1]
-            h_in, w_in = shape[3], shape[4]
-        elif len(shape) == 4:
-            batch_size = shape[0]
-            h_in, w_in = shape[2], shape[3]
-        elif len(shape) == 3:
-            batch_size = shape[0]
-            h_in, w_in = shape[2], 1
-
-    h_out, w_out = infer_conv_output_hw(h_in, w_in, ks, st, pad, dil)
-    macs = estimate_conv_macs(batch_size, h_out, w_out, c_out, c_in, ks, groups)
-
+    macs = float(batch_size * c_in * c_out) if c_in > 0 and c_out > 0 else 0.0
     return ConvMeta(
         layer_name=layer_name,
-        c_in=c_in, c_out=c_out,
-        kernel_size=ks, stride=st, padding=pad, dilation=dil,
-        groups=groups,
-        h_in=h_in, w_in=w_in,
-        h_out=h_out, w_out=w_out,
+        op_type="linear",
+        meta_source=meta_source,
+        c_in=c_in,
+        c_out=c_out,
+        in_features=c_in,
+        out_features=c_out,
+        kernel_size=(1, 1),
+        stride=(1, 1),
+        padding=(0, 0),
+        dilation=(1, 1),
+        groups=1,
+        h_in=1,
+        w_in=1,
+        h_out=1,
+        w_out=1,
         batch_size=batch_size,
         macs=macs,
     )
+
+
+def _conv_meta_from_target(
+    target: Any,
+    conv_module: Optional[Any],
+    layer_name: str,
+    input_shape: Optional[Tuple],
+) -> ConvMeta:
+    op_hint = str(_target_get(target, "op_type", "conv"))
+    if conv_module is not None:
+        meta = conv_meta_from_module(conv_module, input_shape, layer_name)
+        h_in, w_in = meta.h_in, meta.w_in
+        batch_size = int(meta.batch_size)
+        c_in, c_out = meta.c_in, meta.c_out
+        ks, st, pad, dil, groups = meta.kernel_size, meta.stride, meta.padding, meta.dilation, meta.groups
+        meta_source = "measured"
+    else:
+        ks = _pair(_target_get(target, "kernel_size", (3, 3)))
+        st = _pair(_target_get(target, "stride", (1, 1)))
+        pad = _pair(_target_get(target, "padding", (1, 1)))
+        dil = _pair(_target_get(target, "dilation", (1, 1)))
+        groups = int(_target_get(target, "groups", 1))
+        c_in = int(_target_get(target, "cin", _target_get(target, "c_in", 0)))
+        c_out = int(_target_get(target, "cout", _target_get(target, "c_out", 0)))
+        h_in, w_in = 0, 0
+        batch_size = 0
+        meta_source = "fallback"
+
+    if h_in <= 0 or w_in <= 0:
+        h_t = int(_target_get(target, "input_h", 0))
+        w_t = int(_target_get(target, "input_w", 0))
+        if h_t > 0 and w_t > 0:
+            h_in, w_in = h_t, w_t
+            if meta_source == "measured":
+                meta_source = "estimated"
+
+    if batch_size <= 0:
+        batch_size = _infer_conv_batch_from_shape(input_shape)
+        if batch_size > 0 and meta_source == "fallback":
+            meta_source = "estimated"
+    if batch_size <= 0:
+        batch_size = int(_target_get(target, "batch_size", 0))
+        if batch_size > 0 and meta_source == "fallback":
+            meta_source = "estimated"
+    if batch_size <= 0:
+        batch_size = 1
+        meta_source = "fallback"
+
+    h_out, w_out = infer_conv_output_hw(h_in, w_in, ks, st, pad, dil)
+    macs = 0.0
+    if c_in > 0 and c_out > 0 and h_out > 0 and w_out > 0:
+        macs = estimate_conv_macs(batch_size, h_out, w_out, c_out, c_in, ks, groups)
+
+    if op_hint.startswith("conv") or op_hint.startswith("fused_conv") or op_hint == "depthwise_conv2d":
+        op_type = "conv"
+    else:
+        op_type = "conv"
+
+    return ConvMeta(
+        layer_name=layer_name,
+        op_type=op_type,
+        meta_source=meta_source,
+        c_in=c_in,
+        c_out=c_out,
+        kernel_size=ks,
+        stride=st,
+        padding=pad,
+        dilation=dil,
+        groups=groups,
+        h_in=h_in,
+        w_in=w_in,
+        h_out=h_out,
+        w_out=w_out,
+        batch_size=batch_size,
+        macs=macs,
+    )
+
+
+def _fallback_meta_from_target(target: Any, layer_name: str, input_shape: Optional[Tuple]) -> ConvMeta:
+    # Conservative fallback keeps dispatch in dense path unless diagnostics are strongly favorable.
+    return _conv_meta_from_target(target, None, layer_name, input_shape)
+
+
+def op_meta_from_target(target: Any) -> ConvMeta:
+    conv_module = _target_get(target, "module")
+    if conv_module is None:
+        conv_module = _target_get(target, "conv_module")
+    layer_name = _target_layer_name(target)
+    input_shape = _target_get(target, "input_shape")
+    op_type = str(_target_get(target, "op_type", ""))
+    attention_ops = {"attention_qkav", "attention_linear", "attention_qkmix"}
+
+    if conv_module is not None:
+        if hasattr(conv_module, "in_features") and hasattr(conv_module, "out_features"):
+            return _linear_meta_from_target(target, conv_module, layer_name, input_shape)
+        if op_type in attention_ops or _is_attention_like_module(conv_module):
+            return _attention_meta_from_target(target, conv_module, layer_name, input_shape, op_type)
+        if hasattr(conv_module, "kernel_size"):
+            return _conv_meta_from_target(target, conv_module, layer_name, input_shape)
+
+    if op_type in attention_ops:
+        return _attention_meta_from_target(target, None, layer_name, input_shape, op_type)
+    if op_type == "linear":
+        return _linear_meta_from_target(target, None, layer_name, input_shape)
+    if op_type.startswith("conv") or op_type.startswith("fused_conv") or op_type == "depthwise_conv2d":
+        return _conv_meta_from_target(target, None, layer_name, input_shape)
+    return _fallback_meta_from_target(target, layer_name, input_shape)
+
+
+# Backward-compatible name.
+def conv_meta_from_target(target: Any) -> ConvMeta:
+    return op_meta_from_target(target)
+
+
+# Backward-compatible aliases while migrating naming to OpMeta/op_meta_*.
+conv_meta_from_module_legacy = conv_meta_from_module
+conv_meta_from_target_legacy = conv_meta_from_target
 
 
 # =============================================================================
@@ -494,7 +664,7 @@ def _map_diag_tile_mix(diag: Dict[str, Any]) -> Tuple[float, float]:
     return denseish_ratio, sparse_tile_ratio
 
 
-def _get_n_tiles(diag: Dict[str, Any], meta: ConvMeta) -> float:
+def _get_n_tiles(diag: Dict[str, Any], meta: ConvMeta) -> Tuple[float, str]:
     """Get total tile count from diagnostics, or estimate from geometry.
 
     Prefers the measured value from kernel diagnostics (total_tile_count).
@@ -503,20 +673,45 @@ def _get_n_tiles(diag: Dict[str, Any], meta: ConvMeta) -> float:
     """
     n = diag.get('total_tile_count', -1.0)
     if n > 0:
-        return float(n)
+        return float(n), "diag"
 
     # Geometric estimate
     h_out, w_out = meta.h_out, meta.w_out
     if h_out <= 0 or w_out <= 0:
-        # No spatial info — return 1 to make I_l = MACs (conservative: high
+        # No spatial info 鈥?return 1 to make I_l = MACs (conservative: high
         # per-tile intensity makes sparse easier to justify, but R_min and
         # the S_l threshold still guard against bad decisions)
-        return 1.0
+        return 1.0, "estimated_default"
 
     block_m = _estimate_block_m(h_out, w_out)
     pixels = h_out * w_out
     n_spatial = max((pixels + block_m - 1) // block_m, 1)
-    return float(meta.batch_size * n_spatial)
+    batch = int(meta.batch_size) if int(meta.batch_size) > 0 else 1
+    return float(batch * n_spatial), "meta_geometry"
+
+
+def _select_tau(meta: ConvMeta, diag: Dict[str, Any]) -> Tuple[float, str]:
+    op_type = str(getattr(meta, "op_type", "unknown")).lower()
+    kernel_type = str(diag.get("kernel_type", "")).lower()
+    if op_type == "linear":
+        return TAU_LINEAR, "linear"
+    if op_type == "attention_proj_linear":
+        return TAU_ATTN_LINEAR, "attn_linear"
+    if op_type == "attention_matmul":
+        return TAU_ATTN_MATMUL, "attn_matmul"
+    if "attention" in kernel_type and "linear" in kernel_type:
+        return TAU_ATTN_LINEAR, "attn_linear"
+    if "attention" in kernel_type:
+        return TAU_ATTN_MATMUL, "attn_matmul"
+    if kernel_type == "linear":
+        return TAU_LINEAR, "linear"
+
+    # Fallback by kernel footprint.
+    ks = meta.kernel_size
+    groups = meta.groups
+    if ks == (1, 1) and groups == 1:
+        return TAU_1x1, "conv"
+    return TAU_3x3, "conv"
 
 
 # =============================================================================
@@ -524,22 +719,13 @@ def _get_n_tiles(diag: Dict[str, Any], meta: ConvMeta) -> float:
 # =============================================================================
 
 def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDecision:
-    """Execution-Grounded Dispatch for a single non-exact-zero layer.
-
-    Computes:
-        R_l = z + (1 - z)(1 - a)     saved work fraction
-        I_l = MACs / N_tiles          per-tile intensity
-        S_l = R_l × I_l              saved MACs per tile (dispatch score)
-
-    Decision:
-        R_l < R_min → dense   (savings consumed by per-group overhead)
-        S_l > τ_k   → sparse  (saved MACs exceed per-tile dispatch cost)
-        else        → dense
-    """
+    """Execution-grounded dispatch for a single non-exact-zero layer."""
     agr, tzr, active_groups, total_groups = _map_diag_to_agr_tzr(diag)
     denseish_ratio, sparse_tile_ratio = _map_diag_tile_mix(diag)
     macs = meta.macs
     groups = meta.groups
+    meta_source = str(getattr(meta, "meta_source", "measured"))
+    op_type = str(getattr(meta, "op_type", "unknown"))
 
     dec = DispatchDecision(
         layer_name=meta.layer_name,
@@ -551,63 +737,96 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
         denseish_ratio=denseish_ratio,
         sparse_tile_ratio=sparse_tile_ratio,
         groups=groups,
+        meta_source=meta_source,
+        diag_source="measured",
+        support_status="supported",
+        score_family="unknown",
+        tile_source="diag",
     )
-
-    # ── Structural guard ──
 
     if groups != 1:
         dec.backend = "dense"
-        dec.reason = "groups!=1_unsupported"
+        dec.support_status = "unsupported_groups"
+        dec.reason_code = "unsupported_groups"
+        dec.reason = "unsupported_groups!=1"
+        dec.fallback_reason = dec.reason_code
+        dec.confidence = 1.0
+        return dec
+
+    if op_type == "unknown":
+        dec.backend = "dense"
+        dec.support_status = "unsupported_op"
+        dec.reason_code = "unsupported_op"
+        dec.reason = "unsupported_op_fallback_dense"
+        dec.fallback_reason = dec.reason_code
+        dec.confidence = 0.7
         return dec
 
     if agr < 0 or tzr < 0:
         dec.backend = "dense"
-        dec.reason = "no_diag_fallback_dense"
+        dec.diag_source = "missing"
+        dec.reason_code = "missing_diag"
+        dec.reason = "missing_diag_fallback_dense"
+        dec.fallback_reason = dec.reason_code
+        dec.confidence = 0.2
         return dec
 
-    # ── Compute dispatch score ──
-
-    # Saved work fraction R_l, derived from execution semantics:
-    #   z tiles → fully skipped
-    #   (1-z) tiles → skip (1-a) fraction of groups
-    # where a = AGR_nz = average active group ratio over non-zero tiles
     nz_frac = max(1.0 - tzr, _EPS)
     agr_nz = min(agr / nz_frac, 1.0)
-    R_l = tzr + nz_frac * (1.0 - agr_nz)
-    # Note: algebraically R_l = 1 - agr, but the expanded form shows the
-    # direct mapping to SparseFlow's two-level skip (tile + group).
+    R_l_exec = tzr + nz_frac * (1.0 - agr_nz)
+    R_l_simple = 1.0 - agr
+    R_l = R_l_exec
+    r_mismatch = abs(R_l_exec - R_l_simple)
 
-    # Per-tile compute intensity
-    n_tiles = _get_n_tiles(diag, meta)
+    n_tiles, tile_source = _get_n_tiles(diag, meta)
+    dec.tile_source = tile_source
 
-    # For linear targets in Core-all-ops flow, input_shape can be unavailable,
-    # which makes meta.macs = 0. Recover MACs using measured tile geometry.
-    is_linear_diag = str(diag.get("kernel_type", "")).lower() == "linear"
+    kernel_type = str(diag.get("kernel_type", "")).lower()
+    is_linear_diag = kernel_type == "linear"
     is_linear_meta = (
         meta.kernel_size == (1, 1)
         and meta.h_out <= 1
         and meta.w_out <= 1
         and meta.groups == 1
     )
+    macs_estimated = False
     if macs <= 0 and is_linear_diag and is_linear_meta and meta.c_in > 0 and meta.c_out > 0:
         block_m = float(diag.get("block_m", -1))
         if block_m <= 0:
             block_m = 32.0
         n_rows_est = max(n_tiles * block_m, 1.0)
         macs = float(n_rows_est * meta.c_in * meta.c_out)
-        dec.macs = macs
+        macs_estimated = True
+    elif macs <= 0 and meta.c_in > 0 and meta.c_out > 0 and meta.h_out > 0 and meta.w_out > 0:
+        block_m = float(diag.get("block_m", -1))
+        if block_m <= 0:
+            block_m = float(_estimate_block_m(meta.h_out, meta.w_out))
+        n_spatial = max(math.ceil((meta.h_out * meta.w_out) / max(block_m, 1.0)), 1.0)
+        batch_est = max(n_tiles / n_spatial, 1.0)
+        kh, kw = meta.kernel_size
+        cin_per_group = meta.c_in / max(meta.groups, 1)
+        macs = float(batch_est * meta.h_out * meta.w_out * meta.c_out * kh * kw * cin_per_group)
+        macs_estimated = True
+
+    if macs_estimated:
+        dec.meta_source = "estimated" if dec.meta_source == "measured" else dec.meta_source
+    dec.macs = macs
+
+    if macs <= 0:
+        dec.backend = "dense"
+        dec.reason_code = "missing_meta"
+        dec.reason = "missing_meta_fallback_dense"
+        dec.fallback_reason = dec.reason_code
+        dec.confidence = 0.2
+        dec.meta_source = "fallback" if dec.meta_source == "measured" else dec.meta_source
+        return dec
 
     I_l = macs / max(n_tiles, 1.0)
-
-    # Dispatch score: saved MACs per tile
     S_l = R_l * I_l
-
-    # Kernel-family threshold
-    ks = meta.kernel_size
-    is_1x1 = (ks == (1, 1) and groups == 1)
-    tau = TAU_1x1 if is_1x1 else TAU_3x3
-
-    # ── Record fields ──
+    tau, tau_family = _select_tau(meta, diag)
+    tau_gate = tau * (1.0 + TAU_MARGIN)
+    r_gate = R_MIN + R_MARGIN
+    dec.score_family = tau_family
 
     dec.R_l = R_l
     dec.I_l = I_l
@@ -616,21 +835,16 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
     dec.n_tiles = n_tiles
     dec.nz_fraction = nz_frac
     dec.tau = tau
-
-    # Normalized score: >1 means sparse, ≤1 means dense (when R_l ≥ R_min)
     dec.score_sparse = S_l / tau if tau > 0 else 0.0
 
-    # Backward-compatible benefit/overhead view:
-    # "benefit" = R_l, "overhead" = tau/I_l (threshold as fraction of work)
     dec.effective_benefit = R_l
     if I_l > 0:
         dec.total_overhead = tau / I_l
         dec.net_benefit = R_l - tau / I_l
     else:
-        dec.total_overhead = float('inf')
+        dec.total_overhead = float("inf")
         dec.net_benefit = -1.0
 
-    # Legacy compat fields
     dec.x_inactive = 1.0 - agr
     dec.x_tzr = tzr
     dec.x_inter = (1.0 - agr) * tzr
@@ -640,22 +854,42 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
     )
     dec.x_small = 1.0 - dec.x_log_macs
     dec.x_denseish = clamp01(denseish_ratio if denseish_ratio >= 0 else 0.0)
-    dec.efficiency = R_l  # legacy: closest concept to "efficiency"
+    dec.efficiency = R_l
 
-    # ── Decision ──
+    reason_suffix = ""
+    if macs_estimated:
+        reason_suffix += "|macs_estimated"
+    if r_mismatch > 1e-4:
+        reason_suffix += "|R_mismatch_check"
 
-    if R_l < R_MIN:
+    if R_l < r_gate:
         dec.backend = "dense"
-        dec.reason = f"R={R_l:.3f}<R_min={R_MIN}"
-    elif S_l > tau:
+        dec.reason_code = "R_guard"
+        dec.reason = f"R={R_l:.3f}<R_min={r_gate:.3f}{reason_suffix}"
+        dec.fallback_reason = dec.reason_code
+    elif S_l > tau_gate:
         dec.backend = "sparse"
-        dec.reason = f"S={S_l:.0f}>tau={tau:.0f}"
+        dec.reason_code = "score_pass"
+        dec.reason = f"S={S_l:.0f}>tau={tau_gate:.0f}{reason_suffix}"
+        dec.fallback_reason = ""
     else:
         dec.backend = "dense"
-        dec.reason = f"S={S_l:.0f}<=tau={tau:.0f}"
+        dec.reason_code = "score_fail"
+        dec.reason = f"S={S_l:.0f}<=tau={tau_gate:.0f}{reason_suffix}"
+        dec.fallback_reason = dec.reason_code
+
+    confidence = 1.0
+    if dec.diag_source != "measured":
+        confidence *= 0.5
+    if dec.meta_source != "measured":
+        confidence *= 0.75
+    if dec.tile_source != "diag":
+        confidence *= 0.9
+    if r_mismatch > 1e-4:
+        confidence *= 0.8
+    dec.confidence = clamp01(confidence)
 
     return dec
-
 
 # =============================================================================
 # StaticZero decision helper
@@ -665,12 +899,20 @@ def _make_staticzero_decision(layer_name: str) -> DispatchDecision:
     """DispatchDecision for an exact-zero-input layer.
 
     StaticZero is the extreme of the dispatch surface:
-      R_l = 1.0 (all work saved), S_l → ∞ for any finite I_l.
+      R_l = 1.0 (all work saved), S_l 鈫?鈭?for any finite I_l.
     """
     return DispatchDecision(
         layer_name=layer_name,
         backend="staticzero",
-        reason="exact_zero_input",
+        reason="exact_zero_input_shortcut",
+        reason_code="exact_zero",
+        fallback_reason="exact_zero_shortcut",
+        meta_source="shortcut",
+        diag_source="shortcut",
+        support_status="exact_zero_shortcut",
+        score_family="none",
+        tile_source="shortcut",
+        confidence=1.0,
         agr=0.0,
         tzr=1.0,
         R_l=1.0,
@@ -692,28 +934,27 @@ def dispatch_all_layers(
     group_sparsity_data: Dict[str, Dict],
     zero_layers=None,
     prior_decisions: Optional[Dict[str, DispatchDecision]] = None,
-) -> Dict[str, DispatchDecision]:
+    return_summary: bool = False,
+) -> Union[Dict[str, DispatchDecision], Tuple[Dict[str, DispatchDecision], Dict[str, int]]]:
     """Run dispatch for all target layers.
 
     Args:
         targets: list of target dicts from analyze_targets().
         group_sparsity_data: per-layer diagnostic dict from measure_group_sparsity().
-        zero_layers: set of layer names with exact-zero input (→ staticzero).
+        zero_layers: set of layer names with exact-zero input (鈫?staticzero).
         prior_decisions: accepted for interface compatibility (unused in v28;
             the simplified score model is deterministic and does not require
             hysteresis for stability).
 
     Returns:
-        Dict mapping layer_name → DispatchDecision.
+        Dict mapping layer_name 鈫?DispatchDecision.
     """
     if zero_layers is None:
         zero_layers = set()
 
     decisions: Dict[str, DispatchDecision] = {}
     for t in targets:
-        name = _target_get(t, "name", "")
-        if not name:
-            name = _target_get(t, "conv_name", "")
+        name = _target_layer_name(t)
         if not name:
             continue
 
@@ -722,10 +963,38 @@ def dispatch_all_layers(
             continue
 
         diag = group_sparsity_data.get(name, {})
-        meta = conv_meta_from_target(t)
+        meta = op_meta_from_target(t)
         decisions[name] = make_dispatch_decision(diag, meta)
 
+    if return_summary:
+        return decisions, summarize_decisions(decisions)
     return decisions
+
+
+def summarize_decisions(decisions: Dict[str, DispatchDecision]) -> Dict[str, int]:
+    summary = {
+        "n_sparse": 0,
+        "n_dense": 0,
+        "n_staticzero": 0,
+        "n_unsupported": 0,
+        "n_missing_diag": 0,
+        "n_estimated_meta": 0,
+    }
+    for dec in decisions.values():
+        if dec.backend == "sparse":
+            summary["n_sparse"] += 1
+        elif dec.backend == "staticzero":
+            summary["n_staticzero"] += 1
+        else:
+            summary["n_dense"] += 1
+
+        if str(dec.support_status).startswith("unsupported"):
+            summary["n_unsupported"] += 1
+        if dec.diag_source == "missing":
+            summary["n_missing_diag"] += 1
+        if dec.meta_source != "measured":
+            summary["n_estimated_meta"] += 1
+    return summary
 
 
 def decisions_to_sets(decisions: Dict[str, DispatchDecision]):
@@ -740,6 +1009,14 @@ def decisions_to_sets(decisions: Dict[str, DispatchDecision]):
     return static_zero_set, sparse_set
 
 
+def decisions_to_backend_sets(decisions: Dict[str, DispatchDecision]) -> Dict[str, set]:
+    out = {"staticzero": set(), "sparse": set(), "dense": set()}
+    for name, dec in decisions.items():
+        backend = dec.backend if dec.backend in out else "dense"
+        out[backend].add(name)
+    return out
+
+
 # =============================================================================
 # Reporting
 # =============================================================================
@@ -748,8 +1025,8 @@ def format_egd_report_header() -> str:
     """Column header for the EGD dispatch report."""
     return (
         f"  {'Layer':<40} {'AGR':>6} {'TZR':>6} {'AGR_nz':>7} "
-        f"{'R_l':>6} {'I_l':>10} {'S_l':>10} {'τ':>10} {'S/τ':>6} "
-        f"{'Dec':>8} {'Reason':>24}"
+        f"{'R_l':>6} {'I_l':>10} {'S_l':>10} {'蟿':>10} {'S/蟿':>6} "
+        f"{'Dec':>8} {'RC':>14} {'Src':>12}"
     )
 
 
@@ -765,13 +1042,14 @@ def format_egd_report_row(dec: DispatchDecision) -> str:
     sl_s = f"{dec.S_l:.0f}" if dec.S_l > 0 else "0"
     tau_s = f"{dec.tau:.0f}" if dec.tau > 0 else "n/a"
     ratio_s = f"{dec.score_sparse:.2f}" if dec.score_sparse < 1e6 else "inf"
-    reason = dec.reason
-    if len(reason) > 24:
-        reason = reason[:21] + "..."
+    rc = dec.reason_code or "n/a"
+    if len(rc) > 14:
+        rc = rc[:11] + "..."
+    src = f"{dec.meta_source[:1]}/{dec.diag_source[:1]}/{dec.tile_source[:1]}"
     return (
         f"  {short:<40} {agr_s:>6} {tzr_s:>6} {agrnz_s:>7} "
         f"{rl_s:>6} {il_s:>10} {sl_s:>10} {tau_s:>10} {ratio_s:>6} "
-        f"{dec.backend:>8} {reason:>24}"
+        f"{dec.backend:>8} {rc:>14} {src:>12}"
     )
 
 
@@ -781,18 +1059,24 @@ def print_dispatch_decision_report(targets, group_sparsity_data, dispatch_decisi
     Named to match the existing bench_4test.py call site.
     """
     print(f"\n  Execution-Grounded Dispatch Report (EGD v28)")
-    print(f"  Constants: τ_3x3={TAU_3x3:,}  τ_1x1={TAU_1x1:,}  R_min={R_MIN}")
-    print(f"  Score: S_l = R_l × I_l  (saved MACs per tile)")
+    print(
+        f"  Constants: 蟿_3x3={TAU_3x3:,} 蟿_1x1={TAU_1x1:,} "
+        f"蟿_linear={TAU_LINEAR:,} 蟿_attn_lin={TAU_ATTN_LINEAR:,} "
+        f"蟿_attn_mm={TAU_ATTN_MATMUL:,} R_min={R_MIN}"
+    )
+    print(f"  Score: S_l = R_l 脳 I_l  (saved MACs per tile)")
     print(format_egd_report_header())
     print(f"  {'-'*150}")
 
     n_sparse = 0
     n_dense = 0
     n_staticzero = 0
+    n_dense_score = 0
+    n_dense_unsupported = 0
+    n_dense_missing_diag = 0
+    n_estimated_meta = 0
     for t in targets:
-        name = _target_get(t, "name", "")
-        if not name:
-            name = _target_get(t, "conv_name", "")
+        name = _target_layer_name(t)
         if not name:
             continue
         dec = dispatch_decisions.get(name)
@@ -805,11 +1089,25 @@ def print_dispatch_decision_report(targets, group_sparsity_data, dispatch_decisi
             n_staticzero += 1
         else:
             n_dense += 1
+            if str(dec.support_status).startswith("unsupported"):
+                n_dense_unsupported += 1
+            elif dec.diag_source == "missing":
+                n_dense_missing_diag += 1
+            else:
+                n_dense_score += 1
+        if dec.meta_source != "measured":
+            n_estimated_meta += 1
 
     total = n_sparse + n_dense + n_staticzero
-    print(f"\n  Summary: {n_sparse} sparse + {n_dense} dense + {n_staticzero} staticzero "
-          f"= {total} layers")
+    print(
+        f"\n  Summary: sparse={n_sparse} dense={n_dense} staticzero={n_staticzero} total={total}"
+    )
+    print(
+        f"           dense(score)={n_dense_score} dense(unsupported)={n_dense_unsupported} "
+        f"dense(missing_diag)={n_dense_missing_diag} estimated_meta={n_estimated_meta}"
+    )
 
 
-# Alias for v26/v27 compatibility — bench code may call either name
+# Alias for v26/v27 compatibility 鈥?bench code may call either name
 print_cbd_dispatch_report = print_dispatch_decision_report
+

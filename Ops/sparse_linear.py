@@ -120,6 +120,14 @@ class SparseLinear(nn.Module):
         self._last_diag: Dict[str, Any] = {}
         self.profile_runtime = bool(profile_runtime)
         self._profile = _ProfileStats()
+        # Standardized observability contract
+        self.backend_family = "sparse_linear"
+        self.diag_path = "runtime"
+        self.fallback_reason = ""
+        self.meta_source = "measured"
+        self.diag_source = "measured"
+        self.support_status = "supported"
+        self.score_family = "linear"
 
     @classmethod
     def from_dense(
@@ -323,7 +331,16 @@ class SparseLinear(nn.Module):
             t_total = self._stamp()
 
         if self.collect_diag:
-            self._last_diag = {"sparse_path_executed": False}
+            self._last_diag = {
+                "sparse_path_executed": False,
+                "backend_family": self.backend_family,
+                "diag_path": self.diag_path,
+                "fallback_reason": self.fallback_reason,
+                "meta_source": self.meta_source,
+                "diag_source": self.diag_source,
+                "support_status": self.support_status,
+                "score_family": self.score_family,
+            }
 
         if self.profile_runtime:
             t0 = self._stamp()
@@ -335,12 +352,23 @@ class SparseLinear(nn.Module):
 
         if self._force_zero:
             y2d = self._zero_output_2d(x2d)
+            self.backend_family = "exact_zero"
+            self.diag_path = "zero_force"
+            self.fallback_reason = "force_zero_policy"
             if self.profile_runtime:
                 self._profile.zero_path_hits += 1
                 self._profile.last_path = "zero(force)"
                 total_ms = self._elapsed_ms(t_total)
                 self._profile_add("total_ms", total_ms)
                 self._profile_set_last("last_total_ms", total_ms)
+            if self.collect_diag:
+                self._last_diag.update({
+                    "backend": "staticzero",
+                    "backend_family": self.backend_family,
+                    "diag_path": self.diag_path,
+                    "fallback_reason": self.fallback_reason,
+                    "runtime_total_ms": self._profile.last_total_ms if self.profile_runtime else -1.0,
+                })
             return self._restore_output(y2d, restore_meta)
 
         use_triton = self._supports_triton() and x2d.is_cuda
@@ -377,6 +405,7 @@ class SparseLinear(nn.Module):
             y2d = self._fallback_forward(x2d)
             avg_active_ratio = None
             path = "dense"
+            self.fallback_reason = "dense_runtime_or_policy"
             if self.profile_runtime:
                 self._profile.dense_path_hits += 1
 
@@ -394,6 +423,9 @@ class SparseLinear(nn.Module):
         if self._force_zero and avg_active_ratio == 0.0:
             y2d = self._zero_output_2d(x2d)
             path = "zero(promoted)"
+            self.backend_family = "exact_zero"
+            self.diag_path = "zero_promoted"
+            self.fallback_reason = "zero_promoted_policy"
 
         if self.profile_runtime:
             t0 = self._stamp()
@@ -456,11 +488,17 @@ class SparseLinear(nn.Module):
                     f"error={type(err).__name__}: {err}"
                 )
                 self._warned_triton_runtime_error = True
+            self.backend_family = "dense_torch"
+            self.diag_path = "dense_fallback"
+            self.fallback_reason = "triton_runtime_error"
             y2d = self._fallback_forward(x2d)
             if self.collect_diag:
                 self._last_diag = {
                     "sparse_path_executed": False,
                     "backend": "dense_fallback",
+                    "backend_family": self.backend_family,
+                    "diag_path": self.diag_path,
+                    "fallback_reason": self.fallback_reason,
                     "backend_reason": "triton_runtime_error",
                     "error_type": type(err).__name__,
                     "error_msg": str(err),
@@ -493,17 +531,34 @@ class SparseLinear(nn.Module):
         }
 
         backend_kind = backend_meta.get("backend", "sparse_triton") if backend_meta else "sparse_triton"
+        backend_reason = backend_meta.get("reason", "") if backend_meta else ""
 
         if backend_kind == "dense_fallback":
             self._last_sparse_ms = 0.0
             self._last_dense_ms = float(sparse_ms)
+            self.backend_family = "dense_torch"
+            self.diag_path = "dense_fallback"
+            self.fallback_reason = backend_reason or "dense_fallback"
             if self.profile_runtime:
                 self._profile_add("dense_fallback_ms", self._last_dense_ms)
                 self._profile_set_last("last_dense_fallback_ms", self._last_dense_ms)
                 self._profile_set_last("last_sparse_kernel_ms", 0.0)
+        elif backend_kind == "zero_tiles_only":
+            self._last_sparse_ms = float(sparse_ms)
+            self._last_dense_ms = 0.0
+            self.backend_family = "exact_zero"
+            self.diag_path = "zero_tiles_only"
+            self.fallback_reason = backend_reason or "zero_tiles_only"
+            if self.profile_runtime:
+                self._profile_add("sparse_kernel_ms", self._last_sparse_ms)
+                self._profile_set_last("last_sparse_kernel_ms", self._last_sparse_ms)
+                self._profile_set_last("last_dense_fallback_ms", 0.0)
         else:
             self._last_sparse_ms = float(sparse_ms)
             self._last_dense_ms = 0.0
+            self.backend_family = "sparse_linear"
+            self.diag_path = "sparse_kernel"
+            self.fallback_reason = ""
             if self.profile_runtime:
                 self._profile_add("sparse_kernel_ms", self._last_sparse_ms)
                 self._profile_set_last("last_sparse_kernel_ms", self._last_sparse_ms)
@@ -570,6 +625,13 @@ class SparseLinear(nn.Module):
         self._last_diag = {
             "sparse_path_executed": True,
             "metadata_kind": "three_stage_grouped_linear_v3",
+            "backend_family": self.backend_family,
+            "diag_path": self.diag_path,
+            "fallback_reason": self.fallback_reason,
+            "meta_source": self.meta_source,
+            "diag_source": self.diag_source,
+            "support_status": self.support_status,
+            "score_family": self.score_family,
             "group_size": group_size,
             "num_groups": int(num_groups),
             "nonzero_group_count": active_g,
@@ -581,6 +643,7 @@ class SparseLinear(nn.Module):
             "effective_k_ratio": agr,
             "sparse_compute_ms": float(sparse_ms),
             "sparse_total_ms": float(sparse_ms),
+            "dense_fallback_ms": self._last_dense_ms if self._last_dense_ms > 0 else -1.0,
             "avg_active_ratio": float(avg_active_ratio) if avg_active_ratio is not None else -1.0,
             "zero_tiles": int(zt),
             "sparse_tiles": int(st),
@@ -615,6 +678,10 @@ class SparseLinear(nn.Module):
         # match SparseConv2d: fallback uses float path
         y = F.linear(x2d.float(), self.weight.float(), self.bias.float() if self.bias is not None else None).float()
         self._last_sparse_ms = 0.0
+        self.backend_family = "dense_torch"
+        self.diag_path = "dense_fallback"
+        if not self.fallback_reason:
+            self.fallback_reason = "dense_fallback"
 
         if self.profile_runtime:
             self._last_dense_ms = self._elapsed_ms(t0)
@@ -623,8 +690,31 @@ class SparseLinear(nn.Module):
             self._profile_set_last("last_sparse_kernel_ms", 0.0)
         else:
             self._last_dense_ms = 0.0
+        if self.collect_diag:
+            self._last_diag.update({
+                "backend": "dense_fallback",
+                "backend_family": self.backend_family,
+                "diag_path": self.diag_path,
+                "fallback_reason": self.fallback_reason,
+                "dense_fallback_ms": self._last_dense_ms,
+                "sparse_path_executed": False,
+            })
 
         return y
+
+    def get_diag(self) -> Dict[str, Any]:
+        """Return standardized per-layer diagnostics from the latest forward."""
+        diag = dict(self._last_diag or {})
+        diag.setdefault("backend_family", self.backend_family)
+        diag.setdefault("diag_path", self.diag_path)
+        diag.setdefault("fallback_reason", self.fallback_reason)
+        diag.setdefault("meta_source", self.meta_source)
+        diag.setdefault("diag_source", self.diag_source)
+        diag.setdefault("support_status", self.support_status)
+        diag.setdefault("score_family", self.score_family)
+        diag.setdefault("sparse_total_ms", float(self._last_sparse_ms))
+        diag.setdefault("dense_fallback_ms", float(self._last_dense_ms))
+        return diag
 
     def extra_repr(self) -> str:
         return (

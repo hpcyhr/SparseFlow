@@ -67,7 +67,13 @@ class StaticZeroConv2d(nn.Module):
         # Diagnostics
         self.zero_reason = zero_reason
         self.backend_family = ZERO_BACKEND_FAMILY
+        self.diag_path = "staticzero"
+        self.fallback_reason = "exact_zero_shortcut"
         self._forward_count = 0
+        self.collect_diag = False
+        self.profile_runtime = False
+        self._last_diag: Dict[str, Any] = {}
+        self._last_sparse_ms = 0.0
 
         # Template cache: {(device_str, dtype_str, H_out, W_out, bias_ver): tensor}
         self._template_cache: Dict[Tuple, torch.Tensor] = {}
@@ -130,7 +136,10 @@ class StaticZeroConv2d(nn.Module):
             # Materialize to avoid shared-storage aliasing from expand().
             # Some backbones use in-place residual adds (e.g., out += identity),
             # which require a writable tensor with unique storage.
-            return tpl.expand(B, -1, -1, -1).clone()
+            y = tpl.expand(B, -1, -1, -1).clone()
+            if self.collect_diag:
+                self._last_diag = self.get_diag()
+            return y
 
         elif x.dim() == 5:
             T, B, _, H, W = x.shape
@@ -138,7 +147,10 @@ class StaticZeroConv2d(nn.Module):
             tpl = self._get_template(x.device, torch.float32, H_out, W_out)
             # Materialize to avoid shared-storage aliasing from expand().
             y4d = tpl.expand(T * B, -1, -1, -1).clone()
-            return y4d.reshape(T, B, self.out_channels, H_out, W_out)
+            y = y4d.reshape(T, B, self.out_channels, H_out, W_out)
+            if self.collect_diag:
+                self._last_diag = self.get_diag()
+            return y
 
         else:
             raise ValueError(f"Expected 4D or 5D input, got {x.dim()}D")
@@ -148,11 +160,14 @@ class StaticZeroConv2d(nn.Module):
         return {
             'backend_family': self.backend_family,
             'zero_reason': self.zero_reason,
-            'diag_path': 'staticzero',
+            'diag_path': self.diag_path,
+            'fallback_reason': self.fallback_reason,
             'has_bias': self.bias_buf is not None,
             'out_channels': self.out_channels,
             'forward_count': self._forward_count,
             'template_cache_size': len(self._template_cache),
+            'sparse_path_executed': False,
+            'sparse_total_ms': 0.0,
         }
 
     def extra_repr(self) -> str:

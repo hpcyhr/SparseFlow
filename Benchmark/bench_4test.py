@@ -30,7 +30,7 @@ from Ops.sparse_conv2d import SparseConv2d
 from Ops.sparse_fused_conv_lif import FusedSparseConvLIF
 from Ops.static_zero_conv2d import StaticZeroConv2d, make_synthetic_zero_diag
 from Utils.layer_logger import LayerLogger
-from Utils.dispatch_model import dispatch_all_layers, decisions_to_sets
+from Utils.dispatch_model import dispatch_all_layers, decisions_to_sets, summarize_decisions
 from Utils.timing_utils import prepare_for_timing, set_launch_mode, count_sync_state
 from Core.registry import SpikeOpRegistry
 from Core.analyzer import NetworkAnalyzer
@@ -283,11 +283,53 @@ def _get_module_by_name(model, name):
     return cur
 
 
-def make_spike_input(imgs, T, device, spike_mode="normalized_bernoulli"):
-    imgs = imgs.to(device)
+def _phase_seed_offset(seed_tag):
+    offsets = {
+        "sparsity": 10_000_000,
+        "group": 20_000_000,
+        "e2e": 30_000_000,
+        "layer": 40_000_000,
+        "verify": 50_000_000,
+    }
+    for key, off in offsets.items():
+        if seed_tag.startswith(key):
+            return off
+    return 0
+
+
+def _derive_spike_seed(base_seed, batch_idx, seed_tag="e2e", pass_index=0):
+    if base_seed is None:
+        return None
+    base = int(base_seed)
+    return base + _phase_seed_offset(seed_tag) + int(pass_index) * 1_000_000 + int(batch_idx)
+
+
+def _make_torch_generator(device, seed):
+    if seed is None:
+        return None
+    if isinstance(device, torch.device) and device.type == "cuda":
+        gen = torch.Generator(device=device)
+    else:
+        gen = torch.Generator()
+    gen.manual_seed(int(seed))
+    return gen
+
+
+def make_spike_input(imgs, T, device, spike_mode="normalized_bernoulli", rng_seed=None):
+    imgs = imgs.to(device, non_blocking=True)
     if spike_mode in ("normalized_bernoulli", "raw_bernoulli"):
         rates = imgs.clamp(0, 1)
-        return torch.bernoulli(rates.unsqueeze(0).repeat(T, 1, 1, 1, 1))
+        rates_5d = rates.unsqueeze(0).repeat(T, 1, 1, 1, 1)
+        if rng_seed is None:
+            return torch.bernoulli(rates_5d)
+        gen = _make_torch_generator(device, rng_seed)
+        rand = torch.rand(
+            rates_5d.shape,
+            dtype=rates_5d.dtype,
+            device=rates_5d.device,
+            generator=gen,
+        )
+        return (rand < rates_5d).to(rates_5d.dtype)
     elif spike_mode == "raw_repeat":
         return imgs.unsqueeze(0).repeat(T, 1, 1, 1, 1)
     else:
@@ -446,7 +488,8 @@ def print_analysis_report(targets, skipped, fused=False):
 
 
 def measure_sparsity(model, targets, loader, device, T, num_batches=10,
-                     spike_mode="normalized_bernoulli"):
+                     spike_mode="normalized_bernoulli", seed=None, seed_tag="sparsity",
+                     pass_index=0):
     sparsity_data = {t["name"]: {"zeros": 0, "total": 0} for t in targets}
 
     def make_hook(name):
@@ -474,7 +517,8 @@ def measure_sparsity(model, targets, loader, device, T, num_batches=10,
     for imgs, _ in loader:
         if batch_count >= num_batches:
             break
-        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        rng_seed = _derive_spike_seed(seed, batch_count, seed_tag=seed_tag, pass_index=pass_index)
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode, rng_seed=rng_seed)
         sj_func.reset_net(model)
         with torch.no_grad():
             _ = model(inp)
@@ -496,7 +540,8 @@ def collect_static_zero_layers(targets, sparsity_data):
 
 
 def measure_group_sparsity(model, targets, loader, device, T, num_batches=5,
-                           spike_mode="normalized_bernoulli"):
+                           spike_mode="normalized_bernoulli", seed=None,
+                           seed_tag="group", pass_index=0):
     for _, mod in model.named_modules():
         if isinstance(mod, SparseConv2d):
             mod.collect_diag = True
@@ -505,7 +550,8 @@ def measure_group_sparsity(model, targets, loader, device, T, num_batches=5,
     for imgs, _ in loader:
         if batch_count >= num_batches:
             break
-        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        rng_seed = _derive_spike_seed(seed, batch_count, seed_tag=seed_tag, pass_index=pass_index)
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode, rng_seed=rng_seed)
         sj_func.reset_net(model)
         with torch.no_grad():
             _ = model(inp)
@@ -539,6 +585,8 @@ def measure_group_sparsity(model, targets, loader, device, T, num_batches=5,
                 'stage1_zero_candidate': diag.get('stage1_zero_candidate', -1),
                 'stage1_denseish': diag.get('stage1_denseish', -1),
                 'stage1_uncertain': diag.get('stage1_uncertain', -1),
+                'block_m': diag.get('block_m', -1),
+                'block_n': diag.get('block_n', -1),
             }
 
     for _, mod in model.named_modules():
@@ -682,12 +730,16 @@ def replace_model(model, targets, fused=False, static_zero_layers=None,
 
 
 def measure_e2e_latency(model, loader, device, T, warmup=10, max_batches=None,
-                        spike_mode="normalized_bernoulli"):
+                        spike_mode="normalized_bernoulli", seed=None, seed_tag="e2e",
+                        pass_index=0):
     warmup_count = 0
     for imgs, _ in loader:
         if warmup_count >= warmup:
             break
-        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        rng_seed = _derive_spike_seed(
+            seed, warmup_count, seed_tag=f"{seed_tag}_warmup", pass_index=pass_index
+        )
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode, rng_seed=rng_seed)
         sj_func.reset_net(model)
         with torch.no_grad():
             _ = model(inp)
@@ -698,7 +750,10 @@ def measure_e2e_latency(model, loader, device, T, warmup=10, max_batches=None,
     for imgs, _ in loader:
         if max_batches is not None and num_batches >= max_batches:
             break
-        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        rng_seed = _derive_spike_seed(
+            seed, num_batches, seed_tag=f"{seed_tag}_measure", pass_index=pass_index
+        )
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode, rng_seed=rng_seed)
         sj_func.reset_net(model)
         sync()
         start_evt = make_event(); end_evt = make_event()
@@ -715,7 +770,8 @@ def measure_e2e_latency(model, loader, device, T, warmup=10, max_batches=None,
 
 
 def measure_layer_timing(model, loader, device, T, target_names,
-                         warmup=5, num_batches=20, spike_mode="normalized_bernoulli"):
+                         warmup=5, num_batches=20, spike_mode="normalized_bernoulli",
+                         seed=None, seed_tag="layer", pass_index=0):
     name_to_module = {}
     for name, module in model.named_modules():
         if name in target_names:
@@ -746,7 +802,10 @@ def measure_layer_timing(model, loader, device, T, target_names,
     for imgs, _ in loader:
         if warmup_count >= warmup:
             break
-        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        rng_seed = _derive_spike_seed(
+            seed, warmup_count, seed_tag=f"{seed_tag}_warmup", pass_index=pass_index
+        )
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode, rng_seed=rng_seed)
         sj_func.reset_net(model)
         with torch.no_grad():
             _ = model(inp)
@@ -758,7 +817,10 @@ def measure_layer_timing(model, loader, device, T, target_names,
         if batch_count >= num_batches:
             break
         pre_events.clear(); post_events.clear()
-        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        rng_seed = _derive_spike_seed(
+            seed, batch_count, seed_tag=f"{seed_tag}_measure", pass_index=pass_index
+        )
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode, rng_seed=rng_seed)
         sj_func.reset_net(model)
         with torch.no_grad():
             _ = model(inp)
@@ -831,12 +893,14 @@ def print_layer_profile(baseline_timing, sparse_timing, targets, e2e_baseline_ms
 
 
 def verify_consistency(model_baseline, model_sparse, loader, device, T,
-                       num_batches=5, spike_mode="normalized_bernoulli"):
+                       num_batches=5, spike_mode="normalized_bernoulli",
+                       seed=None, seed_tag="verify", pass_index=0):
     cosine_sum = agree_sum = 0.0; global_max_abs = 0.0; count = 0
     for imgs, _ in loader:
         if count >= num_batches:
             break
-        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        rng_seed = _derive_spike_seed(seed, count, seed_tag=seed_tag, pass_index=pass_index)
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode, rng_seed=rng_seed)
         sj_func.reset_net(model_baseline)
         with torch.no_grad():
             out_base = model_baseline(inp)
@@ -895,8 +959,18 @@ def print_fourway_route_report(targets, sparsity_data, hybrid_decisions=None):
 
 
 def print_dispatch_decision_report(targets, group_sparsity_data, dispatch_decisions):
-    print(f"\n  {'Layer':<40} {'AGR':>8} {'TileZR':>8} {'Decision':>12} {'Score':>9} {'Reason':>28}")
-    print(f"  {'-'*112}")
+    print(
+        f"\n  {'Layer':<40} {'AGR':>8} {'TileZR':>8} {'Decision':>12} {'Score':>9} "
+        f"{'RC':>16} {'Src(M/D/T)':>11}"
+    )
+    print(f"  {'-'*130}")
+    n_sparse = 0
+    n_dense = 0
+    n_staticzero = 0
+    n_dense_unsupported = 0
+    n_dense_missing_diag = 0
+    n_dense_score = 0
+    n_estimated_meta = 0
     for t in targets:
         name = t["name"]
         gd = group_sparsity_data.get(name, {})
@@ -904,20 +978,56 @@ def print_dispatch_decision_report(targets, group_sparsity_data, dispatch_decisi
         agr = gd.get('active_group_ratio', dec.agr if dec is not None else -1.0)
         tzr = gd.get('tile_zero_ratio', dec.tzr if dec is not None else -1.0)
         score = dec.score_sparse if dec is not None else 0.0
-        reason = dec.reason if dec is not None else 'n/a'
+        reason_code = getattr(dec, "reason_code", "n/a") if dec is not None else "n/a"
         backend = dec.backend if dec is not None else 'n/a'
         short = name if len(name) <= 39 else "..." + name[-36:]
         agr_s = f"{agr:.4f}" if agr >= 0 else "n/a"
         tzr_s = f"{tzr:.4f}" if tzr >= 0 else "n/a"
         score_s = f"{score:.4f}" if dec is not None else "n/a"
-        if len(reason) > 28:
-            reason = reason[:25] + '...'
-        print(f"  {short:<40} {agr_s:>8} {tzr_s:>8} {backend:>12} {score_s:>9} {reason:>28}")
+        if len(reason_code) > 16:
+            reason_code = reason_code[:13] + "..."
+        if dec is not None:
+            src = f"{getattr(dec, 'meta_source', 'u')[:1]}/{getattr(dec, 'diag_source', 'u')[:1]}/{getattr(dec, 'tile_source', 'u')[:1]}"
+            if backend == "sparse":
+                n_sparse += 1
+            elif backend == "staticzero":
+                n_staticzero += 1
+            else:
+                n_dense += 1
+                support_status = str(getattr(dec, "support_status", ""))
+                if support_status.startswith("unsupported"):
+                    n_dense_unsupported += 1
+                elif getattr(dec, "diag_source", "measured") == "missing":
+                    n_dense_missing_diag += 1
+                else:
+                    n_dense_score += 1
+            if getattr(dec, "meta_source", "measured") != "measured":
+                n_estimated_meta += 1
+        else:
+            src = "u/u/u"
+
+        print(f"  {short:<40} {agr_s:>8} {tzr_s:>8} {backend:>12} {score_s:>9} {reason_code:>16} {src:>11}")
+
+    print(
+        f"\n  Dispatch summary: sparse={n_sparse}, dense={n_dense}, staticzero={n_staticzero} | "
+        f"dense(score)={n_dense_score}, dense(unsupported)={n_dense_unsupported}, "
+        f"dense(missing_diag)={n_dense_missing_diag}, estimated_meta={n_estimated_meta}"
+    )
 
 
-def measure_mode(model, loader, device, T, warmup, spike_mode, power, label):
+def measure_mode(model, loader, device, T, warmup, spike_mode, power, label,
+                 seed=None, seed_tag="e2e", pass_index=0):
     avg_ms, total_ms, num_batches = measure_e2e_latency(
-        model, loader, device, T, warmup=warmup, spike_mode=spike_mode)
+        model,
+        loader,
+        device,
+        T,
+        warmup=warmup,
+        spike_mode=spike_mode,
+        seed=seed,
+        seed_tag=seed_tag,
+        pass_index=pass_index,
+    )
     energy_j = (total_ms / 1000.0) * power
     return {"label": label, "avg_ms": avg_ms, "total_ms": total_ms,
             "num_batches": num_batches, "energy_j": energy_j}
@@ -1132,6 +1242,34 @@ def _core_target_op_type(target):
     return getattr(target, "op_type", "unknown")
 
 
+def _operator_family_from_op_type(op_type):
+    s = str(op_type or "").lower()
+    if s in ("linear", "attn_linear", "attention_linear"):
+        return "linear"
+    if s in ("matmul", "bmm"):
+        return s
+    if s in ("attn_matmul", "attention_qkav", "attention_qkmix", "attention"):
+        return "attn_matmul"
+    if s.startswith("attention"):
+        return "attn_matmul"
+    if s.startswith("conv") or "conv" in s:
+        return "conv"
+    return "unknown"
+
+
+def _operator_family_from_target_kind(kind):
+    s = str(kind or "").lower()
+    if s == "linear":
+        return "linear"
+    if s in ("matmul", "bmm"):
+        return s
+    if s.startswith("attention"):
+        return "attn_matmul"
+    if "conv" in s or "/" in s:
+        return "conv"
+    return "unknown"
+
+
 def _safe_speedup(base_ms, opt_ms):
     if opt_ms <= 1e-9:
         return float("inf")
@@ -1241,6 +1379,9 @@ def measure_sparsity_core(
     T,
     num_batches=10,
     spike_mode="normalized_bernoulli",
+    seed=None,
+    seed_tag="sparsity_core",
+    pass_index=0,
 ):
     target_names = [_core_target_name(t) for t in targets]
     sparsity_data = {name: {"zeros": 0, "total": 0} for name in target_names}
@@ -1267,7 +1408,8 @@ def measure_sparsity_core(
     for imgs, _ in loader:
         if batch_count >= num_batches:
             break
-        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        rng_seed = _derive_spike_seed(seed, batch_count, seed_tag=seed_tag, pass_index=pass_index)
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode, rng_seed=rng_seed)
         sj_func.reset_net(model)
         with torch.no_grad():
             _ = model(inp)
@@ -1298,6 +1440,9 @@ def measure_group_sparsity_core(
     T,
     num_batches=5,
     spike_mode="normalized_bernoulli",
+    seed=None,
+    seed_tag="group_core",
+    pass_index=0,
 ):
     target_names = {_core_target_name(t) for t in targets}
     for name, mod in model.named_modules():
@@ -1308,7 +1453,8 @@ def measure_group_sparsity_core(
     for imgs, _ in loader:
         if batch_count >= num_batches:
             break
-        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode)
+        rng_seed = _derive_spike_seed(seed, batch_count, seed_tag=seed_tag, pass_index=pass_index)
+        inp = make_spike_input(imgs, T, device, spike_mode=spike_mode, rng_seed=rng_seed)
         sj_func.reset_net(model)
         with torch.no_grad():
             _ = model(inp)
@@ -1343,6 +1489,7 @@ def measure_group_sparsity_core(
             "stage1_denseish": diag.get("stage1_denseish", -1),
             "stage1_uncertain": diag.get("stage1_uncertain", -1),
             "block_m": diag.get("block_m", -1),
+            "block_n": diag.get("block_n", -1),
         }
 
     for name, mod in model.named_modules():
@@ -1354,7 +1501,10 @@ def measure_group_sparsity_core(
 def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
     print(f"[3/7] Analyze replaceable targets via Core (all operator types) ...")
     imgs_s, _ = next(iter(loader))
-    sample_input = make_spike_input(imgs_s[:4], args.T, device, spike_mode=args.spike_mode)
+    sample_input = make_spike_input(
+        imgs_s[:4], args.T, device, spike_mode=args.spike_mode,
+        rng_seed=_derive_spike_seed(args.seed, 0, seed_tag="analyze")
+    )
 
     registry = SpikeOpRegistry.default()
     analyzer = NetworkAnalyzer(registry)
@@ -1398,6 +1548,9 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
         args.T,
         num_batches=args.sparsity_batches,
         spike_mode=args.spike_mode,
+        seed=args.seed,
+        seed_tag="sparsity_core",
+        pass_index=0,
     )
     zero_layers = collect_core_static_zero_layers(targets, sparsity_data)
     if args.spike_mode in ("normalized_bernoulli", "raw_bernoulli") and zero_layers:
@@ -1413,6 +1566,9 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
             args.T,
             num_batches=args.sparsity_batches,
             spike_mode=args.spike_mode,
+            seed=args.seed,
+            seed_tag="sparsity_core",
+            pass_index=1,
         )
         zero_layers_recheck = collect_core_static_zero_layers(targets, sparsity_data_recheck)
         unstable_zero_layers = set(zero_layers) - set(zero_layers_recheck)
@@ -1454,8 +1610,11 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
         loader,
         device,
         args.T,
-        num_batches=min(args.sparsity_batches, 5),
+        num_batches=args.sparsity_batches,
         spike_mode=args.spike_mode,
+        seed=args.seed,
+        seed_tag="group_core",
+        pass_index=0,
     )
     del model_diag
 
@@ -1496,6 +1655,7 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
         group_sparsity_data,
         zero_layers=set(zero_layers),
     )
+    dispatch_summary = summarize_decisions(dispatch_decisions)
     hybrid_static_zero_layers, hybrid_sparse_set = decisions_to_sets(dispatch_decisions)
 
     # Safety net: StaticZero must remain exact-zero only.
@@ -1505,6 +1665,10 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
             _dec = dispatch_decisions[_name]
             _dec.backend = "sparse"
             _dec.reason = "core_safety_remap_nonexact_staticzero_to_sparse"
+            if hasattr(_dec, "reason_code"):
+                _dec.reason_code = "safety_remap"
+            if hasattr(_dec, "fallback_reason"):
+                _dec.fallback_reason = "safety_remap"
         hybrid_static_zero_layers -= invalid_static_zero_layers
         hybrid_sparse_set |= invalid_static_zero_layers
 
@@ -1623,10 +1787,22 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
         print(f"  [Timing] hybrid sync state: {count_sync_state(model_hybrid)}")
 
     print(f"\n[6/7] End-to-end latency (warmup={args.warmup}) ...")
-    dense_res = measure_mode(model_baseline, loader, device, args.T, args.warmup, args.spike_mode, args.power, "Dense cuDNN")
-    sz_res = measure_mode(model_staticzero, loader, device, args.T, args.warmup, args.spike_mode, args.power, "StaticZero only")
-    so_res = measure_mode(model_sparse, loader, device, args.T, args.warmup, args.spike_mode, args.power, "SparseKernel only")
-    hy_res = measure_mode(model_hybrid, loader, device, args.T, args.warmup, args.spike_mode, args.power, "SparseKernel + StaticZero")
+    dense_res = measure_mode(
+        model_baseline, loader, device, args.T, args.warmup, args.spike_mode, args.power,
+        "Dense cuDNN", seed=args.seed, seed_tag="e2e_dense"
+    )
+    sz_res = measure_mode(
+        model_staticzero, loader, device, args.T, args.warmup, args.spike_mode, args.power,
+        "StaticZero only", seed=args.seed, seed_tag="e2e_staticzero"
+    )
+    so_res = measure_mode(
+        model_sparse, loader, device, args.T, args.warmup, args.spike_mode, args.power,
+        "SparseKernel only", seed=args.seed, seed_tag="e2e_sparse"
+    )
+    hy_res = measure_mode(
+        model_hybrid, loader, device, args.T, args.warmup, args.spike_mode, args.power,
+        "SparseKernel + StaticZero", seed=args.seed, seed_tag="e2e_hybrid"
+    )
     for r in [dense_res, sz_res, so_res, hy_res]:
         print_mode_result(r)
 
@@ -1661,6 +1837,8 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
             warmup=lp_warmup,
             num_batches=lp_batches,
             spike_mode=args.spike_mode,
+            seed=args.seed,
+            seed_tag="layer_dense",
         )
         staticzero_layer_timing = measure_layer_timing(
             model_staticzero,
@@ -1671,6 +1849,8 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
             warmup=lp_warmup,
             num_batches=lp_batches,
             spike_mode=args.spike_mode,
+            seed=args.seed,
+            seed_tag="layer_staticzero",
         )
         sparse_only_layer_timing = measure_layer_timing(
             model_sparse,
@@ -1681,6 +1861,8 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
             warmup=lp_warmup,
             num_batches=lp_batches,
             spike_mode=args.spike_mode,
+            seed=args.seed,
+            seed_tag="layer_sparse",
         )
         hybrid_layer_timing = measure_layer_timing(
             model_hybrid,
@@ -1691,6 +1873,8 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
             warmup=lp_warmup,
             num_batches=lp_batches,
             spike_mode=args.spike_mode,
+            seed=args.seed,
+            seed_tag="layer_hybrid",
         )
 
         replaced_operator_speedup = {
@@ -1741,15 +1925,18 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
     print(f"\n[7/7] Consistency check ({args.verify_batches} batches) ...")
     sz_cos, sz_agr, sz_mabs = verify_consistency(
         model_baseline, model_staticzero, loader, device, args.T,
-        num_batches=args.verify_batches, spike_mode=args.spike_mode
+        num_batches=args.verify_batches, spike_mode=args.spike_mode,
+        seed=args.seed, seed_tag="verify_staticzero"
     )
     so_cos, so_agr, so_mabs = verify_consistency(
         model_baseline, model_sparse, loader, device, args.T,
-        num_batches=args.verify_batches, spike_mode=args.spike_mode
+        num_batches=args.verify_batches, spike_mode=args.spike_mode,
+        seed=args.seed, seed_tag="verify_sparse"
     )
     hy_cos, hy_agr, hy_mabs = verify_consistency(
         model_baseline, model_hybrid, loader, device, args.T,
-        num_batches=args.verify_batches, spike_mode=args.spike_mode
+        num_batches=args.verify_batches, spike_mode=args.spike_mode,
+        seed=args.seed, seed_tag="verify_hybrid"
     )
     sz_ok = sz_cos > 0.999 and sz_mabs < 0.1
     so_ok = so_cos > 0.999 and so_mabs < 0.1
@@ -1812,6 +1999,7 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
                 and _core_target_name(t) not in hybrid_sparse_set
             ]
         ),
+        "dispatch_summary": dispatch_summary,
         "dispatch_decisions": {name: dec.to_dict() for name, dec in dispatch_decisions.items()},
         "dispatch_invalid_staticzero_remapped_layers": sorted(list(invalid_static_zero_layers)),
         "stochastic_unstable_staticzero_removed_layers": (
@@ -1870,6 +2058,66 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
         results["replaced_operator_speedup"] = replaced_operator_speedup
     if group_sparsity_data:
         results["group_sparsity"] = group_sparsity_data
+
+    if args.collect_diag and (args.diag_json or args.diag_csv):
+        run_id = f"{args.model}_{args.dataset}_T{args.T}_core_all_ops_v21"
+        layer_logger = LayerLogger(run_id=run_id, model=args.model, dataset=args.dataset, T=args.T)
+
+        for t in targets:
+            name = _core_target_name(t)
+            op_type = _core_target_op_type(t)
+            sd = sparsity_data.get(name, {"zeros": 0, "total": 1})
+            elem_sp = sd["zeros"] / max(sd["total"], 1)
+            gd = dict(group_sparsity_data.get(name, {}))
+            dec = dispatch_decisions.get(name)
+
+            # Keep legacy sparsity field usable in downstream tooling.
+            gd.setdefault("element_sparsity", elem_sp)
+            if dec is not None:
+                gd.setdefault("backend", dec.backend)
+                gd.setdefault("reason_code", getattr(dec, "reason_code", ""))
+                gd.setdefault("fallback_reason", getattr(dec, "fallback_reason", ""))
+
+            # Normalize family tags for observability reports.
+            score_family = getattr(dec, "score_family", "") if dec is not None else ""
+            if score_family in ("conv", "linear", "attn_linear", "attn_matmul", "matmul", "bmm"):
+                op_family = _operator_family_from_op_type(score_family)
+            else:
+                op_family = _operator_family_from_op_type(op_type)
+
+            mode_used = "sparsekernel"
+            replaced = True
+            if dec is not None and dec.backend == "staticzero":
+                mode_used = "staticzero"
+            elif dec is not None and dec.backend == "dense":
+                mode_used = "densekeep"
+                replaced = False
+
+            layer_logger.log_from_diag(
+                layer_name=name,
+                diag=gd,
+                mode_used=mode_used,
+                replaced=replaced,
+                operator_family=op_family,
+                operator_type=op_type,
+                dispatch_decision=dec.backend if dec is not None else "",
+                reason_code=getattr(dec, "reason_code", "") if dec is not None else "",
+                support_status=getattr(dec, "support_status", "supported") if dec is not None else "supported",
+                meta_source=getattr(dec, "meta_source", "measured") if dec is not None else "measured",
+                diag_source=getattr(dec, "diag_source", "measured") if dec is not None else "measured",
+                tile_source=getattr(dec, "tile_source", "unknown") if dec is not None else "unknown",
+                score_family=getattr(dec, "score_family", "unknown") if dec is not None else "unknown",
+                fallback_reason=getattr(dec, "fallback_reason", "") if dec is not None else "",
+                decision_confidence=float(getattr(dec, "confidence", -1.0)) if dec is not None else -1.0,
+            )
+
+        if args.diag_json:
+            layer_logger.save_json(args.diag_json)
+            print(f"  Diagnostic JSON: {args.diag_json}")
+        if args.diag_csv:
+            layer_logger.save_csv(args.diag_csv)
+            print(f"  Diagnostic CSV: {args.diag_csv}")
+        layer_logger.print_summary()
 
     out_path = (
         args.out_json
@@ -1958,7 +2206,7 @@ def main():
         "--sparse_only_dispatch_dense",
         dest="sparse_only_dispatch_dense",
         action="store_true",
-        default=True,
+        default=False,
         help=(
             "In Sparse-only mode, force dense runtime path for layers that dispatch "
             "marks as dense (keeps sparse modules but avoids low-gain sparse execution)."
@@ -2044,7 +2292,10 @@ def main():
 
     print(f"[3/7] Analyzing network topology ...")
     imgs_s, _ = next(iter(loader))
-    sample_input = make_spike_input(imgs_s[:4], args.T, device, spike_mode=args.spike_mode)
+    sample_input = make_spike_input(
+        imgs_s[:4], args.T, device, spike_mode=args.spike_mode,
+        rng_seed=_derive_spike_seed(args.seed, 0, seed_tag="analyze")
+    )
     targets, skipped = analyze_targets(
         model_baseline, sample_input, device, fused=False,
         min_spatial_size=args.min_spatial_size)
@@ -2056,7 +2307,12 @@ def main():
     print(f"\n[4/7] Measuring sparsity and dispatch features ({args.sparsity_batches} batches) ...")
     sparsity_data = measure_sparsity(
         model_baseline, targets, loader, device, args.T,
-        num_batches=args.sparsity_batches, spike_mode=args.spike_mode)
+        num_batches=args.sparsity_batches,
+        spike_mode=args.spike_mode,
+        seed=args.seed,
+        seed_tag="sparsity",
+        pass_index=0,
+    )
     zero_layers = collect_static_zero_layers(targets, sparsity_data)
     print(f"\n  Detected {len(zero_layers)} exact-zero-input layers.")
 
@@ -2065,7 +2321,12 @@ def main():
     replace_model(_tmp_model, targets, fused=False, static_zero_layers=set(), only_static_zero=False)
     group_sparsity_data = measure_group_sparsity(
         _tmp_model, targets, loader, device, args.T,
-        num_batches=min(args.sparsity_batches, 5), spike_mode=args.spike_mode)
+        num_batches=args.sparsity_batches,
+        spike_mode=args.spike_mode,
+        seed=args.seed,
+        seed_tag="group",
+        pass_index=0,
+    )
     del _tmp_model
 
     for _t in targets:
@@ -2120,6 +2381,10 @@ def main():
             _dec = dispatch_decisions[_name]
             _dec.backend = 'sparse'
             _dec.reason = 'bench_safety_remap_nonexact_staticzero_to_sparse'
+            if hasattr(_dec, "reason_code"):
+                _dec.reason_code = "safety_remap"
+            if hasattr(_dec, "fallback_reason"):
+                _dec.fallback_reason = "safety_remap"
         hybrid_static_zero_layers -= invalid_static_zero_layers
         hybrid_sparse_set |= invalid_static_zero_layers
 
@@ -2129,6 +2394,10 @@ def main():
             if _dec.backend == 'sparse' and _name not in hybrid_sparse_set:
                 _dec.backend = 'dense'
                 _dec.reason = 'legacy_selective_filter_keep_dense'
+                if hasattr(_dec, "reason_code"):
+                    _dec.reason_code = "legacy_selective_dense"
+                if hasattr(_dec, "fallback_reason"):
+                    _dec.fallback_reason = "legacy_selective_dense"
 
     # Re-sync sets from final decisions after all remaps / legacy filters.
     hybrid_static_zero_layers, hybrid_sparse_set = decisions_to_sets(dispatch_decisions)
@@ -2196,10 +2465,22 @@ def main():
 
 
     print(f"\n[5/7] End-to-end latency (warmup={args.warmup}) ...")
-    dense_res = measure_mode(model_baseline, loader, device, args.T, args.warmup, args.spike_mode, args.power, "Dense cuDNN")
-    sz_res = measure_mode(model_static_zero_only, loader, device, args.T, args.warmup, args.spike_mode, args.power, "StaticZero only")
-    so_res = measure_mode(model_sparse_only, loader, device, args.T, args.warmup, args.spike_mode, args.power, "SparseKernel only")
-    hy_res = measure_mode(model_hybrid, loader, device, args.T, args.warmup, args.spike_mode, args.power, "SparseKernel + StaticZero")
+    dense_res = measure_mode(
+        model_baseline, loader, device, args.T, args.warmup, args.spike_mode, args.power,
+        "Dense cuDNN", seed=args.seed, seed_tag="e2e_dense"
+    )
+    sz_res = measure_mode(
+        model_static_zero_only, loader, device, args.T, args.warmup, args.spike_mode, args.power,
+        "StaticZero only", seed=args.seed, seed_tag="e2e_staticzero"
+    )
+    so_res = measure_mode(
+        model_sparse_only, loader, device, args.T, args.warmup, args.spike_mode, args.power,
+        "SparseKernel only", seed=args.seed, seed_tag="e2e_sparse"
+    )
+    hy_res = measure_mode(
+        model_hybrid, loader, device, args.T, args.warmup, args.spike_mode, args.power,
+        "SparseKernel + StaticZero", seed=args.seed, seed_tag="e2e_hybrid"
+    )
     for r in [dense_res, sz_res, so_res, hy_res]:
         print_mode_result(r)
 
@@ -2226,7 +2507,8 @@ def main():
         print(f"  Measuring baseline (Dense cuDNN) per-layer timing ...")
         baseline_layer_timing = measure_layer_timing(
             model_baseline, loader, device, args.T, target_names,
-            warmup=lp_warmup, num_batches=lp_batches, spike_mode=args.spike_mode)
+            warmup=lp_warmup, num_batches=lp_batches, spike_mode=args.spike_mode,
+            seed=args.seed, seed_tag="layer_dense")
 
         # 6b) SparseKernel-only per-layer timing
         print(f"  Measuring SparseKernel-only per-layer timing ...")
@@ -2234,13 +2516,15 @@ def main():
         # Type is now SparseConv2d / StaticZeroConv2d, hooks work the same way.
         sparse_only_layer_timing = measure_layer_timing(
             model_sparse_only, loader, device, args.T, target_names,
-            warmup=lp_warmup, num_batches=lp_batches, spike_mode=args.spike_mode)
+            warmup=lp_warmup, num_batches=lp_batches, spike_mode=args.spike_mode,
+            seed=args.seed, seed_tag="layer_sparse")
 
         # 6c) Hybrid per-layer timing
         print(f"  Measuring Hybrid per-layer timing ...")
         hybrid_layer_timing = measure_layer_timing(
             model_hybrid, loader, device, args.T, target_names,
-            warmup=lp_warmup, num_batches=lp_batches, spike_mode=args.spike_mode)
+            warmup=lp_warmup, num_batches=lp_batches, spike_mode=args.spike_mode,
+            seed=args.seed, seed_tag="layer_hybrid")
 
         # Print SparseKernel-only layer profile
         print(f"\n  {'=' * 77}")
@@ -2280,9 +2564,18 @@ def main():
         print(f"\n[6/7] Layer-level profiling ... SKIPPED (use --layer_profile to enable)")
 
     print(f"\n[7/7] Consistency check ({args.verify_batches} batches) ...")
-    sz_cos, sz_agr, sz_mabs = verify_consistency(model_baseline, model_static_zero_only, loader, device, args.T, num_batches=args.verify_batches, spike_mode=args.spike_mode)
-    so_cos, so_agr, so_mabs = verify_consistency(model_baseline, model_sparse_only, loader, device, args.T, num_batches=args.verify_batches, spike_mode=args.spike_mode)
-    hy_cos, hy_agr, hy_mabs = verify_consistency(model_baseline, model_hybrid, loader, device, args.T, num_batches=args.verify_batches, spike_mode=args.spike_mode)
+    sz_cos, sz_agr, sz_mabs = verify_consistency(
+        model_baseline, model_static_zero_only, loader, device, args.T,
+        num_batches=args.verify_batches, spike_mode=args.spike_mode,
+        seed=args.seed, seed_tag="verify_staticzero")
+    so_cos, so_agr, so_mabs = verify_consistency(
+        model_baseline, model_sparse_only, loader, device, args.T,
+        num_batches=args.verify_batches, spike_mode=args.spike_mode,
+        seed=args.seed, seed_tag="verify_sparse")
+    hy_cos, hy_agr, hy_mabs = verify_consistency(
+        model_baseline, model_hybrid, loader, device, args.T,
+        num_batches=args.verify_batches, spike_mode=args.spike_mode,
+        seed=args.seed, seed_tag="verify_hybrid")
     sz_ok = sz_cos > 0.999 and sz_mabs < 0.1
     so_ok = so_cos > 0.999 and so_mabs < 0.1
     hy_ok = hy_cos > 0.999 and hy_mabs < 0.1
@@ -2312,13 +2605,21 @@ def main():
 
         set_launch_mode(model_sparse_only, launch_all=False)
         set_launch_mode(model_hybrid, launch_all=False)
-        so_a = measure_mode(model_sparse_only, loader, device, args.T, args.warmup, args.spike_mode, args.power, "Sparse ModeA")
-        hy_a = measure_mode(model_hybrid, loader, device, args.T, args.warmup, args.spike_mode, args.power, "Hybrid ModeA")
+        so_a = measure_mode(
+            model_sparse_only, loader, device, args.T, args.warmup, args.spike_mode, args.power,
+            "Sparse ModeA", seed=args.seed, seed_tag="ab_sparse_mode_a")
+        hy_a = measure_mode(
+            model_hybrid, loader, device, args.T, args.warmup, args.spike_mode, args.power,
+            "Hybrid ModeA", seed=args.seed, seed_tag="ab_hybrid_mode_a")
 
         set_launch_mode(model_sparse_only, launch_all=True)
         set_launch_mode(model_hybrid, launch_all=True)
-        so_b = measure_mode(model_sparse_only, loader, device, args.T, args.warmup, args.spike_mode, args.power, "Sparse ModeB")
-        hy_b = measure_mode(model_hybrid, loader, device, args.T, args.warmup, args.spike_mode, args.power, "Hybrid ModeB")
+        so_b = measure_mode(
+            model_sparse_only, loader, device, args.T, args.warmup, args.spike_mode, args.power,
+            "Sparse ModeB", seed=args.seed, seed_tag="ab_sparse_mode_b")
+        hy_b = measure_mode(
+            model_hybrid, loader, device, args.T, args.warmup, args.spike_mode, args.power,
+            "Hybrid ModeB", seed=args.seed, seed_tag="ab_hybrid_mode_b")
 
         print(f"\n  {'Config':<28} {'Latency(ms)':>12}")
         print(f"  {'-'*44}")
@@ -2347,6 +2648,7 @@ def main():
         "hybrid_static_zero_layers": sorted(list(hybrid_static_zero_layers)),
         "hybrid_sparse_layers": sorted(list(hybrid_sparse_set)),
         "hybrid_dense_keep_layers": sorted([t["name"] for t in targets if t["name"] not in hybrid_static_zero_layers and t["name"] not in hybrid_sparse_set]),
+        "dispatch_summary": summarize_decisions(dispatch_decisions),
         "dispatch_decisions": {name: dec.to_dict() for name, dec in dispatch_decisions.items()},
         "dispatch_invalid_staticzero_remapped_layers": sorted(list(invalid_static_zero_layers)) if "invalid_static_zero_layers" in locals() else [],
         "dense": {"ms_per_batch": round(dense_res["avg_ms"], 2), "energy_j": round(dense_res["energy_j"], 4)},
@@ -2380,27 +2682,75 @@ def main():
             ishape = t.get("input_shape")
             _is_sz = (name in zero_layers)
             _is_dk = (name not in hybrid_sparse_set and not _is_sz)
+            dec = dispatch_decisions.get(name)
+            kind = classify_target_type(t)
+            score_family = getattr(dec, "score_family", "") if dec is not None else ""
+            if score_family in ("conv", "linear", "attn_linear", "attn_matmul", "matmul", "bmm"):
+                op_family = _operator_family_from_op_type(score_family)
+            else:
+                op_family = _operator_family_from_target_kind(t.get("kind", kind))
 
             if _is_sz:
-                layer_logger.log_static_zero(layer_name=name, input_shape=ishape)
+                layer_logger.log_from_diag(
+                    layer_name=name,
+                    diag=gd,
+                    mode_used="staticzero",
+                    replaced=True,
+                    operator_family=op_family,
+                    operator_type=t.get("kind", kind),
+                    dispatch_decision=dec.backend if dec is not None else "staticzero",
+                    reason_code=getattr(dec, "reason_code", "exact_zero") if dec is not None else "exact_zero",
+                    support_status=getattr(dec, "support_status", "exact_zero_shortcut") if dec is not None else "exact_zero_shortcut",
+                    meta_source=getattr(dec, "meta_source", "shortcut") if dec is not None else "shortcut",
+                    diag_source=getattr(dec, "diag_source", "shortcut") if dec is not None else "shortcut",
+                    tile_source=getattr(dec, "tile_source", "unknown") if dec is not None else "unknown",
+                    score_family=getattr(dec, "score_family", op_family) if dec is not None else op_family,
+                    fallback_reason=getattr(dec, "fallback_reason", "exact_zero_shortcut") if dec is not None else "exact_zero_shortcut",
+                    decision_confidence=float(getattr(dec, "confidence", 1.0)) if dec is not None else 1.0,
+                )
             elif _is_dk:
-                layer_logger.log_dense(layer_name=name, input_shape=ishape, element_sparsity=elem_sp)
+                gd_local = dict(gd)
+                gd_local.setdefault("element_sparsity", elem_sp)
+                gd_local.setdefault("backend", "dense")
+                layer_logger.log_from_diag(
+                    layer_name=name,
+                    diag=gd_local,
+                    mode_used="densekeep",
+                    replaced=False,
+                    operator_family=op_family,
+                    operator_type=t.get("kind", kind),
+                    dispatch_decision=dec.backend if dec is not None else "dense",
+                    reason_code=getattr(dec, "reason_code", "dense_keep") if dec is not None else "dense_keep",
+                    support_status=getattr(dec, "support_status", "supported") if dec is not None else "supported",
+                    meta_source=getattr(dec, "meta_source", "measured") if dec is not None else "measured",
+                    diag_source=getattr(dec, "diag_source", "measured") if dec is not None else "measured",
+                    tile_source=getattr(dec, "tile_source", "unknown") if dec is not None else "unknown",
+                    score_family=getattr(dec, "score_family", op_family) if dec is not None else op_family,
+                    fallback_reason=getattr(dec, "fallback_reason", "") if dec is not None else "",
+                    decision_confidence=float(getattr(dec, "confidence", -1.0)) if dec is not None else -1.0,
+                )
             else:
                 _has_diag = gd.get('active_group_ratio', -1) >= 0
-                layer_logger.log_layer(
-                    layer_name=name, mode_used="sparsekernel", replaced=True,
-                    sparse_path_executed=_has_diag,
-                    input_shape=str(ishape) if ishape else "",
-                    element_sparsity=elem_sp,
-                    nonzero_group_count=gd.get('nonzero_group_count', -1.0),
-                    total_group_count=gd.get('total_group_count', -1.0),
-                    active_group_ratio=gd.get('active_group_ratio', -1.0),
-                    tile_zero_count=gd.get('tile_zero_count', -1.0),
-                    total_tile_count=gd.get('total_tile_count', -1.0),
-                    tile_zero_ratio=gd.get('tile_zero_ratio', -1.0),
-                    effective_k_ratio=gd.get('effective_k_ratio', -1.0),
-                    sparse_compute_ms=gd.get('sparse_compute_ms', -1.0),
-                    sparse_total_ms=gd.get('sparse_total_ms', -1.0))
+                gd_local = dict(gd)
+                gd_local.setdefault("sparse_path_executed", _has_diag)
+                gd_local.setdefault("element_sparsity", elem_sp)
+                layer_logger.log_from_diag(
+                    layer_name=name,
+                    diag=gd_local,
+                    mode_used="sparsekernel",
+                    replaced=True,
+                    operator_family=op_family,
+                    operator_type=t.get("kind", kind),
+                    dispatch_decision=dec.backend if dec is not None else "sparse",
+                    reason_code=getattr(dec, "reason_code", "") if dec is not None else "",
+                    support_status=getattr(dec, "support_status", "supported") if dec is not None else "supported",
+                    meta_source=getattr(dec, "meta_source", "measured") if dec is not None else "measured",
+                    diag_source=getattr(dec, "diag_source", "measured") if dec is not None else "measured",
+                    tile_source=getattr(dec, "tile_source", "unknown") if dec is not None else "unknown",
+                    score_family=getattr(dec, "score_family", op_family) if dec is not None else op_family,
+                    fallback_reason=getattr(dec, "fallback_reason", "") if dec is not None else "",
+                    decision_confidence=float(getattr(dec, "confidence", -1.0)) if dec is not None else -1.0,
+                )
         if args.diag_json:
             layer_logger.save_json(args.diag_json)
             print(f"  Diagnostic JSON: {args.diag_json}")
@@ -2417,6 +2767,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
