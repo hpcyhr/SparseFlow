@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Optional, Sequence
 
 import torch
+import torch.nn.functional as F
 
 from Utils.config import PRESCAN_ACTIVITY_EPS, SPARSE_DENSE_RATIO_THRESHOLD
 from Kernels.grouped_conv2d import sparse_grouped_conv2d_forward
@@ -47,6 +48,59 @@ def sparse_depthwise_conv2d_forward(
         raise ValueError("depthwise_conv2d requires weight shape [C,1,KH,KW] with C == x.shape[1]")
 
     kernel_size = (int(weight.shape[2]), int(weight.shape[3]))
+    use_sparse_path = any(
+        v is not None for v in (w_cl_groups, ag_mask_bufs, tile_class_bufs, active_tile_ids_bufs)
+    )
+
+    def _finalize_return(y, ms, avg_active_ratio_val=None, tile_stats_val=None, backend_meta_val=None):
+        ret = (y, ms)
+        if return_avg_active_ratio:
+            ret = ret + (avg_active_ratio_val,)
+        if return_tile_stats:
+            ret = ret + (tile_stats_val,)
+        if return_backend_meta:
+            ret = ret + (backend_meta_val,)
+        return ret
+
+    if not use_sparse_path:
+        dense_ms = 0.0
+        if return_ms:
+            se = torch.cuda.Event(enable_timing=True)
+            ee = torch.cuda.Event(enable_timing=True)
+            se.record()
+
+        y = F.conv2d(
+            x.float(),
+            weight.float(),
+            bias.float() if bias is not None else None,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=channels,
+        ).float()
+
+        if return_ms:
+            ee.record()
+            torch.cuda.synchronize(x.device)
+            dense_ms = se.elapsed_time(ee)
+
+        backend_meta = {
+            "backend": "dense_fallback",
+            "reason": "depthwise_direct_reference_path",
+        }
+        avg_ratio = 1.0 if return_avg_active_ratio else None
+        return _finalize_return(y, dense_ms, avg_ratio, None, backend_meta)
+
+    if w_cl_groups is None:
+        built_layouts = []
+        for c in range(channels):
+            w_c = weight[c:c + 1, :, :, :].contiguous()
+            if kernel_size == (3, 3):
+                built_layouts.append(w_c.half().permute(0, 2, 3, 1).contiguous())
+            else:
+                built_layouts.append(w_c.half().reshape(1, 1).contiguous())
+        w_cl_groups = built_layouts
+
     return sparse_grouped_conv2d_forward(
         x=x,
         weight=weight,
