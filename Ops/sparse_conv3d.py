@@ -34,6 +34,8 @@ class SparseConv3d(nn.Module):
         bias: bool = True,
         groups: int = 1,
         threshold: float = 1e-6,
+        fallback_ratio: float = 0.85,
+        launch_all_tiles: bool = False,
         return_ms: bool = False,
     ):
         super().__init__()
@@ -47,6 +49,8 @@ class SparseConv3d(nn.Module):
         self.padding = (pa, pa, pa)
         self.groups = int(groups)
         self.threshold = float(threshold)
+        self.fallback_ratio = float(fallback_ratio)
+        self.launch_all_tiles = bool(launch_all_tiles)
         self.return_ms = bool(return_ms)
 
         self.weight = nn.Parameter(torch.empty(out_channels, in_channels // groups, ks, ks, ks))
@@ -140,6 +144,8 @@ class SparseConv3d(nn.Module):
             stride=self.stride[0],
             padding=self.padding[0],
             threshold=self.threshold,
+            fallback_ratio=self.fallback_ratio,
+            launch_all_tiles=self.launch_all_tiles,
             return_ms=self.return_ms,
             return_tile_stats=self.collect_diag,
             return_backend_meta=True,
@@ -191,5 +197,6 @@ class SparseConv3d(nn.Module):
         return (
             f"{self.in_channels}, {self.out_channels}, kernel_size={self.kernel_size}, "
             f"stride={self.stride}, padding={self.padding}, groups={self.groups}, "
-            f"threshold={self.threshold}, diag_path={self.diag_path}"
+            f"threshold={self.threshold}, fallback_ratio={self.fallback_ratio}, "
+            f"launch_all_tiles={self.launch_all_tiles}, diag_path={self.diag_path}"
         )

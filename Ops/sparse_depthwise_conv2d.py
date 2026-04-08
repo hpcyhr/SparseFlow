@@ -1,32 +1,26 @@
 """
-SparseFlow Ops/sparse_depthwise_conv2d.py 鈥?SparseDepthwiseConv2d Module
+SparseFlow Ops/sparse_depthwise_conv2d.py
 
-Wraps Kernels/depthwise_conv2d.py. Handles groups=C_in depthwise convolution
-with per-channel-per-tile zero-skip.
-
-Follows SparseConv2d conventions: from_dense(), 5D input support, fallback.
+Depthwise Conv2d is implemented as the special case of SparseGroupedConv2d
+with groups == in_channels == out_channels.
 """
+
+from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Dict, Any, Optional
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+from Utils.config import PRESCAN_ACTIVITY_EPS, SPARSE_DENSE_RATIO_THRESHOLD
+from Ops.sparse_grouped_conv2d import SparseGroupedConv2d
 
 
-class SparseDepthwiseConv2d(nn.Module):
-    """
-    Sparse depthwise Conv2d (groups=C_in).
-
-    Skips computation for (channel, spatial-tile) pairs where input is zero.
-    """
-
+class SparseDepthwiseConv2d(SparseGroupedConv2d):
     def __init__(
         self,
         in_channels: int,
@@ -34,63 +28,49 @@ class SparseDepthwiseConv2d(nn.Module):
         stride: int = 1,
         padding: int = 1,
         bias: bool = True,
-        threshold: float = 1e-6,
+        dilation: int = 1,
+        threshold: float = PRESCAN_ACTIVITY_EPS,
+        fallback_ratio: float = SPARSE_DENSE_RATIO_THRESHOLD,
+        launch_all_tiles: bool = False,
         return_ms: bool = False,
     ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = in_channels  # depthwise: C_out == C_in
-        self.kernel_size = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
-        self.stride = (stride, stride) if isinstance(stride, int) else stride
-        self.padding = (padding, padding) if isinstance(padding, int) else padding
-        self.groups = in_channels
-        self.threshold = threshold
-        self.return_ms = return_ms
-
-        # Weight: [C, 1, KH, KW]
-        self.weight = nn.Parameter(torch.empty(in_channels, 1, self.kernel_size[0], self.kernel_size[1]))
-        if bias:
-            self.bias = nn.Parameter(torch.empty(in_channels))
-        else:
-            self.register_parameter("bias", None)
-
-        nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
-
-        self._triton_available = False
-        try:
-            import triton  # noqa: F401
-            self._triton_available = True
-        except Exception:
-            pass
-
-        self._last_sparse_ms = 0.0
-        self._last_diag: Dict[str, Any] = {}
-        self.collect_diag = False
-        self.profile_runtime = False
-        self._inference_mode = False
-
-        # Unified observability fields
-        self.backend_family = "sparse_kernel"
-        self.diag_path = "depthwise_conv2d"
-        self.fallback_reason = ""
-        self.meta_source = "measured"
-        self.diag_source = "measured"
-        self.support_status = "supported"
-        self.score_family = "conv"
+        super().__init__(
+            in_channels=in_channels,
+            out_channels=in_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            bias=bias,
+            groups=in_channels,
+            dilation=dilation,
+            threshold=threshold,
+            fallback_ratio=fallback_ratio,
+            launch_all_tiles=launch_all_tiles,
+            return_ms=return_ms,
+        )
+        self._sparse_backend_family = "sparse_depthwise_conv2d"
+        self._sparse_diag_path = "depthwise_conv2d_sparse"
+        self.backend_family = self._sparse_backend_family
+        self.diag_path = self._sparse_diag_path
 
     @classmethod
-    def from_dense(cls, conv: nn.Conv2d, threshold: float = 1e-6, return_ms: bool = False, **kwargs):
-        """Create from an existing nn.Conv2d with groups=C_in."""
-        assert conv.groups == conv.in_channels, \
-            f"from_dense requires depthwise conv (groups={conv.groups} != in_channels={conv.in_channels})"
-
+    def from_dense(
+        cls,
+        conv: nn.Conv2d,
+        threshold: float = PRESCAN_ACTIVITY_EPS,
+        return_ms: bool = False,
+        **kwargs,
+    ):
+        assert conv.groups == conv.in_channels == conv.out_channels, (
+            "from_dense requires depthwise conv with "
+            "groups == in_channels == out_channels"
+        )
         sparse = cls(
             in_channels=conv.in_channels,
-            kernel_size=conv.kernel_size[0],
-            stride=conv.stride[0],
-            padding=conv.padding[0],
+            kernel_size=conv.kernel_size,
+            stride=conv.stride,
+            padding=conv.padding,
+            dilation=conv.dilation,
             bias=conv.bias is not None,
             threshold=threshold,
             return_ms=return_ms,
@@ -102,67 +82,10 @@ class SparseDepthwiseConv2d(nn.Module):
             sparse.bias.data.copy_(conv.bias.data)
         return sparse
 
-    def set_inference_mode(self, enabled: bool):
-        self._inference_mode = bool(enabled)
-        if enabled:
-            self.collect_diag = False
-            self.profile_runtime = False
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Handle 5D [T, N, C, H, W] input
-        if x.ndim == 5:
-            T, N, C, H, W = x.shape
-            x_4d = x.reshape(T * N, C, H, W)
-            y_4d = self._forward_4d(x_4d)
-            return y_4d.reshape(T, N, self.out_channels, y_4d.shape[2], y_4d.shape[3])
-        return self._forward_4d(x)
-
-    def _forward_4d(self, x: torch.Tensor) -> torch.Tensor:
-        self._last_diag = {}
-        self.fallback_reason = ""
-        if not self._triton_available or not x.is_cuda:
-            self.fallback_reason = "no_triton_or_not_cuda"
-            self.diag_source = "missing"
-            return self._fallback(x)
-
-        from Kernels.depthwise_conv2d import sparse_depthwise_conv2d_forward
-
-        result = sparse_depthwise_conv2d_forward(
-            x=x,
-            weight=self.weight,
-            bias=self.bias,
-            stride=self.stride[0],
-            padding=self.padding[0],
-            threshold=self.threshold,
-            return_ms=self.return_ms,
-            return_tile_stats=self.collect_diag,
-        )
-
-        y = result[0]
-        self._last_sparse_ms = result[1]
-        self.diag_source = "measured" if self.collect_diag else "missing"
-
-        if self.collect_diag and len(result) > 2:
-            self._last_diag = result[2] if result[2] is not None else {}
-            self._last_diag.setdefault("backend_family", self.backend_family)
-            self._last_diag.setdefault("diag_path", self.diag_path)
-            self._last_diag.setdefault("fallback_reason", self.fallback_reason)
-
-        return y
-
-    def _fallback(self, x):
-        return F.conv2d(
-            x.float(),
-            self.weight.float(),
-            self.bias.float() if self.bias is not None else None,
-            self.stride,
-            self.padding,
-            groups=self.groups,
-        ).float()
-
     def extra_repr(self):
         return (
             f"{self.in_channels}, kernel_size={self.kernel_size}, "
             f"stride={self.stride}, padding={self.padding}, "
-            f"depthwise=True, threshold={self.threshold}"
+            f"depthwise=True, threshold={self.threshold}, "
+            f"fallback_ratio={self.fallback_ratio}, launch_all_tiles={self.launch_all_tiles}"
         )

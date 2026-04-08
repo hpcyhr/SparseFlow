@@ -12,6 +12,7 @@ if _PROJECT_ROOT not in sys.path:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from Utils.config import PRESCAN_ACTIVITY_EPS, SPARSE_DENSE_RATIO_THRESHOLD
 
 
 @dataclass
@@ -47,7 +48,8 @@ class SparseLinear(nn.Module):
 
     Mirrors SparseConv2d style:
       - grouped bitmask metadata
-      - three-stage prescan
+      - metadata-first prescan / tile classification
+      - active-only or all-tiles launch
       - optional runtime profiling
       - EMA-based dense fallback / zero promotion
       - inference_mode to disable periodic calibration syncs
@@ -59,9 +61,11 @@ class SparseLinear(nn.Module):
         in_features: int,
         out_features: int,
         bias: bool = True,
-        threshold: float = 1e-6,
+        threshold: float = PRESCAN_ACTIVITY_EPS,
         return_ms: bool = False,
-        dense_threshold: float = 0.85,
+        dense_threshold: float = SPARSE_DENSE_RATIO_THRESHOLD,
+        fallback_ratio: float = SPARSE_DENSE_RATIO_THRESHOLD,
+        launch_all_tiles: bool = False,
         warmup_steps: int = 8,
         calib_every: int = 32,
         ema_decay: float = 0.9,
@@ -73,6 +77,8 @@ class SparseLinear(nn.Module):
         self.out_features = int(out_features)
         self.threshold = float(threshold)
         self.return_ms = bool(return_ms)
+        self.fallback_ratio = float(fallback_ratio)
+        self.launch_all_tiles = bool(launch_all_tiles)
 
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         if bias:
@@ -101,6 +107,7 @@ class SparseLinear(nn.Module):
         self._w_t_version = -1
         self._ag_mask_buf = None
         self._tile_class_buf = None
+        self._active_tile_ids_buf = None
 
         # policy state
         self._warmup_left = int(max(0, warmup_steps))
@@ -120,21 +127,25 @@ class SparseLinear(nn.Module):
         self._last_diag: Dict[str, Any] = {}
         self.profile_runtime = bool(profile_runtime)
         self._profile = _ProfileStats()
-        self.backend_family = "sparse_kernel"
-        self.diag_path = "linear_three_stage"
+        # Standardized observability contract
+        self.backend_family = "sparse_linear"
+        self.diag_path = "runtime"
         self.fallback_reason = ""
         self.meta_source = "measured"
         self.diag_source = "measured"
         self.support_status = "supported"
         self.score_family = "linear"
-        self._runtime_dispatch_seen = 0
-        self._runtime_dispatch_mismatch = 0
+        self._runtime_dispatch_calls = 0
+        self._runtime_dispatch_disagree = 0
+        self._runtime_last_expected = ""
+        self._runtime_last_backend = ""
+        self._runtime_last_disagree = False
 
     @classmethod
     def from_dense(
         cls,
         linear: nn.Linear,
-        threshold: float = 1e-6,
+        threshold: float = PRESCAN_ACTIVITY_EPS,
         return_ms: bool = False,
         **kwargs,
     ) -> "SparseLinear":
@@ -161,21 +172,6 @@ class SparseLinear(nn.Module):
         if enabled:
             self.collect_diag = False
             self.profile_runtime = False
-
-    def _record_runtime_dispatch(self, runtime_backend: str):
-        expected = str(
-            getattr(
-                self,
-                "sf_dispatch_decision",
-                getattr(self, "sf_backend_mode", ""),
-            )
-        ).strip().lower()
-        if not expected:
-            return
-        runtime = runtime_backend.strip().lower()
-        self._runtime_dispatch_seen += 1
-        if expected != runtime:
-            self._runtime_dispatch_mismatch += 1
 
     def get_profile_summary(self) -> str:
         p = self._profile
@@ -285,7 +281,14 @@ class SparseLinear(nn.Module):
         ):
             self._tile_class_buf = torch.empty(n_tiles, dtype=torch.int32, device=x2d.device)
 
-        return self._ag_mask_buf, self._tile_class_buf
+        if (
+            self._active_tile_ids_buf is None
+            or self._active_tile_ids_buf.numel() < n_tiles
+            or self._active_tile_ids_buf.device != x2d.device
+        ):
+            self._active_tile_ids_buf = torch.empty(n_tiles, dtype=torch.int32, device=x2d.device)
+
+        return self._ag_mask_buf, self._tile_class_buf, self._active_tile_ids_buf
 
     def _zero_output_2d(self, x2d: torch.Tensor) -> torch.Tensor:
         y = torch.zeros(
@@ -338,17 +341,36 @@ class SparseLinear(nn.Module):
         else:
             self._force_dense = False
 
+    def _record_runtime_dispatch(self, runtime_backend: str):
+        expected = str(getattr(self, "sf_dispatch_decision", getattr(self, "sf_backend_mode", "")))
+        self._runtime_dispatch_calls += 1
+        self._runtime_last_expected = expected
+        self._runtime_last_backend = runtime_backend
+        disagree = bool(expected) and expected != runtime_backend
+        self._runtime_last_disagree = disagree
+        if disagree:
+            self._runtime_dispatch_disagree += 1
+        return expected, disagree
+
     # ------------------------------------------------------------------
     # forward
     # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        self.fallback_reason = ""
         if self.profile_runtime:
             self._profile.calls += 1
             t_total = self._stamp()
 
         if self.collect_diag:
-            self._last_diag = {"sparse_path_executed": False}
+            self._last_diag = {
+                "sparse_path_executed": False,
+                "backend_family": self.backend_family,
+                "diag_path": self.diag_path,
+                "fallback_reason": self.fallback_reason,
+                "meta_source": self.meta_source,
+                "diag_source": self.diag_source,
+                "support_status": self.support_status,
+                "score_family": self.score_family,
+            }
 
         if self.profile_runtime:
             t0 = self._stamp()
@@ -360,14 +382,32 @@ class SparseLinear(nn.Module):
 
         if self._force_zero:
             y2d = self._zero_output_2d(x2d)
-            self._record_runtime_dispatch("staticzero")
-            self.fallback_reason = "force_zero"
+            self.backend_family = "exact_zero"
+            self.diag_path = "zero_force"
+            self.fallback_reason = "force_zero_policy"
+            expected_backend, disagree = self._record_runtime_dispatch("staticzero")
             if self.profile_runtime:
                 self._profile.zero_path_hits += 1
                 self._profile.last_path = "zero(force)"
                 total_ms = self._elapsed_ms(t_total)
                 self._profile_add("total_ms", total_ms)
                 self._profile_set_last("last_total_ms", total_ms)
+            if self.collect_diag:
+                self._last_diag.update({
+                    "backend": "staticzero",
+                    "backend_family": self.backend_family,
+                    "diag_path": self.diag_path,
+                    "fallback_reason": self.fallback_reason,
+                    "egd_dispatch_decision": expected_backend,
+                    "runtime_backend_decision": "staticzero",
+                    "egd_runtime_disagree": bool(disagree),
+                    "egd_runtime_disagree_count": int(self._runtime_dispatch_disagree),
+                    "egd_runtime_calls": int(self._runtime_dispatch_calls),
+                    "egd_runtime_disagree_rate": (
+                        float(self._runtime_dispatch_disagree) / max(float(self._runtime_dispatch_calls), 1.0)
+                    ),
+                    "runtime_total_ms": self._profile.last_total_ms if self.profile_runtime else -1.0,
+                })
             return self._restore_output(y2d, restore_meta)
 
         use_triton = self._supports_triton() and x2d.is_cuda
@@ -390,26 +430,25 @@ class SparseLinear(nn.Module):
             )
             if backend_kind == "dense_fallback":
                 path = "dense(fallback)"
-                self._record_runtime_dispatch("dense")
-                self.fallback_reason = "kernel_dense_fallback"
+                runtime_backend = "dense"
                 if self.profile_runtime:
                     self._profile.dense_path_hits += 1
             elif backend_kind == "zero_tiles_only":
                 path = "zero(tile_compaction)"
-                self._record_runtime_dispatch("staticzero")
+                runtime_backend = "staticzero"
                 if self.profile_runtime:
                     self._profile.zero_path_hits += 1
             else:
                 path = "sparse"
-                self._record_runtime_dispatch("sparse")
+                runtime_backend = "sparse"
                 if self.profile_runtime:
                     self._profile.sparse_path_hits += 1
         else:
             y2d = self._fallback_forward(x2d)
             avg_active_ratio = None
             path = "dense"
-            self._record_runtime_dispatch("dense")
-            self.fallback_reason = "module_dense_path"
+            runtime_backend = "dense"
+            self.fallback_reason = "dense_runtime_or_policy"
             if self.profile_runtime:
                 self._profile.dense_path_hits += 1
 
@@ -427,8 +466,23 @@ class SparseLinear(nn.Module):
         if self._force_zero and avg_active_ratio == 0.0:
             y2d = self._zero_output_2d(x2d)
             path = "zero(promoted)"
-            self._record_runtime_dispatch("staticzero")
-            self.fallback_reason = "zero_promoted"
+            self.backend_family = "exact_zero"
+            self.diag_path = "zero_promoted"
+            self.fallback_reason = "zero_promoted_policy"
+            runtime_backend = "staticzero"
+
+        expected_backend, disagree = self._record_runtime_dispatch(runtime_backend)
+        if self.collect_diag:
+            self._last_diag.update({
+                "egd_dispatch_decision": expected_backend,
+                "runtime_backend_decision": runtime_backend,
+                "egd_runtime_disagree": bool(disagree),
+                "egd_runtime_disagree_count": int(self._runtime_dispatch_disagree),
+                "egd_runtime_calls": int(self._runtime_dispatch_calls),
+                "egd_runtime_disagree_rate": (
+                    float(self._runtime_dispatch_disagree) / max(float(self._runtime_dispatch_calls), 1.0)
+                ),
+            })
 
         if self.profile_runtime:
             t0 = self._stamp()
@@ -441,10 +495,6 @@ class SparseLinear(nn.Module):
             total_ms = self._elapsed_ms(t_total)
             self._profile_add("total_ms", total_ms)
             self._profile_set_last("last_total_ms", total_ms)
-        if self.collect_diag:
-            self._last_diag["runtime_dispatch_seen"] = int(self._runtime_dispatch_seen)
-            self._last_diag["runtime_dispatch_mismatch"] = int(self._runtime_dispatch_mismatch)
-            self._last_diag["fallback_reason"] = str(self.fallback_reason)
         return y
 
     # ------------------------------------------------------------------
@@ -461,7 +511,7 @@ class SparseLinear(nn.Module):
             t0 = self._stamp()
 
         w_t = self._get_w_t()
-        ag_mask_buf, tile_class_buf = self._ensure_buffers(x2d)
+        ag_mask_buf, tile_class_buf, active_tile_ids_buf = self._ensure_buffers(x2d)
         x_f16 = x2d if (x2d.dtype == torch.float16 and x2d.is_contiguous()) else x2d.half().contiguous()
 
         if self.profile_runtime:
@@ -482,10 +532,13 @@ class SparseLinear(nn.Module):
                 w_t=w_t,
                 ag_mask_buf=ag_mask_buf,
                 tile_class_buf=tile_class_buf,
+                active_tile_ids_buf=active_tile_ids_buf,
                 return_ms=self.return_ms,
+                fallback_ratio=self.fallback_ratio,
                 return_avg_active_ratio=want_ratio,
                 return_tile_stats=want_tiles,
                 return_backend_meta=True,
+                launch_all_tiles=self.launch_all_tiles,
             )
         except Exception as err:
             # Robust fallback for Triton compile/autotune/runtime failures.
@@ -495,17 +548,20 @@ class SparseLinear(nn.Module):
                     f"error={type(err).__name__}: {err}"
                 )
                 self._warned_triton_runtime_error = True
+            self.backend_family = "dense_torch"
+            self.diag_path = "dense_fallback"
+            self.fallback_reason = "triton_runtime_error"
             y2d = self._fallback_forward(x2d)
             if self.collect_diag:
                 self._last_diag = {
                     "sparse_path_executed": False,
                     "backend": "dense_fallback",
+                    "backend_family": self.backend_family,
+                    "diag_path": self.diag_path,
+                    "fallback_reason": self.fallback_reason,
                     "backend_reason": "triton_runtime_error",
                     "error_type": type(err).__name__,
                     "error_msg": str(err),
-                    "backend_family": self.backend_family,
-                    "diag_path": self.diag_path,
-                    "fallback_reason": "triton_runtime_error",
                 }
             return y2d, None, "dense_fallback"
 
@@ -535,17 +591,34 @@ class SparseLinear(nn.Module):
         }
 
         backend_kind = backend_meta.get("backend", "sparse_triton") if backend_meta else "sparse_triton"
+        backend_reason = backend_meta.get("reason", "") if backend_meta else ""
 
         if backend_kind == "dense_fallback":
             self._last_sparse_ms = 0.0
             self._last_dense_ms = float(sparse_ms)
+            self.backend_family = "dense_torch"
+            self.diag_path = "dense_fallback"
+            self.fallback_reason = backend_reason or "dense_fallback"
             if self.profile_runtime:
                 self._profile_add("dense_fallback_ms", self._last_dense_ms)
                 self._profile_set_last("last_dense_fallback_ms", self._last_dense_ms)
                 self._profile_set_last("last_sparse_kernel_ms", 0.0)
+        elif backend_kind == "zero_tiles_only":
+            self._last_sparse_ms = float(sparse_ms)
+            self._last_dense_ms = 0.0
+            self.backend_family = "exact_zero"
+            self.diag_path = "zero_tiles_only"
+            self.fallback_reason = backend_reason or "zero_tiles_only"
+            if self.profile_runtime:
+                self._profile_add("sparse_kernel_ms", self._last_sparse_ms)
+                self._profile_set_last("last_sparse_kernel_ms", self._last_sparse_ms)
+                self._profile_set_last("last_dense_fallback_ms", 0.0)
         else:
             self._last_sparse_ms = float(sparse_ms)
             self._last_dense_ms = 0.0
+            self.backend_family = "sparse_linear"
+            self.diag_path = "sparse_kernel"
+            self.fallback_reason = ""
             if self.profile_runtime:
                 self._profile_add("sparse_kernel_ms", self._last_sparse_ms)
                 self._profile_set_last("last_sparse_kernel_ms", self._last_sparse_ms)
@@ -578,13 +651,13 @@ class SparseLinear(nn.Module):
         Only called when collect_diag is True.
         May introduce GPU->CPU syncs, so do not enable during perf timing.
         """
-        from Kernels.linear import (
-            _select_linear_block_m,
-            choose_group_size,
-            _popcount_buf,
+        from Kernels.linear import _select_linear_block_m
+        from Utils.sparse_helpers import (
             TILE_ZERO,
             TILE_SPARSE,
             TILE_DENSEISH,
+            choose_group_size,
+            popcount_buf,
         )
         import triton
 
@@ -604,14 +677,33 @@ class SparseLinear(nn.Module):
             st = int((tc == TILE_SPARSE).sum().item())
             dt = int((tc == TILE_DENSEISH).sum().item())
 
-        pc = _popcount_buf(ag_mask_buf, n_tiles)
+        pc = popcount_buf(ag_mask_buf, n_tiles)
         total_g = float(n_tiles * num_groups)
         active_g = float(pc.sum().item())
         agr = active_g / max(total_g, 1.0)
 
+        prescan_mode = "three_stage_grouped_linear_v4"
+        if tile_stats is not None and "prescan_mode" in tile_stats:
+            prescan_mode = str(tile_stats["prescan_mode"])
+
         self._last_diag = {
             "sparse_path_executed": True,
-            "metadata_kind": "three_stage_grouped_linear_v3",
+            "metadata_kind": "metadata_first_linear_v1",
+            "backend_family": self.backend_family,
+            "diag_path": self.diag_path,
+            "fallback_reason": self.fallback_reason,
+            "egd_dispatch_decision": self._runtime_last_expected,
+            "runtime_backend_decision": self._runtime_last_backend,
+            "egd_runtime_disagree": bool(self._runtime_last_disagree),
+            "egd_runtime_disagree_count": int(self._runtime_dispatch_disagree),
+            "egd_runtime_calls": int(self._runtime_dispatch_calls),
+            "egd_runtime_disagree_rate": (
+                float(self._runtime_dispatch_disagree) / max(float(self._runtime_dispatch_calls), 1.0)
+            ),
+            "meta_source": self.meta_source,
+            "diag_source": self.diag_source,
+            "support_status": self.support_status,
+            "score_family": self.score_family,
             "group_size": group_size,
             "num_groups": int(num_groups),
             "nonzero_group_count": active_g,
@@ -623,11 +715,12 @@ class SparseLinear(nn.Module):
             "effective_k_ratio": agr,
             "sparse_compute_ms": float(sparse_ms),
             "sparse_total_ms": float(sparse_ms),
+            "dense_fallback_ms": self._last_dense_ms if self._last_dense_ms > 0 else -1.0,
             "avg_active_ratio": float(avg_active_ratio) if avg_active_ratio is not None else -1.0,
             "zero_tiles": int(zt),
             "sparse_tiles": int(st),
             "denseish_tiles": int(dt),
-            "prescan_mode": "three_stage_grouped_linear_v3",
+            "prescan_mode": prescan_mode,
             "kernel_type": "linear",
             "block_m": int(block_m),
         }
@@ -635,9 +728,9 @@ class SparseLinear(nn.Module):
         if backend_meta is not None:
             self._last_diag["backend"] = backend_meta.get("backend", "unknown")
             self._last_diag["backend_reason"] = backend_meta.get("reason", "unknown")
-        self._last_diag["backend_family"] = self.backend_family
-        self._last_diag["diag_path"] = self.diag_path
-        self._last_diag["fallback_reason"] = self.fallback_reason
+            for key in ("launch_mode", "launch_count", "active_tiles", "total_tiles"):
+                if key in backend_meta:
+                    self._last_diag[key] = backend_meta[key]
 
         if tile_stats is not None:
             for key in (
@@ -660,6 +753,10 @@ class SparseLinear(nn.Module):
         # match SparseConv2d: fallback uses float path
         y = F.linear(x2d.float(), self.weight.float(), self.bias.float() if self.bias is not None else None).float()
         self._last_sparse_ms = 0.0
+        self.backend_family = "dense_torch"
+        self.diag_path = "dense_fallback"
+        if not self.fallback_reason:
+            self.fallback_reason = "dense_fallback"
 
         if self.profile_runtime:
             self._last_dense_ms = self._elapsed_ms(t0)
@@ -668,13 +765,54 @@ class SparseLinear(nn.Module):
             self._profile_set_last("last_sparse_kernel_ms", 0.0)
         else:
             self._last_dense_ms = 0.0
+        if self.collect_diag:
+            self._last_diag.update({
+                "backend": "dense_fallback",
+                "backend_family": self.backend_family,
+                "diag_path": self.diag_path,
+                "fallback_reason": self.fallback_reason,
+                "egd_dispatch_decision": self._runtime_last_expected,
+                "runtime_backend_decision": self._runtime_last_backend or "dense",
+                "egd_runtime_disagree": bool(self._runtime_last_disagree),
+                "egd_runtime_disagree_count": int(self._runtime_dispatch_disagree),
+                "egd_runtime_calls": int(self._runtime_dispatch_calls),
+                "egd_runtime_disagree_rate": (
+                    float(self._runtime_dispatch_disagree) / max(float(self._runtime_dispatch_calls), 1.0)
+                ),
+                "dense_fallback_ms": self._last_dense_ms,
+                "sparse_path_executed": False,
+            })
 
         return y
+
+    def get_diag(self) -> Dict[str, Any]:
+        """Return standardized per-layer diagnostics from the latest forward."""
+        diag = dict(self._last_diag or {})
+        diag.setdefault("backend_family", self.backend_family)
+        diag.setdefault("diag_path", self.diag_path)
+        diag.setdefault("fallback_reason", self.fallback_reason)
+        diag.setdefault("meta_source", self.meta_source)
+        diag.setdefault("diag_source", self.diag_source)
+        diag.setdefault("support_status", self.support_status)
+        diag.setdefault("score_family", self.score_family)
+        diag.setdefault("sparse_total_ms", float(self._last_sparse_ms))
+        diag.setdefault("dense_fallback_ms", float(self._last_dense_ms))
+        diag.setdefault("egd_dispatch_decision", self._runtime_last_expected)
+        diag.setdefault("runtime_backend_decision", self._runtime_last_backend)
+        diag.setdefault("egd_runtime_disagree", bool(self._runtime_last_disagree))
+        diag.setdefault("egd_runtime_disagree_count", int(self._runtime_dispatch_disagree))
+        diag.setdefault("egd_runtime_calls", int(self._runtime_dispatch_calls))
+        diag.setdefault(
+            "egd_runtime_disagree_rate",
+            float(self._runtime_dispatch_disagree) / max(float(self._runtime_dispatch_calls), 1.0),
+        )
+        return diag
 
     def extra_repr(self) -> str:
         return (
             f"{self.in_features}, {self.out_features}, bias={self.bias is not None}, "
             f"sparse=True, dense_threshold={self._dense_threshold}, "
+            f"fallback_ratio={self.fallback_ratio}, launch_all_tiles={self.launch_all_tiles}, "
             f"warmup_left={self._warmup_left}, calib_every={self._calib_every}, "
             f"profile_runtime={self.profile_runtime}, inference_mode={self._inference_mode}"
         )
