@@ -9,6 +9,7 @@ Changes from v16.4:
 """
 
 import torch
+import warnings
 import triton
 import triton.language as tl
 from triton import autotune, Config
@@ -51,6 +52,7 @@ def _make_fused_configs(bh, bw):
 
 _FC_8x8 = _make_fused_configs(8, 8)
 _FC_8x16 = _make_fused_configs(8, 16)
+_LEGACY_ARGS_WARNED = False
 
 
 # ===================================================================
@@ -317,19 +319,29 @@ def sparse_fused_conv_lif_forward(
     kernel_size=3,
     threshold=1e-6,
     w_cl=None,
-    # Legacy params (kept for call-site compat, ignored)
-    counts_buf=None,
-    tile_cin_buf=None,
-    group_flags_buf=None,
-    ag_count_buf=None,
-    ag_list_buf=None,
     # New bitmask buffer
     ag_mask_buf=None,
     return_ms=False,
     fallback_ratio=FALLBACK_RATIO,
     return_avg_active_ratio=False,
+    **legacy_kwargs,
 ):
+    global _LEGACY_ARGS_WARNED
     import torch.nn.functional as Fn
+
+    if legacy_kwargs:
+        # Backward compatibility shim for old call sites.
+        # Supported old key for buffer reuse: ag_count_buf -> ag_mask_buf.
+        legacy_ag_count_buf = legacy_kwargs.get("ag_count_buf", None)
+        if ag_mask_buf is None and legacy_ag_count_buf is not None:
+            ag_mask_buf = legacy_ag_count_buf
+        if not _LEGACY_ARGS_WARNED:
+            warnings.warn(
+                "[SparseFlow] sparse_fused_conv_lif_forward legacy arguments are deprecated and ignored. "
+                "Please pass ag_mask_buf only.",
+                UserWarning,
+            )
+            _LEGACY_ARGS_WARNED = True
 
     N, C_IN, H, W = x.shape
     C_OUT = weight.shape[0]
@@ -375,12 +387,8 @@ def sparse_fused_conv_lif_forward(
 
     x_f16 = x.half().contiguous()
 
-    # Use ag_count_buf as ag_mask_buf if provided (legacy compat shim)
     if ag_mask_buf is None:
-        if ag_count_buf is not None and ag_count_buf.numel() >= N_TILES:
-            ag_mask_buf = ag_count_buf  # reuse same buffer
-        else:
-            ag_mask_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
+        ag_mask_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
 
     _build_active_group_bitmask(
         x_f16, N, C_IN, H, W, H_OUT, W_OUT,

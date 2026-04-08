@@ -1,15 +1,16 @@
 """
-SparseFlow Ops/sparse_conv1d.py 鈥?SparseConv1d nn.Module Wrapper
+Ops/sparse_conv1d.py
 
-Wraps Kernels/conv1d.py. Manages buffers, provides from_dense(),
-5D (T, N, C, L) input support, and F.conv1d fallback.
+SparseConv1d wrapper.
 
-v1: prescan + dense compute; sparse compute kernel in v2.
+Current maturity: prototype / stats path.
+This operator currently runs prescan + dense compute fallback in kernel v1.
 """
 
 import sys
+import warnings
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
@@ -21,9 +22,7 @@ import torch.nn.functional as F
 
 
 class SparseConv1d(nn.Module):
-    """
-    Sparse 1D convolution with grouped-bitmask prescan on input channels.
-    """
+    _warned_prescan_only = False
 
     def __init__(
         self,
@@ -38,18 +37,16 @@ class SparseConv1d(nn.Module):
         return_ms: bool = False,
     ):
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
         self.kernel_size = (kernel_size,) if isinstance(kernel_size, int) else kernel_size
         self.stride = (stride,) if isinstance(stride, int) else stride
         self.padding = (padding,) if isinstance(padding, int) else padding
-        self.groups = groups
-        self.threshold = threshold
-        self.return_ms = return_ms
+        self.groups = int(groups)
+        self.threshold = float(threshold)
+        self.return_ms = bool(return_ms)
 
-        self.weight = nn.Parameter(
-            torch.empty(out_channels, in_channels // groups, self.kernel_size[0])
-        )
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels // groups, self.kernel_size[0]))
         if bias:
             self.bias = nn.Parameter(torch.empty(out_channels))
         else:
@@ -62,16 +59,33 @@ class SparseConv1d(nn.Module):
         self._triton_available = False
         try:
             import triton  # noqa: F401
+
             self._triton_available = True
         except Exception:
             pass
 
+        # Unified observability contract
+        self.collect_diag = False
+        self.profile_runtime = False
+        self._inference_mode = False
         self._last_sparse_ms = 0.0
         self._last_diag: Dict[str, Any] = {}
-        self.collect_diag = False
+        self.backend_family = "sparse_kernel"
+        self.diag_path = "conv1d_v1_prescan_only"
+        self.fallback_reason = ""
+        self.meta_source = "measured"
+        self.diag_source = "measured"
+        self.support_status = "supported"
+        self.score_family = "conv"
 
     @classmethod
     def from_dense(cls, conv: nn.Conv1d, threshold: float = 1e-6, return_ms: bool = False, **kwargs):
+        if not cls._warned_prescan_only:
+            warnings.warn(
+                "[SparseFlow] SparseConv1d is currently prescan-only v1 (dense compute fallback).",
+                UserWarning,
+            )
+            cls._warned_prescan_only = True
         sparse = cls(
             in_channels=conv.in_channels,
             out_channels=conv.out_channels,
@@ -90,19 +104,27 @@ class SparseConv1d(nn.Module):
             sparse.bias.data.copy_(conv.bias.data)
         return sparse
 
+    def set_inference_mode(self, enabled: bool):
+        self._inference_mode = bool(enabled)
+        if enabled:
+            self.collect_diag = False
+            self.profile_runtime = False
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Handle 4D [T, N, C, L] input
         if x.ndim == 4:
-            T, N, C, L = x.shape
-            x_3d = x.reshape(T * N, C, L)
+            t, n, c, l = x.shape
+            x_3d = x.reshape(t * n, c, l)
             y_3d = self._forward_3d(x_3d)
-            L_out = y_3d.shape[2]
-            return y_3d.reshape(T, N, self.out_channels, L_out)
+            l_out = y_3d.shape[2]
+            return y_3d.reshape(t, n, self.out_channels, l_out)
         return self._forward_3d(x)
 
     def _forward_3d(self, x: torch.Tensor) -> torch.Tensor:
-        # groups != 1 鈫?dense fallback (sparse kernel supports groups=1 only)
+        self._last_diag = {}
+        self.fallback_reason = ""
         if self.groups != 1 or not self._triton_available or not x.is_cuda:
+            self.fallback_reason = "no_triton_or_not_cuda_or_groups"
+            self.diag_source = "missing"
             return self._fallback(x)
 
         from Kernels.conv1d import sparse_conv1d_forward
@@ -117,14 +139,18 @@ class SparseConv1d(nn.Module):
             return_ms=self.return_ms,
             return_tile_stats=self.collect_diag,
         )
-
         y = result[0]
-        self._last_sparse_ms = result[1]
+        self._last_sparse_ms = float(result[1])
+        self.fallback_reason = "prescan_only_dense_compute_v1"
+        self.diag_source = "measured" if self.collect_diag else "missing"
         if self.collect_diag and len(result) > 2:
-            self._last_diag = result[2] if result[2] is not None else {}
+            self._last_diag = result[2] if isinstance(result[2], dict) else {}
+            self._last_diag.setdefault("backend_family", self.backend_family)
+            self._last_diag.setdefault("diag_path", self.diag_path)
+            self._last_diag.setdefault("fallback_reason", self.fallback_reason)
         return y
 
-    def _fallback(self, x):
+    def _fallback(self, x: torch.Tensor) -> torch.Tensor:
         return F.conv1d(
             x.float(),
             self.weight.float(),
@@ -139,5 +165,6 @@ class SparseConv1d(nn.Module):
             f"{self.in_channels}, {self.out_channels}, "
             f"kernel_size={self.kernel_size}, stride={self.stride}, "
             f"padding={self.padding}, groups={self.groups}, "
-            f"threshold={self.threshold}"
+            f"threshold={self.threshold}, diag_path={self.diag_path}"
         )
+

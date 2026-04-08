@@ -37,6 +37,7 @@ def _iter_sparse_policy_modules(model: nn.Module):
     changing this file:
     - has set_inference_mode(...), or
     - has _inference_mode / _force_dense / _force_zero state attributes.
+    - or exposes sparse observability contract fields (collect_diag + _last_sparse_ms).
     """
     for name, module in model.named_modules():
         if (
@@ -44,6 +45,8 @@ def _iter_sparse_policy_modules(model: nn.Module):
             or hasattr(module, "_inference_mode")
             or hasattr(module, "_force_dense")
             or hasattr(module, "_force_zero")
+            or (hasattr(module, "collect_diag") and hasattr(module, "_last_sparse_ms"))
+            or hasattr(module, "backend_family")
         ):
             yield name, module
 

@@ -19,7 +19,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from spikingjelly.activation_based import base as sj_base
-from Utils.config import PRESCAN_ACTIVITY_EPS, SPARSE_DENSE_RATIO_THRESHOLD
 
 
 class FusedSparseConvLIF(sj_base.MemoryModule):
@@ -39,7 +38,7 @@ class FusedSparseConvLIF(sj_base.MemoryModule):
         detach_reset: bool = False,
         decay_input: bool = True,
         backend: str = 'torch',
-        threshold: float = PRESCAN_ACTIVITY_EPS,
+        threshold: float = 1e-6,
         block_size=None,
         return_ms: bool = False,
     ):
@@ -77,6 +76,17 @@ class FusedSparseConvLIF(sj_base.MemoryModule):
 
         self._last_sparse_ms = 0.0
         self._w_cl = None
+        self._last_diag = {}
+        self.collect_diag = False
+        self.profile_runtime = False
+        self._inference_mode = False
+        self.backend_family = "fused_sparse"
+        self.diag_path = "fused_conv_lif"
+        self.fallback_reason = ""
+        self.meta_source = "measured"
+        self.diag_source = "measured"
+        self.support_status = "supported"
+        self.score_family = "conv"
 
         # Bitmask buffer (replaces ag_count_buf + ag_list_buf)
         self._ag_mask_buf = None
@@ -84,16 +94,22 @@ class FusedSparseConvLIF(sj_base.MemoryModule):
         self._warmup_steps = 8
         self._calib_interval = 32
         self._ema_decay = 0.9
-        self._dense_threshold = SPARSE_DENSE_RATIO_THRESHOLD
+        self._dense_threshold = 0.85
         self._ema_active_ratio = None
         self._step_count = 0
         self._runtime_mode = 'sparse'
 
         self.register_memory('v', None)
 
+    def set_inference_mode(self, enabled: bool):
+        self._inference_mode = bool(enabled)
+        if enabled:
+            self.collect_diag = False
+            self.profile_runtime = False
+
     @classmethod
     def from_conv_and_lif(cls, conv: nn.Conv2d, lif_node, block_size=None,
-                          threshold: float = PRESCAN_ACTIVITY_EPS, return_ms: bool = False):
+                          threshold: float = 1e-6, return_ms: bool = False):
         mod = cls(
             in_channels=conv.in_channels,
             out_channels=conv.out_channels,

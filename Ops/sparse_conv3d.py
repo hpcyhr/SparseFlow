@@ -1,12 +1,16 @@
 """
-SparseFlow Ops/sparse_conv3d.py 鈥?SparseConv3d nn.Module Wrapper
+Ops/sparse_conv3d.py
 
-Wraps Kernels/conv3d.py. v1: prescan stats + F.conv3d compute.
+SparseConv3d wrapper.
+
+Current maturity: prototype / stats path.
+This operator currently runs prescan + dense compute fallback in kernel v1.
 """
 
 import sys
+import warnings
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
@@ -18,9 +22,7 @@ import torch.nn.functional as F
 
 
 class SparseConv3d(nn.Module):
-    """
-    Sparse 3D convolution.  v1: sparsity profiling + dense compute path.
-    """
+    _warned_prescan_only = False
 
     def __init__(
         self,
@@ -35,21 +37,19 @@ class SparseConv3d(nn.Module):
         return_ms: bool = False,
     ):
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
         ks = kernel_size if isinstance(kernel_size, int) else kernel_size[0]
-        self.kernel_size = (ks, ks, ks)
         st = stride if isinstance(stride, int) else stride[0]
-        self.stride = (st, st, st)
         pa = padding if isinstance(padding, int) else padding[0]
+        self.kernel_size = (ks, ks, ks)
+        self.stride = (st, st, st)
         self.padding = (pa, pa, pa)
-        self.groups = groups
-        self.threshold = threshold
-        self.return_ms = return_ms
+        self.groups = int(groups)
+        self.threshold = float(threshold)
+        self.return_ms = bool(return_ms)
 
-        self.weight = nn.Parameter(
-            torch.empty(out_channels, in_channels // groups, ks, ks, ks)
-        )
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels // groups, ks, ks, ks))
         if bias:
             self.bias = nn.Parameter(torch.empty(out_channels))
         else:
@@ -62,16 +62,33 @@ class SparseConv3d(nn.Module):
         self._triton_available = False
         try:
             import triton  # noqa: F401
+
             self._triton_available = True
         except Exception:
             pass
 
+        # Unified observability contract
+        self.collect_diag = False
+        self.profile_runtime = False
+        self._inference_mode = False
         self._last_sparse_ms = 0.0
         self._last_diag: Dict[str, Any] = {}
-        self.collect_diag = False
+        self.backend_family = "sparse_kernel"
+        self.diag_path = "conv3d_v1_prescan_only"
+        self.fallback_reason = ""
+        self.meta_source = "measured"
+        self.diag_source = "measured"
+        self.support_status = "supported"
+        self.score_family = "conv"
 
     @classmethod
     def from_dense(cls, conv: nn.Conv3d, threshold: float = 1e-6, return_ms: bool = False, **kwargs):
+        if not cls._warned_prescan_only:
+            warnings.warn(
+                "[SparseFlow] SparseConv3d is currently prescan-only v1 (dense compute fallback).",
+                UserWarning,
+            )
+            cls._warned_prescan_only = True
         sparse = cls(
             in_channels=conv.in_channels,
             out_channels=conv.out_channels,
@@ -90,17 +107,26 @@ class SparseConv3d(nn.Module):
             sparse.bias.data.copy_(conv.bias.data)
         return sparse
 
+    def set_inference_mode(self, enabled: bool):
+        self._inference_mode = bool(enabled)
+        if enabled:
+            self.collect_diag = False
+            self.profile_runtime = False
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Handle 6D [T, N, C, D, H, W]
         if x.ndim == 6:
-            T, N, C, D, H, W = x.shape
-            x_5d = x.reshape(T * N, C, D, H, W)
+            t, n, c, d, h, w = x.shape
+            x_5d = x.reshape(t * n, c, d, h, w)
             y_5d = self._forward_5d(x_5d)
-            return y_5d.reshape(T, N, self.out_channels, *y_5d.shape[2:])
+            return y_5d.reshape(t, n, self.out_channels, *y_5d.shape[2:])
         return self._forward_5d(x)
 
     def _forward_5d(self, x: torch.Tensor) -> torch.Tensor:
+        self._last_diag = {}
+        self.fallback_reason = ""
         if not self._triton_available or not x.is_cuda:
+            self.fallback_reason = "no_triton_or_not_cuda"
+            self.diag_source = "missing"
             return self._fallback(x)
 
         from Kernels.conv3d import sparse_conv3d_forward
@@ -115,14 +141,18 @@ class SparseConv3d(nn.Module):
             return_ms=self.return_ms,
             return_tile_stats=self.collect_diag,
         )
-
         y = result[0]
-        self._last_sparse_ms = result[1]
+        self._last_sparse_ms = float(result[1])
+        self.fallback_reason = "prescan_only_dense_compute_v1"
+        self.diag_source = "measured" if self.collect_diag else "missing"
         if self.collect_diag and len(result) > 2:
-            self._last_diag = result[2] if result[2] is not None else {}
+            self._last_diag = result[2] if isinstance(result[2], dict) else {}
+            self._last_diag.setdefault("backend_family", self.backend_family)
+            self._last_diag.setdefault("diag_path", self.diag_path)
+            self._last_diag.setdefault("fallback_reason", self.fallback_reason)
         return y
 
-    def _fallback(self, x):
+    def _fallback(self, x: torch.Tensor) -> torch.Tensor:
         return F.conv3d(
             x.float(),
             self.weight.float(),
@@ -134,8 +164,8 @@ class SparseConv3d(nn.Module):
 
     def extra_repr(self):
         return (
-            f"{self.in_channels}, {self.out_channels}, "
-            f"kernel_size={self.kernel_size}, stride={self.stride}, "
-            f"padding={self.padding}, groups={self.groups}, "
-            f"threshold={self.threshold}"
+            f"{self.in_channels}, {self.out_channels}, kernel_size={self.kernel_size}, "
+            f"stride={self.stride}, padding={self.padding}, groups={self.groups}, "
+            f"threshold={self.threshold}, diag_path={self.diag_path}"
         )
+

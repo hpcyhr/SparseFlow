@@ -10,10 +10,9 @@ Leaky Integrate-and-Fire neuron dynamics as a standalone kernel:
 This kernel is NOT fused with convolution — it operates on pre-computed
 current tensors.  The fused Conv+LIF kernel lives in fused_conv_lif.py.
 
-Key optimization for SNN sparsity: when input current I is zero AND
-V_prev * decay < v_threshold, the output spike is guaranteed zero and
-V_next = V_prev * decay.  For high-sparsity SNN inputs, this fast path
-avoids the full threshold comparison for many elements.
+Implementation note:
+- This kernel currently applies the same update for all elements and does not
+  implement a dedicated zero-input short-circuit branch.
 
 Supports: flat [N] and batched [*, N] inputs via reshape.
 """

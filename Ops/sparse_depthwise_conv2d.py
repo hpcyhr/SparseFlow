@@ -68,6 +68,17 @@ class SparseDepthwiseConv2d(nn.Module):
         self._last_sparse_ms = 0.0
         self._last_diag: Dict[str, Any] = {}
         self.collect_diag = False
+        self.profile_runtime = False
+        self._inference_mode = False
+
+        # Unified observability fields
+        self.backend_family = "sparse_kernel"
+        self.diag_path = "depthwise_conv2d"
+        self.fallback_reason = ""
+        self.meta_source = "measured"
+        self.diag_source = "measured"
+        self.support_status = "supported"
+        self.score_family = "conv"
 
     @classmethod
     def from_dense(cls, conv: nn.Conv2d, threshold: float = 1e-6, return_ms: bool = False, **kwargs):
@@ -91,6 +102,12 @@ class SparseDepthwiseConv2d(nn.Module):
             sparse.bias.data.copy_(conv.bias.data)
         return sparse
 
+    def set_inference_mode(self, enabled: bool):
+        self._inference_mode = bool(enabled)
+        if enabled:
+            self.collect_diag = False
+            self.profile_runtime = False
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Handle 5D [T, N, C, H, W] input
         if x.ndim == 5:
@@ -101,7 +118,11 @@ class SparseDepthwiseConv2d(nn.Module):
         return self._forward_4d(x)
 
     def _forward_4d(self, x: torch.Tensor) -> torch.Tensor:
+        self._last_diag = {}
+        self.fallback_reason = ""
         if not self._triton_available or not x.is_cuda:
+            self.fallback_reason = "no_triton_or_not_cuda"
+            self.diag_source = "missing"
             return self._fallback(x)
 
         from Kernels.depthwise_conv2d import sparse_depthwise_conv2d_forward
@@ -119,9 +140,13 @@ class SparseDepthwiseConv2d(nn.Module):
 
         y = result[0]
         self._last_sparse_ms = result[1]
+        self.diag_source = "measured" if self.collect_diag else "missing"
 
         if self.collect_diag and len(result) > 2:
             self._last_diag = result[2] if result[2] is not None else {}
+            self._last_diag.setdefault("backend_family", self.backend_family)
+            self._last_diag.setdefault("diag_path", self.diag_path)
+            self._last_diag.setdefault("fallback_reason", self.fallback_reason)
 
         return y
 

@@ -5,7 +5,7 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import copy
 import torch.nn as nn
 from torch.nn.utils.fusion import fuse_conv_bn_eval
@@ -15,6 +15,7 @@ from Ops.sparse_conv2d import SparseConv2d
 from Ops.static_zero_conv2d import StaticZeroConv2d
 from Ops.static_zero_linear import StaticZeroLinear
 from Ops.sparse_fused_conv_lif import FusedSparseConvLIF
+from Ops.sparse_attention_block import SparseAttentionBlock
 
 
 def _set_module_by_name(model: nn.Module, name: str, new_module: nn.Module):
@@ -33,50 +34,59 @@ def _eligible_direct_fusion_conv_name(conv_name: str) -> bool:
     return leaf in ("conv1", "conv2")
 
 
-def _score_family_from_op(op: str) -> str:
-    op = str(op or "").lower()
-    if op == "linear":
-        return "linear"
-    if op in ("attention_linear", "attention_qkmix", "attn_linear"):
-        return "attn_linear"
-    if op in ("attention_qkav", "attn_matmul"):
-        return "attn_matmul"
-    if op.startswith("conv") or op.startswith("fused_conv") or op == "depthwise_conv2d":
-        return "conv"
-    return "unknown"
-
-
-def _attach_observability(
-    module: nn.Module,
-    *,
-    layer_name: str,
-    operator_type: str,
-    backend_mode: str,
-    fallback_reason: str = "",
-    meta_source: str = "measured",
-    diag_source: str = "measured",
-    support_status: str = "supported",
-):
-    """Attach standardized SparseFlow metadata on replaced modules.
-
-    This is a lightweight, backward-compatible metadata channel used by
-    profiling/logging code paths without changing forward semantics.
-    """
-    setattr(module, "sf_layer_name", layer_name)
-    setattr(module, "sf_operator_type", operator_type)
-    setattr(module, "sf_operator_family", _score_family_from_op(operator_type))
-    setattr(module, "sf_backend_mode", backend_mode)
-    setattr(module, "sf_backend_family", getattr(module, "backend_family", backend_mode))
-    setattr(module, "sf_diag_path", getattr(module, "diag_path", "runtime"))
-    setattr(module, "sf_fallback_reason", fallback_reason)
-    setattr(module, "sf_meta_source", meta_source)
-    setattr(module, "sf_diag_source", diag_source)
-    setattr(module, "sf_support_status", support_status)
-
-
 class ModuleReplacer:
     def __init__(self, verbose: bool = True):
         self.verbose = verbose
+
+    @staticmethod
+    def _score_family_from_op(op_type: str) -> str:
+        if op_type in ("conv2d_3x3", "conv2d_1x1", "conv2d_3x3_s2", "fused_conv3x3_lif", "fused_conv1x1_lif", "fused_conv3x3s2_lif", "depthwise_conv2d", "conv1d", "conv3d"):
+            return "conv"
+        if op_type == "linear":
+            return "linear"
+        if op_type in ("attention_linear", "attention_proj_linear"):
+            return "attn_linear"
+        if op_type in ("attention_qkav", "attention_qkmix", "attention_matmul"):
+            return "attn_matmul"
+        if op_type == "matmul":
+            return "matmul"
+        if op_type == "bmm":
+            return "bmm"
+        return "unknown"
+
+    def _attach_observability(
+        self,
+        module: nn.Module,
+        target: ReplacementTarget,
+        backend_mode: str,
+        backend_family: Optional[str] = None,
+        fallback_reason: str = "",
+    ) -> nn.Module:
+        """
+        Attach unified observability metadata for all replaced modules.
+
+        Note: keep both `sf_backend_mode` and `sf_dispatch_decision` for
+        compatibility with older runtime readers.
+        """
+        op_type = str(target.op_type)
+        if backend_family is None:
+            backend_family = "exact_zero" if backend_mode == "staticzero" else "sparse_kernel"
+
+        setattr(module, "sf_layer_name", str(target.conv_name))
+        setattr(module, "sf_operator_type", op_type)
+        setattr(module, "sf_operator_family", self._score_family_from_op(op_type))
+        setattr(module, "sf_spike_source", str(target.spike_name))
+        setattr(module, "sf_backend_mode", str(backend_mode))
+        setattr(module, "sf_dispatch_decision", str(backend_mode))
+        setattr(module, "sf_backend_family", str(backend_family))
+        setattr(module, "sf_reason_code", "")
+        setattr(module, "sf_meta_source", "measured")
+        setattr(module, "sf_diag_source", "measured")
+        setattr(module, "sf_support_status", "supported")
+        setattr(module, "sf_score_family", self._score_family_from_op(op_type))
+        setattr(module, "sf_tile_source", "unknown")
+        setattr(module, "sf_fallback_reason", str(fallback_reason))
+        return module
 
     def replace(
         self,
@@ -87,11 +97,14 @@ class ModuleReplacer:
         disable_static_zero: bool = False,
         only_static_zero: bool = False,
         enable_fused_conv_lif: bool = False,
+        sparse_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[int, int, int, int, int]:
         if static_zero_layers is None:
             static_zero_layers = set()
         if disable_static_zero:
             static_zero_layers = set()
+        if sparse_kwargs is None:
+            sparse_kwargs = {}
 
         replaced = 0
         sparse_count = 0
@@ -127,25 +140,15 @@ class ModuleReplacer:
                     new_module = StaticZeroLinear.from_linear(target.conv_module)
                 else:
                     new_module = StaticZeroConv2d.from_conv(target.conv_module)
-                _attach_observability(
+                self._attach_observability(
                     new_module,
-                    layer_name=module_name,
-                    operator_type=op,
+                    target,
                     backend_mode="staticzero",
-                    fallback_reason="exact_zero_shortcut",
-                    meta_source="shortcut",
-                    diag_source="shortcut",
-                    support_status="exact_zero_shortcut",
+                    backend_family="exact_zero",
                 )
                 _set_module_by_name(model, module_name, new_module)
                 replaced += 1
                 static_zero_count += 1
-                # Keep downstream BN/LIF untouched for static-zero route.
-                # Reason:
-                #   StaticZeroConv2d only guarantees exact conv(x=0) output.
-                #   BN/LIF may be stateful / non-identity (especially in SNN blocks),
-                #   so removing them can break numerical equivalence.
-                #   Only explicit fused route is allowed to fold/remove BN/LIF.
                 if self.verbose:
                     if op == "linear":
                         print(f"  [STATIC ] {module_name} ({op}) -> StaticZeroLinear")
@@ -163,6 +166,7 @@ class ModuleReplacer:
                 target,
                 block,
                 enable_fused_conv_lif=enable_fused_conv_lif,
+                sparse_kwargs=sparse_kwargs,
             )
             if new_module is None:
                 dense_keep_count += 1
@@ -170,17 +174,13 @@ class ModuleReplacer:
                     print(f"  [KEEP   ] {module_name} ({op}) -> DenseKeep (unsupported)")
                 continue
 
-            _set_module_by_name(model, module_name, new_module)
-            _attach_observability(
+            self._attach_observability(
                 new_module,
-                layer_name=module_name,
-                operator_type=op,
+                target,
                 backend_mode="sparse",
-                fallback_reason="",
-                meta_source="measured",
-                diag_source="measured",
-                support_status="supported",
+                backend_family="fused_sparse" if isinstance(new_module, FusedSparseConvLIF) else "sparse_kernel",
             )
+            _set_module_by_name(model, module_name, new_module)
             replaced += 1
 
             actually_fused = (
@@ -215,26 +215,65 @@ class ModuleReplacer:
         target: ReplacementTarget,
         block: Optional[int],
         enable_fused_conv_lif: bool = False,
+        sparse_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Optional[nn.Module]:
+        if sparse_kwargs is None:
+            sparse_kwargs = {}
         op = target.op_type
         mod = target.conv_module
+        common_threshold = sparse_kwargs.get("threshold", 1e-6)
+        common_return_ms = bool(sparse_kwargs.get("return_ms", False))
+        common_collect_diag = bool(sparse_kwargs.get("collect_diag", False))
+        common_profile_runtime = bool(sparse_kwargs.get("profile_runtime", False))
 
         if op in ("conv2d_3x3", "conv2d_1x1", "conv2d_3x3_s2"):
-            sparse = SparseConv2d.from_dense(mod, block_size=block)
+            sparse = SparseConv2d.from_dense(
+                mod,
+                block_size=block,
+                threshold=common_threshold,
+                return_ms=common_return_ms,
+            )
+            if hasattr(sparse, "collect_diag"):
+                sparse.collect_diag = common_collect_diag
+            if hasattr(sparse, "profile_runtime"):
+                sparse.profile_runtime = common_profile_runtime
             return sparse.to(mod.weight.device)
 
         if op == "depthwise_conv2d":
             from Ops.sparse_depthwise_conv2d import SparseDepthwiseConv2d
-
-            sparse = SparseDepthwiseConv2d.from_dense(mod)
+            sparse = SparseDepthwiseConv2d.from_dense(
+                mod,
+                threshold=common_threshold,
+                return_ms=common_return_ms,
+            )
+            if hasattr(sparse, "collect_diag"):
+                sparse.collect_diag = common_collect_diag
             return sparse.to(mod.weight.device)
 
         if op in ("fused_conv3x3_lif", "fused_conv1x1_lif", "fused_conv3x3s2_lif"):
             if not enable_fused_conv_lif:
-                sparse = SparseConv2d.from_dense(mod, block_size=block)
+                sparse = SparseConv2d.from_dense(
+                    mod,
+                    block_size=block,
+                    threshold=common_threshold,
+                    return_ms=common_return_ms,
+                )
+                if hasattr(sparse, "collect_diag"):
+                    sparse.collect_diag = common_collect_diag
+                if hasattr(sparse, "profile_runtime"):
+                    sparse.profile_runtime = common_profile_runtime
                 return sparse.to(mod.weight.device)
             if target.lif_module is None:
-                sparse = SparseConv2d.from_dense(mod, block_size=block)
+                sparse = SparseConv2d.from_dense(
+                    mod,
+                    block_size=block,
+                    threshold=common_threshold,
+                    return_ms=common_return_ms,
+                )
+                if hasattr(sparse, "collect_diag"):
+                    sparse.collect_diag = common_collect_diag
+                if hasattr(sparse, "profile_runtime"):
+                    sparse.profile_runtime = common_profile_runtime
                 return sparse.to(mod.weight.device)
 
             conv_for_fusion = mod
@@ -251,32 +290,86 @@ class ModuleReplacer:
                 conv_for_fusion,
                 target.lif_module,
                 block_size=block,
+                threshold=common_threshold,
+                return_ms=common_return_ms,
             )
             return fused.to(mod.weight.device)
 
         if op == "conv1d":
             from Ops.sparse_conv1d import SparseConv1d
-
             if not isinstance(mod, nn.Conv1d):
                 return None
-            sparse = SparseConv1d.from_dense(mod)
+            sparse = SparseConv1d.from_dense(
+                mod,
+                threshold=common_threshold,
+                return_ms=common_return_ms,
+            )
+            if hasattr(sparse, "collect_diag"):
+                sparse.collect_diag = common_collect_diag
             return sparse.to(mod.weight.device)
 
         if op == "conv3d":
             from Ops.sparse_conv3d import SparseConv3d
-
             if not isinstance(mod, nn.Conv3d):
                 return None
-            sparse = SparseConv3d.from_dense(mod)
+            sparse = SparseConv3d.from_dense(
+                mod,
+                threshold=common_threshold,
+                return_ms=common_return_ms,
+            )
+            if hasattr(sparse, "collect_diag"):
+                sparse.collect_diag = common_collect_diag
             return sparse.to(mod.weight.device)
 
         if op == "linear":
             from Ops.sparse_linear import SparseLinear
-
             if not isinstance(mod, nn.Linear):
                 return None
-            sparse = SparseLinear.from_dense(mod)
+            sparse = SparseLinear.from_dense(
+                mod,
+                threshold=common_threshold,
+                return_ms=common_return_ms,
+            )
+            if hasattr(sparse, "collect_diag"):
+                sparse.collect_diag = common_collect_diag
+            if hasattr(sparse, "profile_runtime"):
+                sparse.profile_runtime = common_profile_runtime
             return sparse.to(mod.weight.device)
+
+        if op in ("attention_qkav", "attention_linear", "attention_qkmix", "attention_matmul", "attention_proj_linear"):
+            variant = op
+            if op == "attention_matmul":
+                variant = "attention_qkav"
+            elif op == "attention_proj_linear":
+                variant = "attention_linear"
+            sparse = SparseAttentionBlock.from_dense(
+                mod,
+                variant=variant,
+                threshold=common_threshold,
+            )
+            if hasattr(sparse, "collect_diag"):
+                sparse.collect_diag = common_collect_diag
+            return sparse
+
+        if op == "matmul":
+            from Ops.sparse_matmul import SparseMatmul
+            sparse = SparseMatmul(
+                threshold=common_threshold,
+                return_ms=common_return_ms,
+                profile_runtime=common_profile_runtime,
+            )
+            sparse.collect_diag = common_collect_diag
+            return sparse
+
+        if op == "bmm":
+            from Ops.sparse_bmm import SparseBMM
+            sparse = SparseBMM(
+                threshold=common_threshold,
+                return_ms=common_return_ms,
+                profile_runtime=common_profile_runtime,
+            )
+            sparse.collect_diag = common_collect_diag
+            return sparse
 
         return None
 
@@ -288,6 +381,18 @@ class ModuleReplacer:
             in_f = mod.in_features
             out_f = mod.out_features
             print(f"  [REPLACE] {target.conv_name} (linear {in_f}->{out_f}) <- {target.spike_name}")
+            return
+
+        if op in ("matmul", "bmm"):
+            info = display_block_info(target)
+            print(f"  [REPLACE] {target.conv_name} ({op}) <- {target.spike_name}, {info}")
+            return
+
+        if op in ("attention_qkav", "attention_linear", "attention_qkmix", "attention_matmul", "attention_proj_linear"):
+            info = display_block_info(target)
+            h = getattr(mod, "num_heads", "?")
+            d = getattr(mod, "head_dim", "?")
+            print(f"  [REPLACE] {target.conv_name} ({op}, heads={h}, head_dim={d}) <- {target.spike_name}, {info}")
             return
 
         if "fused" in op and actually_fused:
