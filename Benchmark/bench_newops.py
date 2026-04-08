@@ -117,6 +117,101 @@ def test_depthwise_module(device, verbose):
                  cosine_sim(y_ref, y_sp), max_abs_err(y_ref, y_sp), cos_thresh=0.99)
 
 
+def test_grouped_conv2d(device, verbose):
+    from Kernels.grouped_conv2d import sparse_grouped_conv2d_forward
+
+    groups = 4
+    c_in = 16
+    c_out = 32
+    x = make_sparse((2, c_in, 16, 16), 0.02, device)
+    w = torch.randn(c_out, c_in // groups, 3, 3, device=device, dtype=torch.float16)
+    bias = torch.randn(c_out, device=device, dtype=torch.float16)
+
+    y_ref = F.conv2d(x.float(), w.float(), bias.float(), stride=1, padding=1, groups=groups)
+    y_sp, _ = sparse_grouped_conv2d_forward(
+        x, w, bias,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        groups=groups,
+    )
+
+    return check("Grouped Conv2d [2,16,16,16] G=4 K=3",
+                 cosine_sim(y_ref, y_sp), max_abs_err(y_ref, y_sp), cos_thresh=0.99)
+
+
+def test_grouped_conv2d_module(device, verbose):
+    from Ops.sparse_grouped_conv2d import SparseGroupedConv2d
+
+    dense_conv = nn.Conv2d(16, 32, 3, padding=1, groups=4).to(device)
+    sparse_conv = SparseGroupedConv2d.from_dense(dense_conv)
+    x = make_sparse((2, 16, 8, 8), 0.05, device)
+
+    y_ref = F.conv2d(
+        x.float(),
+        dense_conv.weight.float(),
+        dense_conv.bias.float(),
+        padding=1,
+        groups=4,
+    )
+    y_sp = sparse_conv(x)
+
+    return check("SparseGroupedConv2d Module [2,16,8,8] G=4",
+                 cosine_sim(y_ref, y_sp), max_abs_err(y_ref, y_sp), cos_thresh=0.99)
+
+
+def test_maxpool2d(device, verbose):
+    from Kernels.maxpool2d import sparse_maxpool2d_forward
+
+    x = make_sparse((2, 16, 16, 16), 0.05, device)
+    y_ref = F.max_pool2d(x.float(), kernel_size=3, stride=2, padding=1)
+    y_sp, _ = sparse_maxpool2d_forward(
+        x,
+        kernel_size=3,
+        stride=2,
+        padding=1,
+    )
+    return check("MaxPool2d [2,16,16,16] K=3 S=2",
+                 cosine_sim(y_ref, y_sp), max_abs_err(y_ref, y_sp), cos_thresh=0.99)
+
+
+def test_maxpool2d_module(device, verbose):
+    from Ops.sparse_maxpool2d import SparseMaxPool2d
+
+    mod = SparseMaxPool2d(kernel_size=3, stride=2, padding=1)
+    x = make_sparse((2, 8, 16, 16), 0.1, device)
+    y_ref = F.max_pool2d(x.float(), kernel_size=3, stride=2, padding=1)
+    y_sp = mod(x)
+    return check("SparseMaxPool2d Module [2,8,16,16]",
+                 cosine_sim(y_ref, y_sp), max_abs_err(y_ref, y_sp), cos_thresh=0.99)
+
+
+def test_avgpool2d(device, verbose):
+    from Kernels.avgpool2d import sparse_avgpool2d_forward
+
+    x = make_sparse((2, 16, 16, 16), 0.05, device)
+    y_ref = F.avg_pool2d(x.float(), kernel_size=3, stride=2, padding=1)
+    y_sp, _ = sparse_avgpool2d_forward(
+        x,
+        kernel_size=3,
+        stride=2,
+        padding=1,
+    )
+    return check("AvgPool2d [2,16,16,16] K=3 S=2",
+                 cosine_sim(y_ref, y_sp), max_abs_err(y_ref, y_sp), cos_thresh=0.99)
+
+
+def test_avgpool2d_module(device, verbose):
+    from Ops.sparse_avgpool2d import SparseAvgPool2d
+
+    mod = SparseAvgPool2d(kernel_size=3, stride=2, padding=1)
+    x = make_sparse((2, 8, 16, 16), 0.1, device)
+    y_ref = F.avg_pool2d(x.float(), kernel_size=3, stride=2, padding=1)
+    y_sp = mod(x)
+    return check("SparseAvgPool2d Module [2,8,16,16]",
+                 cosine_sim(y_ref, y_sp), max_abs_err(y_ref, y_sp), cos_thresh=0.99)
+
+
 def test_conv1d(device, verbose):
     from Kernels.conv1d import sparse_conv1d_forward
     x = make_sparse((4, 32, 64), 0.01, device)
@@ -306,6 +401,12 @@ def main():
         ("Ops/SparseBMM", test_bmm_module),
         ("Kernels/depthwise_conv2d", test_depthwise),
         ("Ops/SparseDepthwiseConv2d", test_depthwise_module),
+        ("Kernels/grouped_conv2d", test_grouped_conv2d),
+        ("Ops/SparseGroupedConv2d", test_grouped_conv2d_module),
+        ("Kernels/maxpool2d", test_maxpool2d),
+        ("Ops/SparseMaxPool2d", test_maxpool2d_module),
+        ("Kernels/avgpool2d", test_avgpool2d),
+        ("Ops/SparseAvgPool2d", test_avgpool2d_module),
         ("Kernels/conv1d", test_conv1d),
         ("Ops/SparseConv1d", test_conv1d_module),
         ("Kernels/conv3d", test_conv3d),
