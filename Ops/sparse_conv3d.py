@@ -3,8 +3,8 @@ Ops/sparse_conv3d.py
 
 SparseConv3d wrapper.
 
-Current maturity: prototype / stats path.
-This operator currently runs prescan + dense compute fallback in kernel v1.
+Current maturity: main_path.
+This operator runs prescan + active-tile sparse compute in kernel v2.
 """
 
 import sys
@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 
 class SparseConv3d(nn.Module):
-    _warned_prescan_only = False
+    _warned_v2 = False
 
     def __init__(
         self,
@@ -74,7 +74,7 @@ class SparseConv3d(nn.Module):
         self._last_sparse_ms = 0.0
         self._last_diag: Dict[str, Any] = {}
         self.backend_family = "sparse_kernel"
-        self.diag_path = "conv3d_v1_prescan_only"
+        self.diag_path = "conv3d_active_tile_sparse"
         self.fallback_reason = ""
         self.meta_source = "measured"
         self.diag_source = "measured"
@@ -83,12 +83,12 @@ class SparseConv3d(nn.Module):
 
     @classmethod
     def from_dense(cls, conv: nn.Conv3d, threshold: float = 1e-6, return_ms: bool = False, **kwargs):
-        if not cls._warned_prescan_only:
+        if not cls._warned_v2:
             warnings.warn(
-                "[SparseFlow] SparseConv3d is currently prescan-only v1 (dense compute fallback).",
+                "[SparseFlow] SparseConv3d now uses active-tile sparse compute (v2).",
                 UserWarning,
             )
-            cls._warned_prescan_only = True
+            cls._warned_v2 = True
         sparse = cls(
             in_channels=conv.in_channels,
             out_channels=conv.out_channels,
@@ -124,8 +124,10 @@ class SparseConv3d(nn.Module):
     def _forward_5d(self, x: torch.Tensor) -> torch.Tensor:
         self._last_diag = {}
         self.fallback_reason = ""
-        if not self._triton_available or not x.is_cuda:
-            self.fallback_reason = "no_triton_or_not_cuda"
+
+        if self.groups != 1 or not self._triton_available or not x.is_cuda:
+            self.diag_path = "dense_fallback"
+            self.fallback_reason = "no_triton_or_not_cuda_or_groups"
             self.diag_source = "missing"
             return self._fallback(x)
 
@@ -140,16 +142,39 @@ class SparseConv3d(nn.Module):
             threshold=self.threshold,
             return_ms=self.return_ms,
             return_tile_stats=self.collect_diag,
+            return_backend_meta=True,
         )
         y = result[0]
         self._last_sparse_ms = float(result[1])
-        self.fallback_reason = "prescan_only_dense_compute_v1"
+
+        stats = {}
+        idx = 2
+        if self.collect_diag and len(result) > idx and isinstance(result[idx], dict):
+            stats = result[idx]
+            idx += 1
+        backend_meta = result[idx] if (len(result) > idx and isinstance(result[idx], dict)) else {}
+        backend = str(backend_meta.get("backend", stats.get("backend", "sparse_active_tiles")))
+        reason = str(backend_meta.get("reason", stats.get("reason", "")))
+
+        if backend == "dense_fallback":
+            self.diag_path = "dense_fallback"
+            self.fallback_reason = reason or "dense_fallback"
+        elif backend == "zero_tiles_only":
+            self.diag_path = "zero_tiles_only"
+            self.fallback_reason = ""
+        else:
+            self.diag_path = "sparse_kernel"
+            self.fallback_reason = ""
+
         self.diag_source = "measured" if self.collect_diag else "missing"
-        if self.collect_diag and len(result) > 2:
-            self._last_diag = result[2] if isinstance(result[2], dict) else {}
-            self._last_diag.setdefault("backend_family", self.backend_family)
-            self._last_diag.setdefault("diag_path", self.diag_path)
-            self._last_diag.setdefault("fallback_reason", self.fallback_reason)
+        if self.collect_diag:
+            self._last_diag = {
+                "sparse_path_executed": backend not in ("dense_fallback",),
+                "backend_family": self.backend_family,
+                "diag_path": self.diag_path,
+                "fallback_reason": self.fallback_reason,
+            }
+            self._last_diag.update(stats)
         return y
 
     def _fallback(self, x: torch.Tensor) -> torch.Tensor:
@@ -168,4 +193,3 @@ class SparseConv3d(nn.Module):
             f"stride={self.stride}, padding={self.padding}, groups={self.groups}, "
             f"threshold={self.threshold}, diag_path={self.diag_path}"
         )
-

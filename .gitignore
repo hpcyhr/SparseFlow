@@ -23,3 +23,5 @@ dist/
 *.json
 
 *.log
+
+paper.md
