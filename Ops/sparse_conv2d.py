@@ -327,16 +327,29 @@ class SparseConv2d(nn.Module):
             self._w_cl_version = ver
         return self._w_cl
 
+    def _output_hw(self, h_in: int, w_in: int):
+        k_h, k_w = self.kernel_size
+        s_h, s_w = self.stride
+        p_h, p_w = self.padding
+        d_h, d_w = self.dilation
+        h_out = (h_in + 2 * p_h - d_h * (k_h - 1) - 1) // s_h + 1
+        w_out = (w_in + 2 * p_w - d_w * (k_w - 1) - 1) // s_w + 1
+        return int(h_out), int(w_out)
+
     def _ensure_buffers(self, x):
-        C_IN, H, W = x.shape[1], x.shape[2], x.shape[3]
-        BH, BW = _select_tile_sizes(H, W)
-        N_TILES = x.shape[0] * triton.cdiv(H, BH) * triton.cdiv(W, BW)
-        if self._ag_mask_buf is None or self._ag_mask_buf.numel() < N_TILES:
-            self._ag_mask_buf = torch.empty(N_TILES, dtype=torch.int32, device=x.device)
-        if self._tile_class_buf is None or self._tile_class_buf.numel() < N_TILES:
-            self._tile_class_buf = torch.empty(N_TILES, dtype=torch.int32, device=x.device)
-        if self._active_tile_ids_buf is None or self._active_tile_ids_buf.numel() < N_TILES:
-            self._active_tile_ids_buf = torch.empty(N_TILES, dtype=torch.int32, device=x.device)
+        h_in, w_in = x.shape[2], x.shape[3]
+        h_out, w_out = self._output_hw(h_in, w_in)
+        if h_out > 0 and w_out > 0:
+            bh, bw = _select_tile_sizes(h_out, w_out)
+            n_tiles = x.shape[0] * triton.cdiv(h_out, bh) * triton.cdiv(w_out, bw)
+        else:
+            n_tiles = 0
+        if self._ag_mask_buf is None or self._ag_mask_buf.numel() < n_tiles:
+            self._ag_mask_buf = torch.empty(n_tiles, dtype=torch.int32, device=x.device)
+        if self._tile_class_buf is None or self._tile_class_buf.numel() < n_tiles:
+            self._tile_class_buf = torch.empty(n_tiles, dtype=torch.int32, device=x.device)
+        if self._active_tile_ids_buf is None or self._active_tile_ids_buf.numel() < n_tiles:
+            self._active_tile_ids_buf = torch.empty(n_tiles, dtype=torch.int32, device=x.device)
         return self._ag_mask_buf, self._tile_class_buf, self._active_tile_ids_buf
 
     def _prepare_nhwc(self, x_f16):
@@ -569,23 +582,25 @@ class SparseConv2d(nn.Module):
 
         ag_mask_buf, tile_class_buf, active_tile_ids_buf = self._ensure_buffers(x)
         w_cl = self._get_w_cl()
+        k = self.kernel_size[0]
+        collect_tiles = self.collect_diag
+        want_ratio = need_ratio or collect_tiles
+        want_tiles = collect_tiles
 
-        # Single .half() → x_f16 NCHW; derive NHWC from it.
+        # Single .half() → x_f16 NCHW. Defer NHWC packing on the
+        # ratio-only calibration path so an early dense bailout can skip it.
         if x.dtype == torch.float16 and x.is_contiguous():
             x_f16 = x
         else:
             x_f16 = x.half().contiguous()
-        x_nhwc = self._prepare_nhwc(x_f16)
+        x_nhwc = None
+        if not (need_ratio and not collect_tiles):
+            x_nhwc = self._prepare_nhwc(x_f16)
 
         if self.profile_runtime:
             ms = self._elapsed_ms(t0)
             self._profile_add("buffer_ms", ms)
             self._profile_set_last("last_buffer_ms", ms)
-
-        k = self.kernel_size[0]
-        collect_tiles = self.collect_diag
-        want_ratio = need_ratio or collect_tiles
-        want_tiles = collect_tiles
 
         # When want_ratio=False and want_tiles=False: kernel skips all .item()
         # syncs. When launch_all_tiles=True: kernel skips _build_active_tile_ids
@@ -663,8 +678,9 @@ class SparseConv2d(nn.Module):
         N, C_IN, H, W = x.shape
         GROUP_SIZE_C = choose_group_size(C_IN)
         NUM_GROUPS = triton.cdiv(C_IN, GROUP_SIZE_C)
-        BH, BW = _select_tile_sizes(H, W)
-        N_TILES = N * triton.cdiv(H, BH) * triton.cdiv(W, BW)
+        H_OUT, W_OUT = self._output_hw(H, W)
+        BH, BW = _select_tile_sizes(H_OUT, W_OUT)
+        N_TILES = N * triton.cdiv(H_OUT, BH) * triton.cdiv(W_OUT, BW)
 
         if tile_stats is not None:
             zt = tile_stats.get('zero_tiles', -1)

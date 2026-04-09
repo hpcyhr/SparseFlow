@@ -91,16 +91,6 @@ def sparse_depthwise_conv2d_forward(
         avg_ratio = 1.0 if return_avg_active_ratio else None
         return _finalize_return(y, dense_ms, avg_ratio, None, backend_meta)
 
-    if w_cl_groups is None:
-        built_layouts = []
-        for c in range(channels):
-            w_c = weight[c:c + 1, :, :, :].contiguous()
-            if kernel_size == (3, 3):
-                built_layouts.append(w_c.half().permute(0, 2, 3, 1).contiguous())
-            else:
-                built_layouts.append(w_c.half().reshape(1, 1).contiguous())
-        w_cl_groups = built_layouts
-
     return sparse_grouped_conv2d_forward(
         x=x,
         weight=weight,

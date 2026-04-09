@@ -63,6 +63,32 @@ def _build_active_tile_ids(tile_class_buf: torch.Tensor, n_tiles: int):
     return active.to(dtype=torch.int32).contiguous(), int(active.numel())
 
 
+def _summarize_stage1_metadata(
+    tile_class_buf: torch.Tensor,
+    ag_mask_buf: torch.Tensor,
+    n_tiles: int,
+    num_groups: int,
+):
+    """Summarize coarse Stage-1 metadata before the refine passes."""
+    tc = tile_class_buf[:n_tiles]
+    summary = {
+        "stage1_zero_candidate": int((tc == TILE_ZERO_CANDIDATE).sum().item()),
+        "stage1_denseish": int((tc == TILE_DENSEISH).sum().item()),
+        "stage1_uncertain": int((tc == TILE_UNCERTAIN).sum().item()),
+    }
+    if n_tiles <= 0:
+        summary["stage1_avg_active_group_ratio_lower_bound"] = 0.0
+        return summary, 0.0
+    if num_groups <= 0:
+        summary["stage1_avg_active_group_ratio_lower_bound"] = 1.0
+        return summary, 1.0
+
+    pc = popcount_buf(ag_mask_buf, n_tiles)
+    avg_active_ratio = float(pc.sum().item()) / max(float(n_tiles * num_groups), 1.0)
+    summary["stage1_avg_active_group_ratio_lower_bound"] = avg_active_ratio
+    return summary, avg_active_ratio
+
+
 # ---------------------------------------------------------------------------
 # Stage 1: coarse tile classification over grouped input channels
 # ---------------------------------------------------------------------------
@@ -248,6 +274,8 @@ def _build_linear_metadata(
     ag_mask_buf: torch.Tensor,
     tile_class_buf: torch.Tensor,
     prescan_stats=None,
+    allow_stage1_dense_fallback: bool = False,
+    fallback_ratio: float = FALLBACK_RATIO,
 ):
     GROUP_SIZE_C = choose_group_size(C_IN)
     NUM_GROUPS = triton.cdiv(C_IN, GROUP_SIZE_C)
@@ -265,11 +293,17 @@ def _build_linear_metadata(
         ZERO_CANDIDATE_CLASS=TILE_ZERO_CANDIDATE,
     )
 
-    if prescan_stats is not None:
-        tc = tile_class_buf[:N_TILES]
-        prescan_stats['stage1_zero_candidate'] = int((tc == TILE_ZERO_CANDIDATE).sum().item())
-        prescan_stats['stage1_denseish'] = int((tc == TILE_DENSEISH).sum().item())
-        prescan_stats['stage1_uncertain'] = int((tc == TILE_UNCERTAIN).sum().item())
+    stage1_summary = None
+    if prescan_stats is not None or allow_stage1_dense_fallback:
+        stage1_summary, stage1_avg_active_ratio = _summarize_stage1_metadata(
+            tile_class_buf, ag_mask_buf, N_TILES, NUM_GROUPS
+        )
+        if prescan_stats is not None:
+            prescan_stats.update(stage1_summary)
+        if allow_stage1_dense_fallback and stage1_avg_active_ratio > fallback_ratio:
+            if prescan_stats is not None:
+                prescan_stats["stage1_dense_fallback"] = 1
+            return GROUP_SIZE_C, NUM_GROUPS, True, stage1_summary
 
     linear_zero_candidate_refine_kernel[(N_TILES,)](
         x_f16, tile_class_buf, ag_mask_buf,
@@ -293,7 +327,7 @@ def _build_linear_metadata(
         UNCERTAIN_CLASS=TILE_UNCERTAIN,
     )
 
-    return GROUP_SIZE_C, NUM_GROUPS
+    return GROUP_SIZE_C, NUM_GROUPS, False, stage1_summary
 
 
 # ---------------------------------------------------------------------------
@@ -490,7 +524,6 @@ def sparse_linear_forward(
     N_TILES = triton.cdiv(N, BLOCK_M)
 
     x_f16 = x if (x.dtype == torch.float16 and x.is_contiguous()) else x.half().contiguous()
-    w_t_f16 = w_t if w_t is not None else weight.half().t().contiguous()
 
     if ag_mask_buf is None or ag_mask_buf.numel() < N_TILES:
         ag_mask_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
@@ -498,7 +531,9 @@ def sparse_linear_forward(
         tile_class_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
 
     prescan_stats = {} if return_tile_stats else None
-    group_size_c, num_groups = _build_linear_metadata(
+    stage1_dense_fallback = False
+    stage1_summary = None
+    group_size_c, num_groups, stage1_dense_fallback, stage1_summary = _build_linear_metadata(
         x_f16,
         N,
         C_IN,
@@ -508,7 +543,25 @@ def sparse_linear_forward(
         ag_mask_buf,
         tile_class_buf,
         prescan_stats=prescan_stats,
+        allow_stage1_dense_fallback=(return_avg_active_ratio and not return_tile_stats),
+        fallback_ratio=fallback_ratio,
     )
+
+    if stage1_dense_fallback:
+        stage1_avg_active_ratio = 1.0
+        if stage1_summary is not None:
+            stage1_avg_active_ratio = float(
+                stage1_summary.get("stage1_avg_active_group_ratio_lower_bound", 1.0)
+            )
+        return _dense_fallback(
+            reason="stage1_metadata_dense_fallback",
+            avg_active_ratio_val=stage1_avg_active_ratio,
+            tile_stats_val=None,
+            backend_meta_extra={
+                "stage1_dense_fallback": True,
+                "total_tiles": int(N_TILES),
+            },
+        )
 
     avg_active_ratio = None
     tile_stats = None
@@ -627,6 +680,8 @@ def sparse_linear_forward(
         use_tile_ids = True
         if active_tiles_for_meta is None:
             active_tiles_for_meta = int(active_tile_count)
+
+    w_t_f16 = w_t if w_t is not None else weight.half().t().contiguous()
 
     y = torch.zeros(N, C_OUT, dtype=torch.float32, device=device)
     if bias is not None:

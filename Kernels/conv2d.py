@@ -104,6 +104,33 @@ def _build_active_tile_ids(tile_class_buf, N_TILES):
     return active.to(dtype=torch.int32).contiguous(), int(active.numel())
 
 
+def _summarize_stage1_metadata(tile_class_buf, ag_mask_buf, N_TILES, NUM_GROUPS):
+    """Summarize Stage-1 coarse metadata.
+
+    The Stage-1 group mask is a lower bound on the final active-group mask for
+    ZERO_CANDIDATE / UNCERTAIN tiles. If this lower bound is already dense-ish
+    enough, we can safely bail out to the dense path without paying for the
+    later refinement stages.
+    """
+    tc = tile_class_buf[:N_TILES]
+    summary = {
+        "stage1_zero_candidate": int((tc == TILE_ZERO_CANDIDATE).sum().item()),
+        "stage1_denseish": int((tc == TILE_DENSEISH).sum().item()),
+        "stage1_uncertain": int((tc == TILE_UNCERTAIN).sum().item()),
+    }
+    if N_TILES <= 0:
+        summary["stage1_avg_active_group_ratio_lower_bound"] = 0.0
+        return summary, 0.0
+    if NUM_GROUPS <= 0:
+        summary["stage1_avg_active_group_ratio_lower_bound"] = 1.0
+        return summary, 1.0
+
+    pc = _popcount_buf(ag_mask_buf, N_TILES)
+    avg_active_ratio = float(pc.sum().item()) / max(float(N_TILES * NUM_GROUPS), 1.0)
+    summary["stage1_avg_active_group_ratio_lower_bound"] = avg_active_ratio
+    return summary, avg_active_ratio
+
+
 # ===========================================================================
 # STAGE 1: Coarse 3-way classification (NCHW)
 # ===========================================================================
@@ -483,11 +510,14 @@ def _build_two_stage_metadata(
     kernel_size, stride, padding, threshold,
     ag_mask_buf, tile_class_buf,
     prescan_stats=None,
+    allow_stage1_dense_fallback=False,
+    fallback_ratio=FALLBACK_RATIO,
 ):
     GROUP_SIZE_C = choose_group_size(C_IN)
     N_TILES = N * GH * GW
     NUM_GROUPS = triton.cdiv(C_IN, GROUP_SIZE_C)
     ALL_ONES_MASK = (1 << NUM_GROUPS) - 1
+    stage1_summary = None
 
     # Receptive-field size for non-1x1 kernels. Shared across Stage 1, 2a, 2b.
     if kernel_size != 1:
@@ -517,11 +547,16 @@ def _build_two_stage_metadata(
             UNCERTAIN_CLASS=TILE_UNCERTAIN, ZERO_CANDIDATE_CLASS=TILE_ZERO_CANDIDATE,
         )
 
-    if prescan_stats is not None:
-        tc = tile_class_buf[:N_TILES]
-        prescan_stats['stage1_zero_candidate'] = int((tc == TILE_ZERO_CANDIDATE).sum().item())
-        prescan_stats['stage1_denseish'] = int((tc == TILE_DENSEISH).sum().item())
-        prescan_stats['stage1_uncertain'] = int((tc == TILE_UNCERTAIN).sum().item())
+    if prescan_stats is not None or allow_stage1_dense_fallback:
+        stage1_summary, stage1_avg_active_ratio = _summarize_stage1_metadata(
+            tile_class_buf, ag_mask_buf, N_TILES, NUM_GROUPS
+        )
+        if prescan_stats is not None:
+            prescan_stats.update(stage1_summary)
+        if allow_stage1_dense_fallback and stage1_avg_active_ratio > fallback_ratio:
+            if prescan_stats is not None:
+                prescan_stats["stage1_dense_fallback"] = 1
+            return GROUP_SIZE_C, NUM_GROUPS, True, stage1_summary
 
     # Stage 2a: zero-candidate refine
     if kernel_size == 1:
@@ -575,7 +610,7 @@ def _build_two_stage_metadata(
         prescan_stats['stage2_zero_refine_tiles'] = prescan_stats.get('stage1_zero_candidate', 0)
         prescan_stats['stage2_uncertain_tiles'] = prescan_stats.get('stage1_uncertain', 0)
 
-    return GROUP_SIZE_C, NUM_GROUPS
+    return GROUP_SIZE_C, NUM_GROUPS, False, stage1_summary
 
 
 # ---------------------------------------------------------------------------
@@ -1157,11 +1192,6 @@ def sparse_conv2d_forward(
     GW = triton.cdiv(W_OUT, BW)
     N_TILES = N * GH * GW
 
-    if w_cl is not None:
-        w_cl_f16 = w_cl
-    else:
-        w_cl_f16 = weight.half().permute(0, 2, 3, 1).contiguous() if kernel_size == 3 else weight.half().reshape(C_OUT, C_IN).contiguous()
-
     x_f16 = x if (x.dtype == torch.float16 and x.is_contiguous()) else x.half().contiguous()
 
     if ag_mask_buf is None or ag_mask_buf.numel() < N_TILES:
@@ -1170,11 +1200,32 @@ def sparse_conv2d_forward(
         tile_class_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
 
     prescan_stats = {} if return_tile_stats else None
-    _build_two_stage_metadata(
+    stage1_dense_fallback = False
+    stage1_summary = None
+    GROUP_SIZE_C, NUM_GROUPS, stage1_dense_fallback, stage1_summary = _build_two_stage_metadata(
         x_f16, N, C_IN, H_IN, W_IN, H_OUT, W_OUT,
         BH, BW, GH, GW, kernel_size, stride, padding, threshold,
-        ag_mask_buf, tile_class_buf, prescan_stats=prescan_stats,
+        ag_mask_buf, tile_class_buf,
+        prescan_stats=prescan_stats,
+        allow_stage1_dense_fallback=(return_avg_active_ratio and not return_tile_stats),
+        fallback_ratio=fallback_ratio,
     )
+
+    if stage1_dense_fallback:
+        stage1_avg_active_ratio = 1.0
+        if stage1_summary is not None:
+            stage1_avg_active_ratio = float(
+                stage1_summary.get("stage1_avg_active_group_ratio_lower_bound", 1.0)
+            )
+        return _dense_fallback(
+            reason="stage1_metadata_dense_fallback",
+            avg_active_ratio_val=stage1_avg_active_ratio,
+            tile_stats_val=None,
+            backend_meta_extra={
+                "stage1_dense_fallback": True,
+                "total_tiles": N_TILES,
+            },
+        )
 
     # ====== [P0] Sync-gated: only compute stats when requested ======
     avg_active_ratio = None
@@ -1231,6 +1282,14 @@ def sparse_conv2d_forward(
 
     if x_nhwc is None:
         x_nhwc = x_f16.permute(0, 2, 3, 1).contiguous()
+    if w_cl is not None:
+        w_cl_f16 = w_cl
+    else:
+        w_cl_f16 = (
+            weight.half().permute(0, 2, 3, 1).contiguous()
+            if kernel_size == 3
+            else weight.half().reshape(C_OUT, C_IN).contiguous()
+        )
 
     y = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=torch.float32, device=device)
 

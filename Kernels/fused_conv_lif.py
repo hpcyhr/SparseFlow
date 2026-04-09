@@ -360,14 +360,6 @@ def sparse_fused_conv_lif_forward(
     GW = triton.cdiv(W_OUT, BW)
     N_TILES = N * GH * GW
 
-    if w_cl is not None:
-        w_cl_f16 = w_cl
-    else:
-        if kernel_size == 3:
-            w_cl_f16 = weight.half().permute(0, 2, 3, 1).contiguous()
-        else:
-            w_cl_f16 = weight.half().reshape(C_OUT, C_IN).contiguous()
-
     # 1x1 or unsupported → dense fallback with LIF
     if kernel_size != 3:
         y = Fn.conv2d(x, weight, bias, stride=1, padding=0).float()
@@ -426,6 +418,11 @@ def sparse_fused_conv_lif_forward(
         if return_avg_active_ratio:
             return sp, vn, 0.0, avg_active_ratio
         return sp, vn, 0.0
+
+    if w_cl is not None:
+        w_cl_f16 = w_cl
+    else:
+        w_cl_f16 = weight.half().permute(0, 2, 3, 1).contiguous()
 
     has_bias = bias is not None
     bias_f32 = bias.float().contiguous() if has_bias else torch.empty(1, device=device)

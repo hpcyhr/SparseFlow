@@ -432,20 +432,11 @@ def sparse_conv3d_forward(
 
     # ---- prepare buffers ----
     x_ndhwc = x.permute(0, 2, 3, 4, 1).contiguous().to(torch.float16)
-    w_kc = (
-        weight.permute(0, 2, 3, 4, 1)
-        .contiguous()
-        .to(torch.float16)
-        .view(C_OUT, KD * KH * KW * C_IN)
-    )
 
     if ag_mask_buf is None or ag_mask_buf.numel() < N_TILES:
         ag_mask_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
     if tile_class_buf is None or tile_class_buf.numel() < N_TILES:
         tile_class_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
-
-    bias_arg = (bias.to(torch.float32) if bias is not None
-                else torch.empty(1, dtype=torch.float32, device=device))
 
     sparse_ms = 0.0
     if return_ms:
@@ -535,6 +526,17 @@ def sparse_conv3d_forward(
         active_ids = active_tile_ids_buf
         active_count = n_active
         use_tile_ids = True
+
+    w_kc = (
+        weight.permute(0, 2, 3, 4, 1)
+        .contiguous()
+        .to(torch.float16)
+        .view(C_OUT, KD * KH * KW * C_IN)
+    )
+    bias_arg = (
+        bias.to(torch.float32) if bias is not None
+        else torch.empty(1, dtype=torch.float32, device=device)
+    )
 
     # ---- Stage 2: compute ----
     # [C.3] Pre-fill bias so TILE_ZERO tiles (early-return in kernel) are correct.

@@ -233,7 +233,6 @@ def sparse_matmul_forward(
         return _finalize(c, 0.0, ratio, tile_stats)
 
     a_f16 = a.half().contiguous()
-    b_f16 = b.half().contiguous()
 
     # Buffer allocation for prescan metadata
     if ag_mask_buf is None or ag_mask_buf.numel() < N_TILES_M:
@@ -245,7 +244,7 @@ def sparse_matmul_forward(
     # A's geometry [M, K] maps to linear's [N_val, C_IN].
     prescan_stats = {} if return_tile_stats else None
     try:
-        _build_linear_metadata(
+        _, _, stage1_dense_fallback, stage1_summary = _build_linear_metadata(
             x_f16=a_f16,
             N=M,
             C_IN=K,
@@ -255,6 +254,8 @@ def sparse_matmul_forward(
             ag_mask_buf=ag_mask_buf,
             tile_class_buf=tile_class_buf,
             prescan_stats=prescan_stats,
+            allow_stage1_dense_fallback=(return_avg_active_ratio and not return_tile_stats),
+            fallback_ratio=fallback_ratio,
         )
     except Exception:
         c = torch.mm(a.float(), b.float())
@@ -265,6 +266,15 @@ def sparse_matmul_forward(
         } if return_tile_stats else None
         ratio = 1.0 if return_avg_active_ratio else None
         return _finalize(c, 0.0, ratio, tile_stats)
+
+    if stage1_dense_fallback:
+        stage1_avg_ratio = 1.0
+        if stage1_summary is not None:
+            stage1_avg_ratio = float(
+                stage1_summary.get("stage1_avg_active_group_ratio_lower_bound", 1.0)
+            )
+        c = torch.mm(a.float(), b.float())
+        return _finalize(c, 0.0, stage1_avg_ratio, None)
 
     # Dense fallback check (sync-gated on need_stats)
     if need_stats:
@@ -282,6 +292,8 @@ def sparse_matmul_forward(
             'avg_active_ratio': avg_ratio,
         } if return_tile_stats else None
         return _finalize(c, 0.0, avg_ratio, tile_stats)
+
+    b_f16 = b.half().contiguous()
 
     # Allocate output
     c = torch.empty(M, N, dtype=torch.float32, device=device)

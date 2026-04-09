@@ -246,7 +246,6 @@ def sparse_bmm_forward(
 
     TOTAL_META = B_dim * N_TILES_M
     a_f16 = a.half().contiguous()
-    b_f16 = b.half().contiguous()
 
     # Allocate metadata
     if ag_mask_buf is None or ag_mask_buf.numel() < TOTAL_META:
@@ -284,6 +283,8 @@ def sparse_bmm_forward(
         c = torch.bmm(a.float(), b.float())
         stats = {'total_tiles': TOTAL_META, 'fallback': True} if return_tile_stats else None
         return _finalize(c, 0.0, avg_ratio, stats)
+
+    b_f16 = b.half().contiguous()
 
     # Output
     c = torch.empty(B_dim, M, N, dtype=torch.float32, device=device)
