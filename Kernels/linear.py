@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 from triton import autotune, Config
+from typing import Optional
 from Utils.config import PRESCAN_ACTIVITY_EPS, SPARSE_DENSE_RATIO_THRESHOLD
 from Utils.sparse_helpers import (
     TILE_ZERO,
@@ -21,6 +22,7 @@ from Utils.sparse_helpers import (
 
 TRITON_MAX_TENSOR_NUMEL = 131072
 FALLBACK_RATIO = SPARSE_DENSE_RATIO_THRESHOLD
+AUTO_LAUNCH_ALL_ACTIVE_TILE_RATIO = 0.75
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +54,11 @@ def _check_dense_fallback(
     return avg_active > float(fallback_ratio) * float(num_groups)
 
 
-def _build_active_tile_ids(tile_class_buf: torch.Tensor, n_tiles: int):
+def _build_active_tile_ids(
+    tile_class_buf: torch.Tensor,
+    n_tiles: int,
+    active_tile_ids_buf: Optional[torch.Tensor] = None,
+):
     """
     NOTE: calls torch.nonzero() and syncs GPU->CPU. Only call in active_only mode.
     """
@@ -60,7 +66,11 @@ def _build_active_tile_ids(tile_class_buf: torch.Tensor, n_tiles: int):
     active = torch.nonzero(tc != TILE_ZERO, as_tuple=False).flatten()
     if active.numel() == 0:
         return active.to(dtype=torch.int32), 0
-    return active.to(dtype=torch.int32).contiguous(), int(active.numel())
+    active = active.to(dtype=torch.int32).contiguous()
+    if active_tile_ids_buf is not None and active_tile_ids_buf.numel() >= active.numel():
+        active_tile_ids_buf[: active.numel()].copy_(active)
+        return active_tile_ids_buf[: active.numel()], int(active.numel())
+    return active, int(active.numel())
 
 
 def _summarize_stage1_metadata(
@@ -347,6 +357,7 @@ _LINEAR_CONFIGS = [
 def sparse_linear_grouped_kernel(
     x_ptr,
     w_t_ptr,
+    bias_ptr,
     tile_class_ptr,
     ag_mask_ptr,
     tile_ids_ptr,
@@ -362,6 +373,7 @@ def sparse_linear_grouped_kernel(
     DENSE_K: tl.constexpr,
     GROUP_SIZE_C: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
     USE_TILE_IDS: tl.constexpr,
 ):
     pid_tile = tl.program_id(0)
@@ -383,6 +395,12 @@ def sparse_linear_grouped_kernel(
     tc = tl.load(tile_class_ptr + tile_id + off1)
     tile_cls = tl.sum(tc)
     if tile_cls == TILE_ZERO:
+        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        if HAS_BIAS:
+            acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
+        out_addrs = offs_m[:, None] * C_OUT + offs_n[None, :]
+        out_mask = m_mask[:, None] & n_mask[None, :]
+        tl.store(y_ptr + out_addrs, acc, mask=out_mask)
         return
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -424,10 +442,11 @@ def sparse_linear_grouped_kernel(
 
                     acc += tl.dot(x_tile, w_tile)
 
+    if HAS_BIAS:
+        acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
     out_addrs = offs_m[:, None] * C_OUT + offs_n[None, :]
     out_mask = m_mask[:, None] & n_mask[None, :]
-    out_old = tl.load(y_ptr + out_addrs, mask=out_mask, other=0.0)
-    tl.store(y_ptr + out_addrs, out_old + acc, mask=out_mask)
+    tl.store(y_ptr + out_addrs, acc, mask=out_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +585,7 @@ def sparse_linear_forward(
     avg_active_ratio = None
     tile_stats = None
     active_tiles_for_meta = None
+    launch_mode_reason = "all_tiles_requested" if launch_all_tiles else "active_only_default"
 
     if need_stats:
         tc = tile_class_buf[:N_TILES]
@@ -611,6 +631,13 @@ def sparse_linear_forward(
                     "denseish_ratio_nonzero": denseish_ratio,
                 },
             )
+        if (
+            not launch_all_tiles
+            and N_TILES > 0
+            and (float(total_nonzero) / float(N_TILES)) >= AUTO_LAUNCH_ALL_ACTIVE_TILE_RATIO
+        ):
+            launch_all_tiles = True
+            launch_mode_reason = "auto_active_tile_ratio"
 
         if launch_all_tiles and total_nonzero == 0:
             return _zero_tiles_output(
@@ -664,28 +691,26 @@ def sparse_linear_forward(
         use_tile_ids = False
         tile_ids_ptr = ag_mask_buf  # placeholder, ignored in all_tiles mode
     else:
-        active_tile_ids, active_tile_count = _build_active_tile_ids(tile_class_buf, N_TILES)
+        active_tile_ids, active_tile_count = _build_active_tile_ids(
+            tile_class_buf,
+            N_TILES,
+            active_tile_ids_buf=active_tile_ids_buf,
+        )
         if active_tile_count == 0:
             return _zero_tiles_output(
                 reason="all_tiles_zero_after_metadata",
                 tile_stats_val=tile_stats,
                 backend_meta_extra={"active_tiles": 0, "total_tiles": int(N_TILES)},
             )
-        if active_tile_ids_buf is not None and active_tile_ids_buf.numel() >= active_tile_count:
-            active_tile_ids_buf[:active_tile_count].copy_(active_tile_ids)
-            tile_ids_ptr = active_tile_ids_buf[:active_tile_count]
-        else:
-            tile_ids_ptr = active_tile_ids
+        tile_ids_ptr = active_tile_ids
         launch_count = active_tile_count
         use_tile_ids = True
         if active_tiles_for_meta is None:
             active_tiles_for_meta = int(active_tile_count)
 
     w_t_f16 = w_t if w_t is not None else weight.half().t().contiguous()
-
-    y = torch.zeros(N, C_OUT, dtype=torch.float32, device=device)
-    if bias is not None:
-        y = y + bias.detach().float().view(1, -1)
+    bias_arg = bias.detach().float() if bias is not None else torch.empty(1, dtype=torch.float32, device=device)
+    y = torch.empty(N, C_OUT, dtype=torch.float32, device=device)
 
     sparse_ms = 0.0
     if return_ms:
@@ -699,6 +724,7 @@ def sparse_linear_forward(
     sparse_linear_grouped_kernel[_grid](
         x_f16,
         w_t_f16,
+        bias_arg,
         tile_class_buf,
         ag_mask_buf,
         tile_ids_ptr,
@@ -712,6 +738,7 @@ def sparse_linear_forward(
         BLOCK_M=BLOCK_M,
         GROUP_SIZE_C=group_size_c,
         NUM_GROUPS=num_groups,
+        HAS_BIAS=(bias is not None),
         USE_TILE_IDS=use_tile_ids,
     )
 
@@ -726,6 +753,7 @@ def sparse_linear_forward(
         "total_tiles": int(N_TILES),
         "launch_count": int(launch_count),
         "launch_mode": "all_tiles" if launch_all_tiles else "active_only",
+        "launch_mode_reason": launch_mode_reason,
     }
     if active_tiles_for_meta is not None:
         backend_meta["active_tiles"] = int(active_tiles_for_meta)

@@ -118,10 +118,11 @@ class SparseConv2d(nn.Module):
         the kernel. Only echoed by `extra_repr`.
 
     launch_all_tiles : bool
-        Mode A (False, default): build active tile IDs, launch only active.
-        Mode B (True): launch all tiles, zero tiles early-return in kernel.
-        Mode B eliminates the nonzero() sync in _build_active_tile_ids.
-        Use set_launch_all_tiles() or the constructor to configure.
+        When True, force launch-all mode.
+        When False, use the adaptive default: small-tile or dense-ish layers may
+        still switch to launch-all to avoid compaction overhead; otherwise the
+        path compacts active tiles and launches only those.
+        Use set_launch_all_tiles() or the constructor to configure the override.
 
     Public state-changing methods
     -----------------------------
@@ -202,6 +203,9 @@ class SparseConv2d(nn.Module):
         self._force_zero = False
         self._force_dense = False
         self._inference_mode = False  # disable calibration for timing
+        self._auto_launch_small_tile_threshold = 32
+        self._auto_launch_active_tile_threshold = 0.75
+        self._auto_launch_group_ratio_threshold = min(self._dense_threshold, 0.60)
 
         # Triton availability cached once at import time; no per-forward probe.
         self._triton_available = _TRITON_AVAILABLE
@@ -225,7 +229,7 @@ class SparseConv2d(nn.Module):
     # Runtime A/B switch
     # ----------------------------------------------------------------
     def set_launch_all_tiles(self, enabled: bool):
-        """Switch between Mode A (active-tile-ID launch) and Mode B (launch-all)."""
+        """Force launch-all mode on or off; False re-enables the adaptive default."""
         self.launch_all_tiles = bool(enabled)
 
     # ----------------------------------------------------------------
@@ -335,6 +339,47 @@ class SparseConv2d(nn.Module):
         h_out = (h_in + 2 * p_h - d_h * (k_h - 1) - 1) // s_h + 1
         w_out = (w_in + 2 * p_w - d_w * (k_w - 1) - 1) // s_w + 1
         return int(h_out), int(w_out)
+
+    def _estimate_tile_count(self, x) -> int:
+        h_out, w_out = self._output_hw(int(x.shape[2]), int(x.shape[3]))
+        if h_out <= 0 or w_out <= 0:
+            return 0
+        bh, bw = _select_tile_sizes(h_out, w_out)
+        return int(x.shape[0] * triton.cdiv(h_out, bh) * triton.cdiv(w_out, bw))
+
+    def _choose_launch_all_tiles(self, x) -> bool:
+        if self.launch_all_tiles:
+            return True
+
+        n_tiles = self._estimate_tile_count(x)
+        if 0 < n_tiles <= self._auto_launch_small_tile_threshold:
+            return True
+
+        total_tiles = self._last_diag.get("total_tile_count", self._last_diag.get("total_tiles", 0))
+        active_tiles = self._last_diag.get("active_tiles")
+        zero_tiles = self._last_diag.get("tile_zero_count")
+        if total_tiles:
+            if active_tiles is not None:
+                active_tile_ratio = float(active_tiles) / max(float(total_tiles), 1.0)
+            elif zero_tiles is not None:
+                active_tile_ratio = 1.0 - (float(zero_tiles) / max(float(total_tiles), 1.0))
+            else:
+                active_tile_ratio = None
+            if (
+                active_tile_ratio is not None
+                and active_tile_ratio >= self._auto_launch_active_tile_threshold
+            ):
+                return True
+
+        hist_ratio = self._ema_active_ratio
+        if hist_ratio is None and self._last_avg_active_ratio >= 0.0:
+            hist_ratio = self._last_avg_active_ratio
+        if (
+            hist_ratio is not None
+            and hist_ratio >= self._auto_launch_group_ratio_threshold
+        ):
+            return True
+        return False
 
     def _ensure_buffers(self, x):
         h_in, w_in = x.shape[2], x.shape[3]
@@ -586,6 +631,7 @@ class SparseConv2d(nn.Module):
         collect_tiles = self.collect_diag
         want_ratio = need_ratio or collect_tiles
         want_tiles = collect_tiles
+        launch_all_tiles = self._choose_launch_all_tiles(x)
 
         # Single .half() → x_f16 NCHW. Defer NHWC packing on the
         # ratio-only calibration path so an early dense bailout can skip it.
@@ -619,7 +665,7 @@ class SparseConv2d(nn.Module):
             return_backend_meta=True,
             x_nhwc=x_nhwc,
             active_tile_ids_buf=active_tile_ids_buf,
-            launch_all_tiles=self.launch_all_tiles,
+            launch_all_tiles=launch_all_tiles,
         )
 
         # --- Unpack result ---
@@ -721,6 +767,8 @@ class SparseConv2d(nn.Module):
                 self._last_diag['launch_tile_count'] = backend_meta.get('launch_count', backend_meta['total_tiles'])
             if 'denseish_ratio_nonzero' in backend_meta:
                 self._last_diag['denseish_ratio_nonzero'] = backend_meta['denseish_ratio_nonzero']
+            if 'launch_mode_reason' in backend_meta:
+                self._last_diag['launch_mode_reason'] = backend_meta['launch_mode_reason']
         self._last_diag['backend_family'] = self.backend_family
         self._last_diag['diag_path'] = self.diag_path
         self._last_diag['fallback_reason'] = self.fallback_reason

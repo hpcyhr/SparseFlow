@@ -140,6 +140,9 @@ class SparseLinear(nn.Module):
         self._force_zero = False
         self._force_dense = False
         self._inference_mode = False
+        self._auto_launch_small_tile_threshold = 32
+        self._auto_launch_active_tile_threshold = 0.75
+        self._auto_launch_group_ratio_threshold = min(self._dense_threshold, 0.60)
 
         # diagnostics
         self.collect_diag = False
@@ -305,6 +308,45 @@ class SparseLinear(nn.Module):
             self._active_tile_ids_buf = torch.empty(n_tiles, dtype=torch.int32, device=x2d.device)
 
         return self._ag_mask_buf, self._tile_class_buf, self._active_tile_ids_buf
+
+    def _estimate_tile_count(self, x2d: torch.Tensor) -> int:
+        n_rows = int(x2d.shape[0])
+        block_m = _select_linear_block_m(n_rows)
+        return int(triton.cdiv(n_rows, block_m))
+
+    def _choose_launch_all_tiles(self, x2d: torch.Tensor) -> bool:
+        if self.launch_all_tiles:
+            return True
+
+        n_tiles = self._estimate_tile_count(x2d)
+        if 0 < n_tiles <= self._auto_launch_small_tile_threshold:
+            return True
+
+        total_tiles = self._last_diag.get("total_tile_count", self._last_diag.get("total_tiles", 0))
+        active_tiles = self._last_diag.get("active_tiles")
+        zero_tiles = self._last_diag.get("tile_zero_count")
+        if total_tiles:
+            if active_tiles is not None:
+                active_tile_ratio = float(active_tiles) / max(float(total_tiles), 1.0)
+            elif zero_tiles is not None:
+                active_tile_ratio = 1.0 - (float(zero_tiles) / max(float(total_tiles), 1.0))
+            else:
+                active_tile_ratio = None
+            if (
+                active_tile_ratio is not None
+                and active_tile_ratio >= self._auto_launch_active_tile_threshold
+            ):
+                return True
+
+        hist_ratio = self._ema_active_ratio
+        if hist_ratio is None and self._last_avg_active_ratio >= 0.0:
+            hist_ratio = self._last_avg_active_ratio
+        if (
+            hist_ratio is not None
+            and hist_ratio >= self._auto_launch_group_ratio_threshold
+        ):
+            return True
+        return False
 
     def _zero_output_2d(self, x2d: torch.Tensor) -> torch.Tensor:
         y = torch.zeros(
@@ -536,6 +578,7 @@ class SparseLinear(nn.Module):
         collect_tiles = self.collect_diag
         want_ratio = need_ratio or collect_tiles
         want_tiles = collect_tiles
+        launch_all_tiles = self._choose_launch_all_tiles(x2d)
 
         try:
             result = sparse_linear_forward(
@@ -552,7 +595,7 @@ class SparseLinear(nn.Module):
                 return_avg_active_ratio=want_ratio,
                 return_tile_stats=want_tiles,
                 return_backend_meta=True,
-                launch_all_tiles=self.launch_all_tiles,
+                launch_all_tiles=launch_all_tiles,
             )
         except Exception as err:
             # Robust fallback for Triton compile/autotune/runtime failures.
@@ -742,7 +785,7 @@ class SparseLinear(nn.Module):
         if backend_meta is not None:
             self._last_diag["backend"] = backend_meta.get("backend", "unknown")
             self._last_diag["backend_reason"] = backend_meta.get("reason", "unknown")
-            for key in ("launch_mode", "launch_count", "active_tiles", "total_tiles"):
+            for key in ("launch_mode", "launch_mode_reason", "launch_count", "active_tiles", "total_tiles"):
                 if key in backend_meta:
                     self._last_diag[key] = backend_meta[key]
 

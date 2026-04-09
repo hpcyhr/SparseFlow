@@ -41,6 +41,7 @@ TILE_UNCERTAIN = 3
 TILE_ZERO_CANDIDATE = 4
 
 FALLBACK_RATIO = SPARSE_DENSE_RATIO_THRESHOLD
+AUTO_LAUNCH_ALL_ACTIVE_TILE_RATIO = 0.75
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -95,13 +96,17 @@ def _check_dense_fallback(ag_mask_buf, N_TILES, NUM_GROUPS, fallback_ratio=FALLB
     return avg_active > fallback_ratio * NUM_GROUPS
 
 
-def _build_active_tile_ids(tile_class_buf, N_TILES):
+def _build_active_tile_ids(tile_class_buf, N_TILES, active_tile_ids_buf=None):
     """NOTE: calls torch.nonzero() → GPU→CPU sync. Only use in Mode A path."""
     tc = tile_class_buf[:N_TILES]
     active = torch.nonzero(tc != TILE_ZERO, as_tuple=False).flatten()
     if active.numel() == 0:
         return active.to(dtype=torch.int32), 0
-    return active.to(dtype=torch.int32).contiguous(), int(active.numel())
+    active = active.to(dtype=torch.int32).contiguous()
+    if active_tile_ids_buf is not None and active_tile_ids_buf.numel() >= active.numel():
+        active_tile_ids_buf[: active.numel()].copy_(active)
+        return active_tile_ids_buf[: active.numel()], int(active.numel())
+    return active, int(active.numel())
 
 
 def _summarize_stage1_metadata(tile_class_buf, ag_mask_buf, N_TILES, NUM_GROUPS):
@@ -1230,6 +1235,8 @@ def sparse_conv2d_forward(
     # ====== [P0] Sync-gated: only compute stats when requested ======
     avg_active_ratio = None
     tile_stats_base = None
+    active_tiles_for_meta = None
+    launch_mode_reason = "all_tiles_requested" if launch_all_tiles else "active_only_default"
 
     if need_stats:
         tc = tile_class_buf[:N_TILES]
@@ -1238,6 +1245,7 @@ def sparse_conv2d_forward(
         dc = int((tc == TILE_DENSEISH).sum().item())
         total_nonzero = sc + dc
         denseish_ratio = float(dc) / max(float(total_nonzero), 1.0)
+        active_tiles_for_meta = int(total_nonzero)
 
         if NUM_GROUPS > 0:
             pc = _popcount_buf(ag_mask_buf, N_TILES)
@@ -1262,6 +1270,13 @@ def sparse_conv2d_forward(
                 tile_stats_val=tile_stats_base,
                 backend_meta_extra={"active_tiles": total_nonzero, "total_tiles": N_TILES, "denseish_ratio_nonzero": denseish_ratio},
             )
+        if (
+            not launch_all_tiles
+            and N_TILES > 0
+            and (float(total_nonzero) / float(N_TILES)) >= AUTO_LAUNCH_ALL_ACTIVE_TILE_RATIO
+        ):
+            launch_all_tiles = True
+            launch_mode_reason = "auto_active_tile_ratio"
 
     # ====== [P1] A/B tile launch switch ======
     if launch_all_tiles:
@@ -1269,7 +1284,11 @@ def sparse_conv2d_forward(
         use_tile_ids = False
         tile_ids_ptr = ag_mask_buf  # unused placeholder
     else:
-        active_tile_ids, active_tile_count = _build_active_tile_ids(tile_class_buf, N_TILES)
+        active_tile_ids, active_tile_count = _build_active_tile_ids(
+            tile_class_buf,
+            N_TILES,
+            active_tile_ids_buf=active_tile_ids_buf,
+        )
         if active_tile_count == 0:
             return _zero_tiles_output(
                 reason="all_tiles_zero_after_metadata",
@@ -1279,6 +1298,8 @@ def sparse_conv2d_forward(
         launch_count = active_tile_count
         use_tile_ids = True
         tile_ids_ptr = active_tile_ids
+        if active_tiles_for_meta is None:
+            active_tiles_for_meta = int(active_tile_count)
 
     if x_nhwc is None:
         x_nhwc = x_f16.permute(0, 2, 3, 1).contiguous()
@@ -1329,6 +1350,9 @@ def sparse_conv2d_forward(
         "backend": "sparse_triton", "reason": "v25_sync_gated",
         "total_tiles": N_TILES, "launch_count": launch_count,
         "launch_mode": "all_tiles" if launch_all_tiles else "active_only",
+        "launch_mode_reason": launch_mode_reason,
     }
+    if active_tiles_for_meta is not None:
+        backend_meta["active_tiles"] = int(active_tiles_for_meta)
 
     return _finalize_return(y, sparse_ms, avg_active_ratio, tile_stats_base, backend_meta)
