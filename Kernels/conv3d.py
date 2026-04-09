@@ -1,16 +1,46 @@
 """
-SparseFlow Kernels/conv3d.py - Unified Sparse Conv3d kernel framework.
+SparseFlow Kernels/conv3d.py - v2 unified Triton sparse Conv3d.
 
-This file aligns Conv3d with Conv1d/Conv2d framework semantics:
-1) output-space tiling + channel grouping
-2) metadata build (tile_class + active-group bitmask)
-3) optional sync-gated stats / dense fallback
-4) launch mode switch (active_only vs all_tiles)
-5) active-group sparse execution via Triton
-6) structured outputs (avg_active_ratio / tile_stats / backend_meta)
+Replaces the previous host-loop reference implementation with a real
+two-stage Triton kernel that follows the canonical SparseFlow method:
+
+  Stage 1: prescan kernel scans the (KD x KH x KW) receptive field of each
+           output tile across C_in groups and emits per-tile metadata
+           (tile_class, ag_mask).
+  Stage 2: compute kernel branches per tile on tile_class:
+             ZERO     -> bias-only output
+             DENSEISH -> flat dense reduction over all C_in
+             SPARSE   -> grouped bitmask iteration with `if g_active != 0`
+                         to actually skip the load + tl.dot of inactive groups.
+
+Layouts:
+  - Input  x is permuted to NDHWC (channels-last) for coalesced loads.
+  - Weight w is materialized as [C_out, KD, KH, KW, C_in] (k-then-channel)
+    flattened to [C_out, KD*KH*KW*C_in] for contiguous reduction-dim access.
+  - Output y is written to NCDHW (PyTorch standard).
+
+Output tile geometry:
+  - Each tile owns BD x BH x BW output voxels, flattened to
+    BLOCK_M = BD * BH * BW (>= 16, required by tl.dot).
+  - Tile id encodes (n, gd, gh, gw) using row-major over (GD, GH, GW).
+
+Supported sparse-path configurations:
+  - groups == 1
+  - dilation == 1
+  - kernel_size in {1, 3} (cube)
+  - stride in {1, 2}
+  - padding consistent with kernel_size and stride
+
+Anything outside this set falls back to F.conv3d with backend_meta
+explicitly tagged.
+
+Maturity: main_path (production-facing sparse kernel).
 """
 
+from __future__ import annotations
+
 import torch
+import torch.nn.functional as Fn
 import triton
 import triton.language as tl
 from triton import autotune, Config
@@ -34,60 +64,40 @@ from Utils.sparse_helpers import (
 FALLBACK_RATIO = SPARSE_DENSE_RATIO_THRESHOLD
 
 
+# ===========================================================================
+# Tile sizing
+# ===========================================================================
+
 def _select_3d_tile_sizes(d_out: int, h_out: int, w_out: int):
+    """Pick (BD, BH, BW); BD*BH*BW >= 16 (for tl.dot)."""
     voxels = d_out * h_out * w_out
     if voxels >= 4096:
-        return 2, 4, 8
+        return 2, 4, 8   # 64
     if voxels >= 1024:
-        return 2, 4, 4
-    return 2, 2, 4
+        return 2, 4, 4   # 32
+    return 2, 2, 4       # 16
 
 
-def _check_dense_fallback(
-    ag_mask_buf: torch.Tensor,
-    total_tiles: int,
-    num_groups: int,
-    fallback_ratio: float = FALLBACK_RATIO,
-) -> bool:
-    """
-    NOTE: calls .item() and syncs GPU->CPU. Only call this in need_stats paths.
-    """
-    if num_groups == 0:
+def _is_supported_sparse_pattern(kernel_size, stride, padding, dilation, groups):
+    if groups != 1 or dilation != 1:
         return False
-    pc = popcount_buf(ag_mask_buf, total_tiles)
-    avg_active = pc.float().mean().item()
-    return avg_active > float(fallback_ratio) * float(num_groups)
+    if kernel_size == 1 and stride in (1, 2) and padding == 0:
+        return True
+    if kernel_size == 3 and stride in (1, 2) and padding == 1:
+        return True
+    return False
 
 
-def _build_active_tile_ids(tile_class_buf: torch.Tensor, total_tiles: int):
-    """
-    NOTE: calls torch.nonzero() and syncs GPU->CPU. Only call in active_only mode.
-    """
-    tc = tile_class_buf[:total_tiles]
-    active = torch.nonzero(tc != TILE_ZERO, as_tuple=False).flatten()
-    if active.numel() == 0:
-        return active.to(dtype=torch.int32), 0
-    return active.to(dtype=torch.int32).contiguous(), int(active.numel())
-
-
-def _ensure_metadata_buffers(
-    ag_mask_buf: torch.Tensor,
-    tile_class_buf: torch.Tensor,
-    total_tiles: int,
-    device: torch.device,
-):
-    if ag_mask_buf is None or ag_mask_buf.numel() < total_tiles:
-        ag_mask_buf = torch.empty(total_tiles, dtype=torch.int32, device=device)
-    if tile_class_buf is None or tile_class_buf.numel() < total_tiles:
-        tile_class_buf = torch.empty(total_tiles, dtype=torch.int32, device=device)
-    return ag_mask_buf, tile_class_buf
-
+# ===========================================================================
+# Stage 1: prescan kernel
+# ===========================================================================
 
 @triton.jit
 def _prescan_conv3d_kernel(
-    x_ptr,  # [N, C_IN, D_IN, H_IN, W_IN]
-    ag_mask_ptr,  # [TOTAL_TILES]
-    tile_class_ptr,  # [TOTAL_TILES]
+    x_ndhwc_ptr,         # [N, D_IN, H_IN, W_IN, C_IN] fp16 channels-last
+    ag_mask_ptr,         # [N * GD * GH * GW] int32 per-tile bitmask
+    tile_class_ptr,      # [N * GD * GH * GW] int32 per-tile class
+    N_val,
     C_IN: tl.constexpr,
     D_IN: tl.constexpr,
     H_IN: tl.constexpr,
@@ -100,441 +110,329 @@ def _prescan_conv3d_kernel(
     KW: tl.constexpr,
     STRIDE: tl.constexpr,
     PADDING: tl.constexpr,
+    GD: tl.constexpr,
+    GH: tl.constexpr,
+    GW: tl.constexpr,
     BD: tl.constexpr,
     BH: tl.constexpr,
     BW: tl.constexpr,
-    N_TILES_D: tl.constexpr,
-    N_TILES_H: tl.constexpr,
-    N_TILES_W: tl.constexpr,
+    BLOCK_M: tl.constexpr,
     GROUP_SIZE_C: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     ALL_ONES: tl.constexpr,
     THRESHOLD: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    tiles_per_n = N_TILES_D * N_TILES_H * N_TILES_W
-    n_idx = pid // tiles_per_n
-    rem = pid % tiles_per_n
-    td = rem // (N_TILES_H * N_TILES_W)
-    rem2 = rem % (N_TILES_H * N_TILES_W)
-    th = rem2 // N_TILES_W
-    tw = rem2 % N_TILES_W
+    pid_n = tl.program_id(0)
+    pid_dhw = tl.program_id(1)
 
-    d_out_start = td * BD
-    h_out_start = th * BH
-    w_out_start = tw * BW
+    if pid_n >= N_val:
+        return
+
+    gd = pid_dhw // (GH * GW)
+    gh = (pid_dhw // GW) % GH
+    gw = pid_dhw % GW
+
+    d_base = gd * BD
+    h_base = gh * BH
+    w_base = gw * BW
+
+    m_local = tl.arange(0, BLOCK_M)
+    d_local = m_local // (BH * BW)
+    h_local = (m_local // BW) % BH
+    w_local = m_local % BW
+
+    out_d = d_base + d_local
+    out_h = h_base + h_local
+    out_w = w_base + w_local
+    m_mask = (out_d < D_OUT) & (out_h < H_OUT) & (out_w < W_OUT)
+
+    n_offset = pid_n * D_IN * H_IN * W_IN * C_IN
+    DHWC = D_IN * H_IN * W_IN * C_IN  # noqa: F841
+    HWC = H_IN * W_IN * C_IN
+    WC = W_IN * C_IN
 
     off1 = tl.arange(0, 1)
     ag_mask = tl.zeros([1], dtype=tl.int32)
-    any_nonzero = tl.zeros([1], dtype=tl.int32)
-    HW = H_IN * W_IN
-    DHW = D_IN * HW
+    any_nz = tl.zeros([1], dtype=tl.int32)
 
     for g in range(NUM_GROUPS):
-        g_start = g * GROUP_SIZE_C
-        group_has_nonzero = tl.zeros([1], dtype=tl.int32)
+        cs = g * GROUP_SIZE_C
+        offs_c = cs + tl.arange(0, GROUP_SIZE_C)
+        c_mask = offs_c < C_IN
 
-        for bd in range(BD):
-            d_out = d_out_start + bd
-            if d_out < D_OUT:
-                for bh in range(BH):
-                    h_out = h_out_start + bh
-                    if h_out < H_OUT:
-                        for bw in range(BW):
-                            w_out = w_out_start + bw
-                            if w_out < W_OUT:
-                                for kd in range(KD):
-                                    d_in = d_out * STRIDE - PADDING + kd
-                                    if (d_in >= 0) and (d_in < D_IN):
-                                        for kh in range(KH):
-                                            h_in = h_out * STRIDE - PADDING + kh
-                                            if (h_in >= 0) and (h_in < H_IN):
-                                                for kw in range(KW):
-                                                    w_in = w_out * STRIDE - PADDING + kw
-                                                    if (w_in >= 0) and (w_in < W_IN):
-                                                        for ci in range(GROUP_SIZE_C):
-                                                            c = g_start + ci
-                                                            if c < C_IN:
-                                                                addr = (
-                                                                    n_idx * C_IN * DHW
-                                                                    + c * DHW
-                                                                    + d_in * HW
-                                                                    + h_in * W_IN
-                                                                    + w_in
-                                                                )
-                                                                val = tl.load(x_ptr + addr)
-                                                                if tl.abs(val) > THRESHOLD:
-                                                                    group_has_nonzero = tl.full([1], 1, dtype=tl.int32)
+        group_nz_acc = tl.zeros([1], dtype=tl.int32)
 
-        if tl.sum(group_has_nonzero) != 0:
-            ag_mask = ag_mask + group_has_nonzero * (1 << g)
-            any_nonzero = tl.full([1], 1, dtype=tl.int32)
+        for kd in tl.static_range(KD):
+            for kh in tl.static_range(KH):
+                for kw in tl.static_range(KW):
+                    in_d = out_d * STRIDE + kd - PADDING
+                    in_h = out_h * STRIDE + kh - PADDING
+                    in_w = out_w * STRIDE + kw - PADDING
 
-    tl.store(ag_mask_ptr + pid + off1, ag_mask)
-    if tl.sum(any_nonzero) == 0:
-        tl.store(tile_class_ptr + pid + off1, tl.zeros([1], dtype=tl.int32))
+                    dhw_ok = (
+                        m_mask
+                        & (in_d >= 0) & (in_d < D_IN)
+                        & (in_h >= 0) & (in_h < H_IN)
+                        & (in_w >= 0) & (in_w < W_IN)
+                    )
+
+                    safe_d = tl.minimum(tl.maximum(in_d, 0), D_IN - 1)
+                    safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
+                    safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
+
+                    x_pix = (
+                        n_offset
+                        + safe_d * HWC
+                        + safe_h * WC
+                        + safe_w * C_IN
+                    )  # [BLOCK_M]
+
+                    addrs = x_pix[:, None] + offs_c[None, :]
+                    mfull = dhw_ok[:, None] & c_mask[None, :]
+                    vals = tl.load(x_ndhwc_ptr + addrs, mask=mfull, other=0.0)
+
+                    elem_nz = (tl.abs(vals) > THRESHOLD).to(tl.int32)
+                    group_nz_acc = group_nz_acc + tl.sum(elem_nz)
+
+        has_nz = (group_nz_acc > 0).to(tl.int32)
+        ag_mask = ag_mask + has_nz * (1 << g)
+        any_nz = tl.maximum(any_nz, has_nz)
+
+    out_idx = pid_n * (GD * GH * GW) + pid_dhw
+    tl.store(ag_mask_ptr + out_idx + off1, ag_mask)
+
+    if tl.sum(any_nz) == 0:
+        tl.store(tile_class_ptr + out_idx + off1, tl.zeros([1], dtype=tl.int32))
     else:
-        if tl.sum(ag_mask == ALL_ONES) > 0:
-            tl.store(tile_class_ptr + pid + off1, tl.full([1], TILE_DENSEISH, dtype=tl.int32))
+        if tl.sum((ag_mask == ALL_ONES).to(tl.int32)) > 0:
+            tl.store(tile_class_ptr + out_idx + off1, tl.full([1], TILE_DENSEISH, tl.int32))
         else:
-            tl.store(tile_class_ptr + pid + off1, tl.full([1], TILE_SPARSE, dtype=tl.int32))
+            tl.store(tile_class_ptr + out_idx + off1, tl.full([1], TILE_SPARSE, tl.int32))
 
 
-def _build_conv3d_metadata(
-    x_f16: torch.Tensor,
-    ag_mask_buf: torch.Tensor,
-    tile_class_buf: torch.Tensor,
-    *,
-    c_in: int,
-    d_in: int,
-    h_in: int,
-    w_in: int,
-    d_out: int,
-    h_out: int,
-    w_out: int,
-    kd: int,
-    kh: int,
-    kw: int,
-    stride: int,
-    padding: int,
-    bd: int,
-    bh: int,
-    bw: int,
-    n_tiles_d: int,
-    n_tiles_h: int,
-    n_tiles_w: int,
-    group_size_c: int,
-    num_groups: int,
-    all_ones: int,
-    threshold: float,
-    prescan_stats: dict = None,
-):
-    total_tiles = int(x_f16.shape[0]) * int(n_tiles_d) * int(n_tiles_h) * int(n_tiles_w)
-    _prescan_conv3d_kernel[(total_tiles,)](
-        x_f16,
-        ag_mask_buf,
-        tile_class_buf,
-        C_IN=c_in,
-        D_IN=d_in,
-        H_IN=h_in,
-        W_IN=w_in,
-        D_OUT=d_out,
-        H_OUT=h_out,
-        W_OUT=w_out,
-        KD=kd,
-        KH=kh,
-        KW=kw,
-        STRIDE=stride,
-        PADDING=padding,
-        BD=bd,
-        BH=bh,
-        BW=bw,
-        N_TILES_D=n_tiles_d,
-        N_TILES_H=n_tiles_h,
-        N_TILES_W=n_tiles_w,
-        GROUP_SIZE_C=group_size_c,
-        NUM_GROUPS=num_groups,
-        ALL_ONES=all_ones,
-        THRESHOLD=threshold,
-    )
-    if prescan_stats is not None:
-        prescan_stats.update(
-            {
-                "prescan_mode": "single_stage_rf_conv3d_v4",
-                "tile_d": int(bd),
-                "tile_h": int(bh),
-                "tile_w": int(bw),
-                "group_size_c": int(group_size_c),
-                "num_groups": int(num_groups),
-            }
-        )
+# ===========================================================================
+# Stage 2: compute kernel
+# ===========================================================================
 
-
-def _decode_active_channels(mask: int, num_groups: int, group_size_c: int, c_in: int):
-    channels = []
-    for g in range(int(num_groups)):
-        if ((int(mask) >> g) & 1) != 0:
-            cs = g * group_size_c
-            ce = min(cs + group_size_c, c_in)
-            channels.extend(range(cs, ce))
-    return channels
-
-
-_CFG_CONV3D = [
-    Config({"BLOCK_N": 16}, num_warps=4, num_stages=2),
-    Config({"BLOCK_N": 32}, num_warps=4, num_stages=2),
-    Config({"BLOCK_N": 64}, num_warps=8, num_stages=3),
+_CONV3D_CONFIGS = [
+    Config({"BLOCK_N_OUT": 32, "DENSE_K": 32}, num_warps=4, num_stages=1),
+    Config({"BLOCK_N_OUT": 64, "DENSE_K": 32}, num_warps=4, num_stages=1),
+    Config({"BLOCK_N_OUT": 64, "DENSE_K": 64}, num_warps=8, num_stages=1),
 ]
 
 
-@autotune(configs=_CFG_CONV3D, key=["C_IN", "C_OUT", "D_OUT", "H_OUT", "W_OUT"])
+@autotune(
+    configs=_CONV3D_CONFIGS,
+    key=["C_IN", "C_OUT", "D_OUT", "H_OUT", "W_OUT", "BLOCK_M", "KD", "STRIDE"],
+)
 @triton.jit
-def _sparse_conv3d_compute_kernel(
-    x_ptr,  # [N, C_IN, D_IN, H_IN, W_IN] fp16
-    w_ptr,  # [C_OUT, C_IN, KD, KH, KW] fp16 contiguous
-    ag_mask_ptr,  # [TOTAL_TILES] int32
-    tile_ids_ptr,  # [active_tiles] int32 (or placeholder)
-    y_ptr,  # [N, C_OUT, D_OUT, H_OUT, W_OUT] fp32 (bias baseline prefilled)
-    N_batch,
-    C_IN,
-    C_OUT,
-    D_IN,
-    H_IN,
-    W_IN,
-    D_OUT,
-    H_OUT,
-    W_OUT,
-    N_TILES_D,
-    N_TILES_H,
-    N_TILES_W,
+def _sparse_conv3d_kernel(
+    x_ndhwc_ptr,         # [N, D_IN, H_IN, W_IN, C_IN]
+    w_kc_ptr,            # [C_OUT, KD*KH*KW*C_IN]
+    bias_ptr,
+    y_ptr,               # [N, C_OUT, D_OUT, H_OUT, W_OUT]
+    ag_mask_ptr,
+    tile_class_ptr,
+    active_tile_ids_ptr,
+    N_val,
+    C_IN: tl.constexpr,
+    C_OUT: tl.constexpr,
+    D_IN: tl.constexpr,
+    H_IN: tl.constexpr,
+    W_IN: tl.constexpr,
+    D_OUT: tl.constexpr,
+    H_OUT: tl.constexpr,
+    W_OUT: tl.constexpr,
     KD: tl.constexpr,
     KH: tl.constexpr,
     KW: tl.constexpr,
     STRIDE: tl.constexpr,
     PADDING: tl.constexpr,
+    GD: tl.constexpr,
+    GH: tl.constexpr,
+    GW: tl.constexpr,
     BD: tl.constexpr,
     BH: tl.constexpr,
     BW: tl.constexpr,
+    BLOCK_M: tl.constexpr,
     GROUP_SIZE_C: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
-    ALL_ONES_MASK: tl.constexpr,
-    DENSE_K: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
     USE_TILE_IDS: tl.constexpr,
+    BLOCK_N_OUT: tl.constexpr,
+    DENSE_K: tl.constexpr,
 ):
     pid_tile = tl.program_id(0)
-    tile_id = tl.load(tile_ids_ptr + pid_tile) if USE_TILE_IDS else pid_tile
-    pid_cout = tl.program_id(1)
+    pid_n_out = tl.program_id(1)
 
-    total_tiles = N_batch * N_TILES_D * N_TILES_H * N_TILES_W
-    if tile_id >= total_tiles:
-        return
+    if USE_TILE_IDS:
+        tile_id = tl.load(active_tile_ids_ptr + pid_tile)
+    else:
+        tile_id = pid_tile
 
-    tiles_per_n = N_TILES_D * N_TILES_H * N_TILES_W
+    tiles_per_n = GD * GH * GW
     n_idx = tile_id // tiles_per_n
     rem = tile_id % tiles_per_n
-    td = rem // (N_TILES_H * N_TILES_W)
-    rem2 = rem % (N_TILES_H * N_TILES_W)
-    th = rem2 // N_TILES_W
-    tw = rem2 % N_TILES_W
 
-    offs_n = pid_cout * BLOCK_N + tl.arange(0, BLOCK_N)
-    n_mask = offs_n < C_OUT
-
-    offs_m = tl.arange(0, BLOCK_M)
-    HW_TILE: tl.constexpr = BH * BW
-    od = td * BD + offs_m // HW_TILE
-    rem_hw = offs_m % HW_TILE
-    oh = th * BH + rem_hw // BW
-    ow = tw * BW + rem_hw % BW
-    m_mask = (od < D_OUT) & (oh < H_OUT) & (ow < W_OUT)
-
-    ag_mask = tl.load(ag_mask_ptr + tile_id)
-    if ag_mask == 0:
+    if n_idx >= N_val:
         return
 
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    gd = rem // (GH * GW)
+    gh = (rem // GW) % GH
+    gw = rem % GW
 
-    if ag_mask == ALL_ONES_MASK:
-        for kd in range(KD):
-            id_in = od * STRIDE - PADDING + kd
-            d_ok = (id_in >= 0) & (id_in < D_IN)
-            safe_d = tl.minimum(tl.maximum(id_in, 0), D_IN - 1)
-            for kh in range(KH):
-                ih_in = oh * STRIDE - PADDING + kh
-                h_ok = (ih_in >= 0) & (ih_in < H_IN)
-                safe_h = tl.minimum(tl.maximum(ih_in, 0), H_IN - 1)
-                for kw in range(KW):
-                    iw_in = ow * STRIDE - PADDING + kw
-                    w_ok = (iw_in >= 0) & (iw_in < W_IN)
-                    safe_w = tl.minimum(tl.maximum(iw_in, 0), W_IN - 1)
-                    dhw_ok = m_mask & d_ok & h_ok & w_ok
+    d_base = gd * BD
+    h_base = gh * BH
+    w_base = gw * BW
 
-                    for cin_base in range(0, NUM_GROUPS * GROUP_SIZE_C, DENSE_K):
+    off1 = tl.arange(0, 1)
+    tc_t = tl.load(tile_class_ptr + tile_id + off1)
+    tile_cls = tl.sum(tc_t)
+
+    m_local = tl.arange(0, BLOCK_M)
+    d_local = m_local // (BH * BW)
+    h_local = (m_local // BW) % BH
+    w_local = m_local % BW
+
+    out_d = d_base + d_local
+    out_h = h_base + h_local
+    out_w = w_base + w_local
+    m_mask = (out_d < D_OUT) & (out_h < H_OUT) & (out_w < W_OUT)
+
+    offs_n_out = pid_n_out * BLOCK_N_OUT + tl.arange(0, BLOCK_N_OUT)
+    n_out_mask = offs_n_out < C_OUT
+
+    acc = tl.zeros([BLOCK_M, BLOCK_N_OUT], dtype=tl.float32)
+
+    HWC = H_IN * W_IN * C_IN
+    WC = W_IN * C_IN
+    KCC = KD * KH * KW * C_IN
+    n_offset = n_idx * D_IN * HWC
+
+    if tile_cls == TILE_ZERO:
+        pass
+
+    elif tile_cls == TILE_DENSEISH:
+        for kd in tl.static_range(KD):
+            for kh in tl.static_range(KH):
+                for kw in tl.static_range(KW):
+                    in_d = out_d * STRIDE + kd - PADDING
+                    in_h = out_h * STRIDE + kh - PADDING
+                    in_w = out_w * STRIDE + kw - PADDING
+
+                    dhw_ok = (
+                        m_mask
+                        & (in_d >= 0) & (in_d < D_IN)
+                        & (in_h >= 0) & (in_h < H_IN)
+                        & (in_w >= 0) & (in_w < W_IN)
+                    )
+
+                    safe_d = tl.minimum(tl.maximum(in_d, 0), D_IN - 1)
+                    safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
+                    safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
+
+                    x_pix = n_offset + safe_d * HWC + safe_h * WC + safe_w * C_IN
+                    w_k_base = (kd * KH * KW + kh * KW + kw) * C_IN
+
+                    for cin_base in range(0, C_IN, DENSE_K):
                         offs_k = cin_base + tl.arange(0, DENSE_K)
                         k_mask = offs_k < C_IN
 
-                        x_addr = (
-                            (((n_idx * C_IN + offs_k[None, :]) * D_IN + safe_d[:, None]) * H_IN + safe_h[:, None]) * W_IN
-                            + safe_w[:, None]
-                        )
+                        x_addrs = x_pix[:, None] + offs_k[None, :]
                         x_t = tl.load(
-                            x_ptr + x_addr,
+                            x_ndhwc_ptr + x_addrs,
                             mask=dhw_ok[:, None] & k_mask[None, :],
                             other=0.0,
                         ).to(tl.float16)
 
-                        w_addr = (
-                            (((offs_n[None, :] * C_IN + offs_k[:, None]) * KD + kd) * KH + kh) * KW
-                            + kw
-                        )
+                        w_addrs = offs_n_out[None, :] * KCC + w_k_base + offs_k[:, None]
                         w_t = tl.load(
-                            w_ptr + w_addr,
-                            mask=k_mask[:, None] & n_mask[None, :],
+                            w_kc_ptr + w_addrs,
+                            mask=k_mask[:, None] & n_out_mask[None, :],
                             other=0.0,
                         ).to(tl.float16)
+
                         acc += tl.dot(x_t, w_t)
+
     else:
-        for kd in range(KD):
-            id_in = od * STRIDE - PADDING + kd
-            d_ok = (id_in >= 0) & (id_in < D_IN)
-            safe_d = tl.minimum(tl.maximum(id_in, 0), D_IN - 1)
-            for kh in range(KH):
-                ih_in = oh * STRIDE - PADDING + kh
-                h_ok = (ih_in >= 0) & (ih_in < H_IN)
-                safe_h = tl.minimum(tl.maximum(ih_in, 0), H_IN - 1)
-                for kw in range(KW):
-                    iw_in = ow * STRIDE - PADDING + kw
-                    w_ok = (iw_in >= 0) & (iw_in < W_IN)
-                    safe_w = tl.minimum(tl.maximum(iw_in, 0), W_IN - 1)
-                    dhw_ok = m_mask & d_ok & h_ok & w_ok
+        # SPARSE: bitmask-gated grouped reduction
+        ag_t = tl.load(ag_mask_ptr + tile_id + off1)
+        ag = tl.sum(ag_t)
+
+        for kd in tl.static_range(KD):
+            for kh in tl.static_range(KH):
+                for kw in tl.static_range(KW):
+                    in_d = out_d * STRIDE + kd - PADDING
+                    in_h = out_h * STRIDE + kh - PADDING
+                    in_w = out_w * STRIDE + kw - PADDING
+
+                    dhw_ok = (
+                        m_mask
+                        & (in_d >= 0) & (in_d < D_IN)
+                        & (in_h >= 0) & (in_h < H_IN)
+                        & (in_w >= 0) & (in_w < W_IN)
+                    )
+
+                    safe_d = tl.minimum(tl.maximum(in_d, 0), D_IN - 1)
+                    safe_h = tl.minimum(tl.maximum(in_h, 0), H_IN - 1)
+                    safe_w = tl.minimum(tl.maximum(in_w, 0), W_IN - 1)
+
+                    x_pix = n_offset + safe_d * HWC + safe_h * WC + safe_w * C_IN
+                    w_k_base = (kd * KH * KW + kh * KW + kw) * C_IN
 
                     for g in range(NUM_GROUPS):
-                        if ((ag_mask >> g) & 1) != 0:
-                            offs_k = g * GROUP_SIZE_C + tl.arange(0, GROUP_SIZE_C)
+                        g_active = (ag >> g) & 1
+                        if g_active != 0:
+                            cs = g * GROUP_SIZE_C
+                            offs_k = cs + tl.arange(0, GROUP_SIZE_C)
                             k_mask = offs_k < C_IN
 
-                            x_addr = (
-                                (((n_idx * C_IN + offs_k[None, :]) * D_IN + safe_d[:, None]) * H_IN + safe_h[:, None]) * W_IN
-                                + safe_w[:, None]
-                            )
+                            x_addrs = x_pix[:, None] + offs_k[None, :]
                             x_t = tl.load(
-                                x_ptr + x_addr,
+                                x_ndhwc_ptr + x_addrs,
                                 mask=dhw_ok[:, None] & k_mask[None, :],
                                 other=0.0,
                             ).to(tl.float16)
 
-                            w_addr = (
-                                (((offs_n[None, :] * C_IN + offs_k[:, None]) * KD + kd) * KH + kh) * KW
-                                + kw
-                            )
+                            w_addrs = offs_n_out[None, :] * KCC + w_k_base + offs_k[:, None]
                             w_t = tl.load(
-                                w_ptr + w_addr,
-                                mask=k_mask[:, None] & n_mask[None, :],
+                                w_kc_ptr + w_addrs,
+                                mask=k_mask[:, None] & n_out_mask[None, :],
                                 other=0.0,
                             ).to(tl.float16)
+
                             acc += tl.dot(x_t, w_t)
 
-    out_addr = (
-        (((n_idx * C_OUT + offs_n[None, :]) * D_OUT + od[:, None]) * H_OUT + oh[:, None]) * W_OUT
-        + ow[:, None]
+    if HAS_BIAS:
+        acc += tl.load(bias_ptr + offs_n_out, mask=n_out_mask, other=0.0)[None, :]
+
+    # Write to NCDHW output: y[n, c_out, d, h, w]
+    DHW_OUT = D_OUT * H_OUT * W_OUT
+    pix_offset = out_d * (H_OUT * W_OUT) + out_h * W_OUT + out_w  # [BLOCK_M]
+    out_addrs = (
+        n_idx * C_OUT * DHW_OUT
+        + offs_n_out[None, :] * DHW_OUT
+        + pix_offset[:, None]
     )
-    out_old = tl.load(y_ptr + out_addr, mask=m_mask[:, None] & n_mask[None, :], other=0.0)
-    tl.store(
-        y_ptr + out_addr,
-        out_old + acc,
-        mask=m_mask[:, None] & n_mask[None, :],
-    )
+    out_mask = m_mask[:, None] & n_out_mask[None, :]
+    tl.store(y_ptr + out_addrs, acc, mask=out_mask)
 
 
-def _execute_sparse_tiles_conv3d(
-    *,
-    x_f32: torch.Tensor,  # [N, C_IN, D_IN, H_IN, W_IN]
-    w_f32: torch.Tensor,  # [C_OUT, C_IN, KD, KH, KW]
-    y: torch.Tensor,      # [N, C_OUT, D_OUT, H_OUT, W_OUT], bias baseline prefilled
-    ag_mask_buf: torch.Tensor,
-    tile_ids: torch.Tensor,
-    launch_all_tiles: bool,
-    n_tiles_d: int,
-    n_tiles_h: int,
-    n_tiles_w: int,
-    bd: int,
-    bh: int,
-    bw: int,
-    c_in: int,
-    group_size_c: int,
-    num_groups: int,
-    all_ones_mask: int,
-    kd: int,
-    kh: int,
-    kw: int,
-    stride: int,
-    padding: int,
-):
-    import torch.nn.functional as Fn
+# ===========================================================================
+# Helpers
+# ===========================================================================
 
-    device = x_f32.device
-    n_batch, _, d_in, h_in, w_in = x_f32.shape
-    c_out = int(w_f32.shape[0])
-    d_out = int(y.shape[2])
-    h_out = int(y.shape[3])
-    w_out = int(y.shape[4])
-    total_tiles = n_batch * n_tiles_d * n_tiles_h * n_tiles_w
-    tiles_per_n = n_tiles_d * n_tiles_h * n_tiles_w
+def _build_active_tile_ids(tile_class_buf, total_tiles):
+    nz = torch.nonzero(tile_class_buf[:total_tiles] != TILE_ZERO, as_tuple=False)
+    if nz.numel() == 0:
+        return None, 0
+    ids = nz.view(-1).to(torch.int32)
+    return ids, int(ids.numel())
 
-    ag_mask_host = ag_mask_buf[:total_tiles].detach().cpu()
-    if launch_all_tiles:
-        tile_ids_host = range(total_tiles)
-    else:
-        tile_ids_host = tile_ids.detach().cpu().tolist()
 
-    x_pad = Fn.pad(x_f32, (padding, padding, padding, padding, padding, padding))
-    x_unfold = x_pad.unfold(2, kd, stride).unfold(3, kh, stride).unfold(4, kw, stride)
-    w_all = w_f32.reshape(c_out, c_in * kd * kh * kw)
-    mask_channel_cache = {}
-
-    visited_tiles = 0
-    executed_tiles = 0
-
-    for tile_id in tile_ids_host:
-        tile_id = int(tile_id)
-        visited_tiles += 1
-
-        ag_mask = int(ag_mask_host[tile_id].item())
-        if ag_mask == 0:
-            continue
-
-        n_idx = tile_id // tiles_per_n
-        rem = tile_id % tiles_per_n
-        td = rem // (n_tiles_h * n_tiles_w)
-        rem2 = rem % (n_tiles_h * n_tiles_w)
-        th = rem2 // n_tiles_w
-        tw = rem2 % n_tiles_w
-
-        d0 = td * bd
-        h0 = th * bh
-        w0 = tw * bw
-        d1 = min(d0 + bd, d_out)
-        h1 = min(h0 + bh, h_out)
-        w1 = min(w0 + bw, w_out)
-        if d1 <= d0 or h1 <= h0 or w1 <= w0:
-            continue
-
-        if ag_mask == all_ones_mask:
-            x_tile = x_unfold[n_idx, :, d0:d1, h0:h1, w0:w1, :, :, :]
-            x_mat = x_tile.permute(1, 2, 3, 0, 4, 5, 6).reshape(
-                (d1 - d0) * (h1 - h0) * (w1 - w0),
-                c_in * kd * kh * kw,
-            )
-            w_mat = w_all
-        else:
-            c_idx = mask_channel_cache.get(ag_mask, None)
-            if c_idx is None:
-                channels = _decode_active_channels(ag_mask, num_groups, group_size_c, c_in)
-                if not channels:
-                    continue
-                c_idx = torch.tensor(channels, dtype=torch.long, device=device)
-                mask_channel_cache[ag_mask] = c_idx
-
-            x_tile = x_unfold[n_idx, c_idx, d0:d1, h0:h1, w0:w1, :, :, :]
-            c_sel = int(c_idx.numel())
-            x_mat = x_tile.permute(1, 2, 3, 0, 4, 5, 6).reshape(
-                (d1 - d0) * (h1 - h0) * (w1 - w0),
-                c_sel * kd * kh * kw,
-            )
-            w_mat = w_f32[:, c_idx, :, :, :].reshape(c_out, c_sel * kd * kh * kw)
-
-        y_tile = torch.matmul(x_mat, w_mat.t())
-        y_tile = y_tile.reshape(d1 - d0, h1 - h0, w1 - w0, c_out).permute(3, 0, 1, 2).contiguous()
-        y[n_idx, :, d0:d1, h0:h1, w0:w1] += y_tile
-        executed_tiles += 1
-
-    return {
-        "visited_tiles": int(visited_tiles),
-        "executed_tiles": int(executed_tiles),
-    }
-
+# ===========================================================================
+# Public entry
+# ===========================================================================
 
 def sparse_conv3d_forward(
     x, weight, bias,
@@ -551,293 +449,302 @@ def sparse_conv3d_forward(
     group_flags_buf=None, ag_count_buf=None, ag_list_buf=None,
     tile_alive_buf=None,
 ):
-    import torch.nn.functional as Fn
+    """
+    Two-stage Triton sparse Conv3d forward.
 
-    N, C_IN, D_IN, H_IN, W_IN = x.shape
-    C_OUT = int(weight.shape[0])
-    device = x.device
-
+    Returns:
+        y                                                 always
+        ms                              if return_ms       (else 0.0)
+        avg_active_ratio                if return_avg_active_ratio
+        tile_stats                      if return_tile_stats
+        backend_meta                    if return_backend_meta
+    """
+    # ---- normalize args ----
     if isinstance(kernel_size, (tuple, list)):
         kernel_size = int(kernel_size[0])
-    weight_kernel_size = int(weight.shape[2])
-    if kernel_size is None:
-        kernel_size = weight_kernel_size
-    if int(kernel_size) != weight_kernel_size:
-        kernel_size = weight_kernel_size
+    weight_ks = int(weight.shape[2])
+    if kernel_size is None or int(kernel_size) != weight_ks:
+        kernel_size = weight_ks
     if isinstance(stride, (tuple, list)):
         stride = int(stride[0])
     if isinstance(padding, (tuple, list)):
         padding = int(padding[0])
     if isinstance(dilation, (tuple, list)):
         dilation = int(dilation[0])
+    stride = int(stride)
+    padding = int(padding)
+    dilation = int(dilation)
+    groups = int(groups)
+    KS = int(kernel_size)
+    KD = KH = KW = KS
 
-    KD, KH, KW = int(weight.shape[2]), int(weight.shape[3]), int(weight.shape[4])
+    N = int(x.shape[0])
+    C_IN = int(x.shape[1])
+    D_IN = int(x.shape[2])
+    H_IN = int(x.shape[3])
+    W_IN = int(x.shape[4])
+    C_OUT = int(weight.shape[0])
+    device = x.device
+    HAS_BIAS = bias is not None
+
+    D_OUT = (D_IN + 2 * padding - dilation * (KD - 1) - 1) // stride + 1
+    H_OUT = (H_IN + 2 * padding - dilation * (KH - 1) - 1) // stride + 1
+    W_OUT = (W_IN + 2 * padding - dilation * (KW - 1) - 1) // stride + 1
 
     need_stats = return_tile_stats or return_avg_active_ratio
 
-    def _finalize_return(y, ms, avg_active_ratio_val=None, tile_stats_val=None, backend_meta_val=None):
+    def _finalize(y, ms, avg_ratio_val=None, tile_stats_val=None, backend_meta_val=None):
         ret = (y, ms)
         if return_avg_active_ratio:
-            ret = ret + (avg_active_ratio_val,)
+            ret = ret + (avg_ratio_val,)
         if return_tile_stats:
             ret = ret + (tile_stats_val,)
         if return_backend_meta:
             ret = ret + (backend_meta_val,)
         return ret
 
-    def _dense_fallback(reason="dense_fallback", avg_active_ratio_val=1.0, tile_stats_val=None, backend_meta_extra=None):
-        dense_ms = 0.0
+    def _dense_fallback(reason: str, avg_ratio_val=None, tile_stats_val=None):
+        ms = 0.0
         if return_ms:
             se = torch.cuda.Event(enable_timing=True)
             ee = torch.cuda.Event(enable_timing=True)
             se.record()
-
         y = Fn.conv3d(
             x.float(),
             weight.float(),
             bias.float() if bias is not None else None,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            groups=groups,
+            stride=stride, padding=padding, dilation=dilation, groups=groups,
         ).float()
-
         if return_ms:
             ee.record()
             torch.cuda.synchronize(device)
-            dense_ms = se.elapsed_time(ee)
+            ms = se.elapsed_time(ee)
+        backend_meta = {
+            "backend": "dense_fallback",
+            "reason": reason,
+            "kernel_type": f"3d_k{KS}_s{stride}",
+            "total_tiles": -1,
+            "launch_count": -1,
+            "launch_mode": "dense",
+        }
+        if avg_ratio_val is None and return_avg_active_ratio:
+            avg_ratio_val = 1.0
+        return _finalize(y, ms, avg_ratio_val, tile_stats_val, backend_meta)
 
-        bm = {"backend": "dense_fallback", "reason": reason}
-        if backend_meta_extra:
-            bm.update(backend_meta_extra)
-        return _finalize_return(y, dense_ms, avg_active_ratio_val, tile_stats_val, bm)
-
-    D_OUT = (D_IN + 2 * padding - dilation * (KD - 1) - 1) // stride + 1
-    H_OUT = (H_IN + 2 * padding - dilation * (KH - 1) - 1) // stride + 1
-    W_OUT = (W_IN + 2 * padding - dilation * (KW - 1) - 1) // stride + 1
-
-    def _zero_tiles_output(reason, tile_stats_val=None, backend_meta_extra=None):
-        y = torch.zeros(N, C_OUT, D_OUT, H_OUT, W_OUT, dtype=torch.float32, device=device)
-        if bias is not None:
-            y = y + bias.detach().float().view(1, -1, 1, 1, 1)
-        bm = {"backend": "zero_tiles_only", "reason": reason}
-        if backend_meta_extra:
-            bm.update(backend_meta_extra)
-        return _finalize_return(y, 0.0, 0.0, tile_stats_val, bm)
-
-    # ------------------------------------------------------------------
-    # 1) validate / support checks
-    # ------------------------------------------------------------------
-    if groups != 1 or dilation != 1:
-        return _dense_fallback(reason="unsupported_groups_or_dilation")
+    # ---- support gating ----
+    if not _is_supported_sparse_pattern(KS, stride, padding, dilation, groups):
+        return _dense_fallback("unsupported_sparse_pattern")
+    if not x.is_cuda:
+        return _dense_fallback("not_cuda")
     if D_OUT <= 0 or H_OUT <= 0 or W_OUT <= 0:
-        return _dense_fallback(reason="invalid_output_shape")
-    if x.ndim != 5 or weight.ndim != 5:
-        return _dense_fallback(reason="invalid_tensor_rank")
-    if x.device.type != "cuda" or weight.device.type != "cuda":
-        return _dense_fallback(reason="not_cuda")
+        return _dense_fallback("nonpositive_output_shape")
 
-    # ------------------------------------------------------------------
-    # 2) tile/group config
-    # ------------------------------------------------------------------
-    GROUP_SIZE_C = choose_group_size(C_IN)
-    NUM_GROUPS = triton.cdiv(C_IN, GROUP_SIZE_C)
-    ALL_ONES_MASK = (1 << NUM_GROUPS) - 1
-    DENSE_K = min(max(GROUP_SIZE_C * 2, 16), 64)
-
+    # ---- choose tiling and grouping ----
     BD, BH, BW = _select_3d_tile_sizes(D_OUT, H_OUT, W_OUT)
     BLOCK_M = BD * BH * BW
-    N_TILES_D = triton.cdiv(D_OUT, BD)
-    N_TILES_H = triton.cdiv(H_OUT, BH)
-    N_TILES_W = triton.cdiv(W_OUT, BW)
-    N_TILES = N * N_TILES_D * N_TILES_H * N_TILES_W
+    GROUP_SIZE_C = choose_group_size(C_IN)
+    NUM_GROUPS = (C_IN + GROUP_SIZE_C - 1) // GROUP_SIZE_C
 
-    # ------------------------------------------------------------------
-    # 3) layout prep + metadata allocation
-    # ------------------------------------------------------------------
-    x_f16 = x if (x.dtype == torch.float16 and x.is_contiguous()) else x.half().contiguous()
-    w_f16 = weight if (weight.dtype == torch.float16 and weight.is_contiguous()) else weight.half().contiguous()
-    ag_mask_buf, tile_class_buf = _ensure_metadata_buffers(ag_mask_buf, tile_class_buf, N_TILES, device)
+    if NUM_GROUPS > 32:
+        return _dense_fallback(f"num_groups_exceeds_uint32({NUM_GROUPS})")
 
-    # ------------------------------------------------------------------
-    # 4) metadata build
-    # ------------------------------------------------------------------
-    prescan_stats = {} if return_tile_stats else None
-    try:
-        _build_conv3d_metadata(
-            x_f16=x_f16,
-            ag_mask_buf=ag_mask_buf,
-            tile_class_buf=tile_class_buf,
-            c_in=C_IN,
-            d_in=D_IN,
-            h_in=H_IN,
-            w_in=W_IN,
-            d_out=D_OUT,
-            h_out=H_OUT,
-            w_out=W_OUT,
-            kd=KD,
-            kh=KH,
-            kw=KW,
-            stride=stride,
-            padding=padding,
-            bd=BD,
-            bh=BH,
-            bw=BW,
-            n_tiles_d=N_TILES_D,
-            n_tiles_h=N_TILES_H,
-            n_tiles_w=N_TILES_W,
-            group_size_c=GROUP_SIZE_C,
-            num_groups=NUM_GROUPS,
-            all_ones=ALL_ONES_MASK,
-            threshold=float(threshold),
-            prescan_stats=prescan_stats,
-        )
-    except Exception:
-        return _dense_fallback(reason="prescan_failed")
+    GD = (D_OUT + BD - 1) // BD
+    GH = (H_OUT + BH - 1) // BH
+    GW = (W_OUT + BW - 1) // BW
+    tiles_per_n = GD * GH * GW
+    N_TILES = N * tiles_per_n
 
-    # ------------------------------------------------------------------
-    # 5) optional stats + optional fallback (sync-gated)
-    # ------------------------------------------------------------------
-    avg_active_ratio = None
-    tile_stats_base = None
-    active_tiles_for_meta = None
+    ALL_ONES = (1 << NUM_GROUPS) - 1
 
-    if need_stats:
-        tc = tile_class_buf[:N_TILES]
-        zc = int((tc == TILE_ZERO).sum().item())
-        sc = int((tc == TILE_SPARSE).sum().item())
-        dc = int((tc == TILE_DENSEISH).sum().item())
-        total_nonzero = sc + dc
-        denseish_ratio = float(dc) / max(float(total_nonzero), 1.0)
-        active_tiles_for_meta = int(total_nonzero)
-
-        if NUM_GROUPS > 0:
-            pc = popcount_buf(ag_mask_buf, N_TILES)
-            avg_active_ratio = float(pc.sum().item()) / max(float(N_TILES * NUM_GROUPS), 1.0)
-        else:
-            avg_active_ratio = 1.0
-
-        if return_tile_stats:
-            tile_stats_base = {
-                "zero_tiles": zc,
-                "sparse_tiles": sc,
-                "denseish_tiles": dc,
-                "total_tiles": N_TILES,
-                "prescan_mode": "single_stage_rf_conv3d_v4",
-                "active_tiles": total_nonzero,
-                "active_tile_ratio": float(total_nonzero) / max(float(N_TILES), 1.0),
-                "denseish_ratio_nonzero": denseish_ratio,
-                "avg_active_group_ratio": avg_active_ratio,
-            }
-            if prescan_stats:
-                tile_stats_base.update(prescan_stats)
-
-        if _check_dense_fallback(ag_mask_buf, N_TILES, NUM_GROUPS, fallback_ratio=fallback_ratio):
-            return _dense_fallback(
-                reason="post_metadata_dense_fallback",
-                avg_active_ratio_val=avg_active_ratio,
-                tile_stats_val=tile_stats_base,
-                backend_meta_extra={
-                    "active_tiles": total_nonzero,
-                    "total_tiles": N_TILES,
-                    "denseish_ratio_nonzero": denseish_ratio,
-                },
-            )
-
-        if launch_all_tiles and total_nonzero == 0:
-            return _zero_tiles_output(
-                reason="all_tiles_zero_after_metadata",
-                tile_stats_val=tile_stats_base,
-                backend_meta_extra={"active_tiles": 0, "total_tiles": N_TILES},
-            )
-
-    # ------------------------------------------------------------------
-    # 6) launch mode selection
-    # ------------------------------------------------------------------
-    if launch_all_tiles:
-        launch_count = N_TILES
-        use_tile_ids = False
-        tile_ids_ptr = ag_mask_buf  # placeholder, ignored by kernel in all_tiles mode
-    else:
-        active_tile_ids, active_tile_count = _build_active_tile_ids(tile_class_buf, N_TILES)
-        if active_tile_count == 0:
-            return _zero_tiles_output(
-                reason="all_tiles_zero_after_metadata",
-                tile_stats_val=tile_stats_base,
-                backend_meta_extra={"active_tiles": 0, "total_tiles": N_TILES},
-            )
-        if active_tile_ids_buf is not None and active_tile_ids_buf.numel() >= active_tile_count:
-            active_tile_ids_buf[:active_tile_count].copy_(active_tile_ids)
-            tile_ids_ptr = active_tile_ids_buf[:active_tile_count]
-        else:
-            tile_ids_ptr = active_tile_ids
-        launch_count = active_tile_count
-        use_tile_ids = True
-        if active_tiles_for_meta is None:
-            active_tiles_for_meta = int(active_tile_count)
-
-    # ------------------------------------------------------------------
-    # 7) sparse execution (active-only compute over metadata-selected groups)
-    # ------------------------------------------------------------------
-    y = torch.zeros(N, C_OUT, D_OUT, H_OUT, W_OUT, dtype=torch.float32, device=device)
-    if bias is not None:
-        y = y + bias.detach().float().view(1, -1, 1, 1, 1)
-
-    x_f32 = x.float()
-    w_f32 = weight.float().contiguous()
-
-    if return_ms:
-        start_ev = torch.cuda.Event(enable_timing=True)
-        end_ev = torch.cuda.Event(enable_timing=True)
-        start_ev.record()
-
-    exec_meta = _execute_sparse_tiles_conv3d(
-        x_f32=x_f32,
-        w_f32=w_f32,
-        y=y,
-        ag_mask_buf=ag_mask_buf,
-        tile_ids=tile_ids_ptr,
-        launch_all_tiles=launch_all_tiles,
-        n_tiles_d=N_TILES_D,
-        n_tiles_h=N_TILES_H,
-        n_tiles_w=N_TILES_W,
-        bd=BD,
-        bh=BH,
-        bw=BW,
-        c_in=C_IN,
-        group_size_c=GROUP_SIZE_C,
-        num_groups=NUM_GROUPS,
-        all_ones_mask=ALL_ONES_MASK,
-        kd=KD,
-        kh=KH,
-        kw=KW,
-        stride=stride,
-        padding=padding,
+    # ---- prepare buffers ----
+    # NCDHW -> NDHWC
+    x_ndhwc = x.permute(0, 2, 3, 4, 1).contiguous().to(torch.float16)
+    # Weight [C_out, C_in, KD, KH, KW] -> [C_out, KD, KH, KW, C_in] -> flat
+    w_kc = (
+        weight.permute(0, 2, 3, 4, 1)
+        .contiguous()
+        .to(torch.float16)
+        .view(C_OUT, KD * KH * KW * C_IN)
     )
+
+    if ag_mask_buf is None or ag_mask_buf.numel() < N_TILES:
+        ag_mask_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
+    if tile_class_buf is None or tile_class_buf.numel() < N_TILES:
+        tile_class_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
+
+    bias_arg = bias.to(torch.float32) if bias is not None else torch.empty(0, device=device)
 
     sparse_ms = 0.0
     if return_ms:
-        end_ev.record()
-        torch.cuda.synchronize(device)
-        sparse_ms = start_ev.elapsed_time(end_ev)
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt = torch.cuda.Event(enable_timing=True)
+        start_evt.record()
 
-    # ------------------------------------------------------------------
-    # 8) structured outputs
-    # ------------------------------------------------------------------
+    # ---- Stage 1: prescan ----
+    prescan_grid = (N, tiles_per_n)
+    _prescan_conv3d_kernel[prescan_grid](
+        x_ndhwc,
+        ag_mask_buf,
+        tile_class_buf,
+        N,
+        C_IN=C_IN,
+        D_IN=D_IN,
+        H_IN=H_IN,
+        W_IN=W_IN,
+        D_OUT=D_OUT,
+        H_OUT=H_OUT,
+        W_OUT=W_OUT,
+        KD=KD,
+        KH=KH,
+        KW=KW,
+        STRIDE=stride,
+        PADDING=padding,
+        GD=GD,
+        GH=GH,
+        GW=GW,
+        BD=BD,
+        BH=BH,
+        BW=BW,
+        BLOCK_M=BLOCK_M,
+        GROUP_SIZE_C=GROUP_SIZE_C,
+        NUM_GROUPS=NUM_GROUPS,
+        ALL_ONES=ALL_ONES,
+        THRESHOLD=float(threshold),
+    )
+
+    # ---- optional stats / fallback / active-tile compaction ----
+    avg_active_ratio = None
+    tile_stats = None
+    active_ids = None
+    active_count = N_TILES
+    use_tile_ids = False
+
+    if need_stats or not launch_all_tiles:
+        pc = popcount_buf(ag_mask_buf, N_TILES)
+        active_g_total = float(pc.sum().item())
+        avg_active_ratio = active_g_total / max(float(N_TILES * NUM_GROUPS), 1.0)
+
+        tc_host = tile_class_buf[:N_TILES].cpu()
+        zt = int((tc_host == TILE_ZERO).sum().item())
+        sp_t = int((tc_host == TILE_SPARSE).sum().item())
+        dt = int((tc_host == TILE_DENSEISH).sum().item())
+
+        if return_tile_stats:
+            tile_stats = {
+                "zero_tiles": zt,
+                "sparse_tiles": sp_t,
+                "denseish_tiles": dt,
+                "total_tiles": int(N_TILES),
+                "prescan_mode": "triton_grouped_conv3d_v2",
+                "block_d": int(BD),
+                "block_h": int(BH),
+                "block_w": int(BW),
+                "block_m": int(BLOCK_M),
+                "group_size_c": int(GROUP_SIZE_C),
+                "num_groups": int(NUM_GROUPS),
+                "active_tile_ratio": float(N_TILES - zt) / max(float(N_TILES), 1.0),
+                "avg_active_group_ratio": float(avg_active_ratio),
+            }
+
+        if avg_active_ratio > float(fallback_ratio):
+            if return_ms:
+                end_evt.record()
+                torch.cuda.synchronize(device)
+                sparse_ms = start_evt.elapsed_time(end_evt)
+            return _dense_fallback(
+                "post_metadata_dense_fallback",
+                avg_ratio_val=avg_active_ratio,
+                tile_stats_val=tile_stats,
+            )
+
+        if not launch_all_tiles:
+            ids, n_active = _build_active_tile_ids(tile_class_buf, N_TILES)
+            if n_active == 0:
+                y = torch.zeros((N, C_OUT, D_OUT, H_OUT, W_OUT), device=device, dtype=torch.float32)
+                if HAS_BIAS:
+                    y += bias.float().view(1, C_OUT, 1, 1, 1)
+                if return_ms:
+                    end_evt.record()
+                    torch.cuda.synchronize(device)
+                    sparse_ms = start_evt.elapsed_time(end_evt)
+                backend_meta = {
+                    "backend": "all_zero_after_metadata",
+                    "reason": "no_active_tiles",
+                    "kernel_type": f"3d_k{KS}_s{stride}",
+                    "total_tiles": int(N_TILES),
+                    "launch_count": 0,
+                    "launch_mode": "active_only",
+                    "active_tiles": 0,
+                }
+                return _finalize(y, sparse_ms, avg_active_ratio, tile_stats, backend_meta)
+
+            if active_tile_ids_buf is None or active_tile_ids_buf.numel() < n_active:
+                active_tile_ids_buf = torch.empty(n_active, dtype=torch.int32, device=device)
+            active_tile_ids_buf[:n_active].copy_(ids)
+            active_ids = active_tile_ids_buf
+            active_count = n_active
+            use_tile_ids = True
+
+    # ---- Stage 2: compute ----
+    y = torch.empty((N, C_OUT, D_OUT, H_OUT, W_OUT), device=device, dtype=torch.float32)
+    if HAS_BIAS:
+        y.copy_(bias.float().view(1, C_OUT, 1, 1, 1).expand(N, C_OUT, D_OUT, H_OUT, W_OUT))
+    else:
+        y.zero_()
+
+    if active_ids is None:
+        active_ids = torch.empty(0, dtype=torch.int32, device=device)
+
+    grid = lambda META: (active_count, triton.cdiv(C_OUT, META["BLOCK_N_OUT"]))
+    _sparse_conv3d_kernel[grid](
+        x_ndhwc,
+        w_kc,
+        bias_arg,
+        y,
+        ag_mask_buf,
+        tile_class_buf,
+        active_ids,
+        N,
+        C_IN=C_IN,
+        C_OUT=C_OUT,
+        D_IN=D_IN,
+        H_IN=H_IN,
+        W_IN=W_IN,
+        D_OUT=D_OUT,
+        H_OUT=H_OUT,
+        W_OUT=W_OUT,
+        KD=KD,
+        KH=KH,
+        KW=KW,
+        STRIDE=stride,
+        PADDING=padding,
+        GD=GD,
+        GH=GH,
+        GW=GW,
+        BD=BD,
+        BH=BH,
+        BW=BW,
+        BLOCK_M=BLOCK_M,
+        GROUP_SIZE_C=GROUP_SIZE_C,
+        NUM_GROUPS=NUM_GROUPS,
+        HAS_BIAS=HAS_BIAS,
+        USE_TILE_IDS=use_tile_ids,
+    )
+
+    if return_ms:
+        end_evt.record()
+        torch.cuda.synchronize(device)
+        sparse_ms = start_evt.elapsed_time(end_evt)
+
     backend_meta = {
-        "backend": "sparse_hybrid",
-        "reason": "conv3d_unified_v3",
-        "compute_engine": "python_tile_executor",
-        "total_tiles": N_TILES,
-        "launch_count": launch_count,
-        "launch_mode": "all_tiles" if launch_all_tiles else "active_only",
+        "backend": "sparse_active_tiles" if use_tile_ids else "sparse_all_tiles",
+        "reason": "ok",
+        "kernel_type": f"3d_k{KS}_s{stride}",
+        "total_tiles": int(N_TILES),
+        "launch_count": int(active_count),
+        "launch_mode": "active_only" if use_tile_ids else "all_tiles",
     }
-    backend_meta.update(exec_meta)
-    if active_tiles_for_meta is None:
-        active_tiles_for_meta = int(exec_meta.get("executed_tiles", 0))
-    if active_tiles_for_meta is not None:
-        backend_meta["active_tiles"] = int(active_tiles_for_meta)
     if avg_active_ratio is not None:
         backend_meta["avg_active_group_ratio"] = float(avg_active_ratio)
 
-    return _finalize_return(y, sparse_ms, avg_active_ratio, tile_stats_base, backend_meta)
+    return _finalize(y, sparse_ms, avg_active_ratio, tile_stats, backend_meta)
