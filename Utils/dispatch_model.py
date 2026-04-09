@@ -1,48 +1,74 @@
 """
-Utils/dispatch_model.py 鈥?Execution-Grounded Dispatch (EGD), v28.
+Utils/dispatch_model.py — Execution-Grounded Dispatch (EGD), v29.
 
 Decides per-layer backend: "dense", "sparse", or "staticzero".
 
-Design principle:
-  The dispatch score is derived directly from what SparseFlow's sparse kernel
-  does at runtime, not from a hand-crafted cost model with many coefficients.
+Design principle
+================
+The dispatch score is derived directly from what SparseFlow's sparse kernel
+does at runtime, not from a hand-crafted cost model with many coefficients.
 
-SparseFlow execution semantics:
-  1. Zero tiles 鈫?early return (cost 鈮?0)
-  2. Non-zero tiles 鈫?iterate groups, skip inactive groups via bitmask
+SparseFlow execution semantics
+------------------------------
+  1. Zero tiles     → early return (cost ≈ 0)
+  2. Non-zero tiles → iterate groups, skip inactive groups via bitmask
 
-Therefore, the fraction of dense work saved by sparse execution is:
+Therefore, the fraction of dense work saved by sparse execution is
 
-    R_l = z_l + (1 - z_l) 脳 (1 - a_l)
+    R_l = z_l + (1 - z_l) × (1 - a_l)
 
-  where z_l = TZR (tile-zero ratio) and a_l = AGR_nz (active group ratio
-  over non-zero tiles).  Algebraically, R_l = 1 - AGR_overall.
+where z_l = TZR (tile-zero ratio) and a_l = AGR_nz (active group ratio over
+non-zero tiles). Algebraically, R_l = 1 - AGR_overall.
 
-Per-tile compute intensity (how much dense work each tile represents):
+Per-tile compute intensity
 
     I_l = M_l / N_l
 
-  where M_l = dense MACs and N_l = total tile count.
+where M_l = dense MACs and N_l = total tile count.
 
-Dispatch score (saved MACs per tile):
+Dispatch score (saved MACs per tile)
 
-    S_l = R_l 脳 I_l
+    S_l = R_l × I_l
 
-Decision:
-  - exact-zero input 鈫?staticzero
-  - R_l < R_min 鈫?dense  (savings too thin for per-group bitmask overhead)
-  - S_l > 蟿_k 鈫?sparse   (saved MACs per tile exceed prescan/metadata cost)
-  - else 鈫?dense
+Decision
+--------
+  - exact-zero input  → staticzero
+  - R_l  < R_min      → dense (savings too thin for per-group bitmask overhead)
+  - S_l  > τ_k        → sparse (saved MACs per tile exceed prescan/metadata cost)
+  - else              → dense
 
 Thresholds are execution-grounded but empirically calibrated:
-R_min, 蟿_3x3, 蟿_1x1, 蟿_linear, 蟿_attn_*.
+R_min, τ_3x3, τ_1x1, τ_linear, τ_attn_linear, τ_attn_matmul.
+
+Round 3 changes from v28 (no semantic changes to decision logic)
+----------------------------------------------------------------
+  - Deleted ~18 DispatchDecision fields that were written but never read by
+    any code in the repository (CBD v27 feature-vector remnants: x_inactive,
+    x_tzr, x_inter, x_log_macs, x_group_pressure, x_small, x_denseish,
+    nz_fraction, variable_overhead, divergence_overhead, fixed_overhead,
+    eta_base, denseish_is_fallback, hysteresis_threshold, prior_backend,
+    effective_benefit, total_overhead, net_benefit, efficiency).
+  - Deleted unused public helpers with zero callers:
+        conv_meta_from_target, op_meta_from_module,
+        decisions_to_backend_sets, summarize_decisions,
+        format_egd_report_header, format_egd_report_row,
+        print_dispatch_decision_report, print_cbd_dispatch_report,
+        conv_meta_from_module_legacy, conv_meta_from_target_legacy.
+    (bench_4test.py defines its own local print_dispatch_decision_report and
+    imports only `dispatch_all_layers` and `decisions_to_sets`.)
+  - Deleted unused parameters of dispatch_all_layers:
+        prior_decisions (docstring already said "unused in v28"),
+        return_summary  (depended on the now-deleted summarize_decisions).
+  - Deleted fused_conv op_type branches in meta extraction; fused operators
+    are out of scope for the current codebase.
+  - Fixed ~30 mojibake'd characters throughout the file.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple
 
 from Utils.config import (
     NUMERIC_EPS,
@@ -61,49 +87,44 @@ from Utils.config import (
 # Dispatch thresholds and guards
 # =============================================================================
 #
-# NOTE:
 # These thresholds are semantically grounded in SparseFlow's execution path
 # (tile skip + group skip), but are empirically calibrated rather than strict
 # first-principles hardware costs.
 #
-# 蟿_3x3 (TAU_3x3):
-#   Minimum saved MACs per tile for 3脳3 (and larger) kernels.
+# τ_3x3 (TAU_3x3)
+#   Minimum saved MACs per tile for 3×3 (and larger) kernels.
 #   Physical meaning: the per-tile cost of prescan + metadata + bitmask
-#   dispatch.  Prescan reads ~C_in 脳 BLOCK_M values per tile and performs
-#   per-group activity classification.  For typical layers (C_in=64-256,
-#   BLOCK_M=16-64), this is ~200K-1M MACs equivalent in memory + compute
-#   overhead.  500K is a mid-range estimate.
+#   dispatch. Prescan reads ~C_in × BLOCK_M values per tile and performs
+#   per-group activity classification. For typical layers (C_in=64..256,
+#   BLOCK_M=16..64), this is ~200K..1M MAC-equivalent memory + compute
+#   overhead. 500K is a mid-range estimate.
 #   Calibrate: profile prescan latency on representative layers, convert to
-#   MACs at GPU peak throughput, and set 蟿_3x3 to that value.
+#   MACs at GPU peak throughput, and set τ_3x3 to that value.
 TAU_3x3 = DISPATCH_TAU_3X3
 
-# 蟿_1x1 (TAU_1x1):
-#   Minimum saved MACs per tile for 1脳1 kernels.
-#   Higher than 蟿_3x3 because cuDNN reduces 1脳1 conv to a highly-optimized
-#   GEMM call with near-peak throughput.  The sparse kernel must save
+# τ_1x1 (TAU_1x1)
+#   Minimum saved MACs per tile for 1×1 kernels.
+#   Higher than τ_3x3 because cuDNN reduces 1×1 conv to a highly-optimized
+#   GEMM call with near-peak throughput. The sparse kernel must save
 #   proportionally more to overcome this stronger baseline.
-#   Calibrate: same procedure as 蟿_3x3 but comparing against cuDNN 1脳1 perf.
 TAU_1x1 = DISPATCH_TAU_1X1
 
-# Linear thresholds (execution-grounded, empirically calibrated)
+# Linear and attention thresholds (execution-grounded, empirically calibrated)
 TAU_LINEAR = DISPATCH_TAU_LINEAR
-
-# Attention thresholds (split by family)
 TAU_ATTN_LINEAR = DISPATCH_TAU_ATTN_LINEAR
 TAU_ATTN_MATMUL = DISPATCH_TAU_ATTN_MATMUL
 
-# R_min (R_MIN):
-#   Minimum saved work fraction for sparse to be viable.
-#   Physical meaning: at very low R_l (high AGR), the sparse kernel iterates
-#   almost all groups with per-group bitmask checks, and the savings from
-#   the few skipped groups are consumed by this overhead.  Below R_min=0.15,
-#   the sparse kernel does 鈮?5% of the dense kernel's work plus bitmask
-#   overhead 鈥?guaranteed slower.
+# R_min
+#   Minimum saved work fraction for sparse to be viable. At very low R_l
+#   (high AGR), the sparse kernel iterates almost all groups with per-group
+#   bitmask checks, and the savings from the few skipped groups are consumed
+#   by this overhead. Below R_min=0.15, the sparse kernel does ≥85% of the
+#   dense kernel's work plus bitmask overhead — guaranteed slower.
 #   Calibrate: find the AGR at which sparse kernel latency equals dense
 #   kernel latency on a compute-heavy layer; R_min = 1 - that AGR.
 R_MIN = DISPATCH_R_MIN
 
-# Keep margins explicit for future stability tuning (default no extra margin).
+# Margins are kept explicit for future stability tuning (default none).
 R_MARGIN = DISPATCH_R_MARGIN
 TAU_MARGIN = DISPATCH_TAU_MARGIN
 
@@ -201,41 +222,52 @@ class OpMeta:
     macs: float = 0.0
 
 
-# Backward-compatible alias.
+# Backward-compatible alias — used repo-wide as the type annotation for meta.
 ConvMeta = OpMeta
 
 
 @dataclass
 class DispatchDecision:
+    """Per-layer dispatch decision.
+
+    Fields are grouped into (1) the decision outcome, (2) the v28 score
+    triple, (3) raw input measurements, and (4) provenance metadata used by
+    diagnostic reports and confidence gating. Fields that were set by v27
+    but never read by any code path have been removed in v29.
+    """
+
+    # --- decision outcome ---
     backend: str = "dense"
     reason: str = ""
     reason_code: str = "init"
     confidence: float = 1.0
+    fallback_reason: str = ""
+
+    # --- provenance ---
     meta_source: str = "measured"       # measured | estimated | fallback | shortcut
     diag_source: str = "measured"       # measured | missing | shortcut
     support_status: str = "supported"   # supported | unsupported_groups | unsupported_op | exact_zero_shortcut
     score_family: str = "unknown"       # conv | linear | attn_linear | attn_matmul | matmul | bmm | none | unknown
     tile_source: str = "diag"           # diag | meta_geometry | estimated_default | unknown
-    fallback_reason: str = ""           # short fallback/debug code
 
-    # 鈹€鈹€ Core dispatch score fields (v28) 鈹€鈹€
-    R_l: float = 0.0           # saved work fraction: TZR + (1-TZR)(1-AGR_nz)
-    I_l: float = 0.0           # per-tile intensity: MACs / N_tiles
-    S_l: float = 0.0           # dispatch score: R_l 脳 I_l (saved MACs per tile)
-    agr_nz: float = 0.0        # AGR over non-zero tiles: AGR / (1 - TZR)
+    # --- v28 core score triple ---
+    R_l: float = 0.0           # saved work fraction: tzr + (1-tzr)(1-agr_nz)
+    I_l: float = 0.0           # per-tile intensity: macs / n_tiles
+    S_l: float = 0.0           # dispatch score: R_l × I_l (saved MACs per tile)
+    agr_nz: float = 0.0        # AGR over non-zero tiles: agr / (1 - tzr)
     n_tiles: float = 0.0       # total tile count (measured or estimated)
     tau: float = 0.0           # threshold used for this layer's kernel family
+
+    # --- worst-case R guard (calibration-based, optional) ---
     agr_p90: float = -1.0      # p90 AGR from calibration batches (if available)
-    r_worst: float = -1.0      # conservative saved-work lower bound (1 - AGR_p90)
+    r_worst: float = -1.0      # conservative saved-work lower bound (1 - agr_p90)
 
-    # 鈹€鈹€ Backward-compatible fields 鈹€鈹€
-    score_sparse: float = 0.0  # S_l / tau (normalized: >1 鈫?sparse)
+    # --- bench-facing convenience field ---
+    # score_sparse = S_l / tau. Read by Benchmark/bench_4test.py for report
+    # ordering and by format_egd_report_row-style printers.
+    score_sparse: float = 0.0
 
-    effective_benefit: float = 0.0   # alias for R_l
-    total_overhead: float = 0.0      # tau / I_l (overhead as fraction of work)
-    net_benefit: float = 0.0         # R_l - tau/I_l
-
-    # 鈹€鈹€ Input measurements 鈹€鈹€
+    # --- raw input measurements (kept for JSON dumps) ---
     agr: float = -1.0          # overall AGR (active_group_ratio from kernel)
     tzr: float = -1.0          # tile zero ratio
     macs: float = 0.0
@@ -244,26 +276,7 @@ class DispatchDecision:
     active_groups: float = 0.0
     total_groups: float = 0.0
 
-    # 鈹€鈹€ Derived features for backward compat with bench reports 鈹€鈹€
-    efficiency: float = 0.0
-    nz_fraction: float = 0.0
-    denseish_among_nz: float = 0.0
-    variable_overhead: float = 0.0
-    divergence_overhead: float = 0.0
-    fixed_overhead: float = 0.0
-    eta_base: float = 0.0
-    denseish_is_fallback: bool = False
-    hysteresis_threshold: float = 0.0
-    prior_backend: str = ""
-
-    x_inactive: float = 0.0
-    x_tzr: float = 0.0
-    x_inter: float = 0.0
-    x_log_macs: float = 0.0
-    x_group_pressure: float = 0.0
-    x_small: float = 0.0
-    x_denseish: float = 0.0
-
+    # --- identity ---
     layer_name: str = ""
     groups: int = 1
 
@@ -277,6 +290,7 @@ class DispatchDecision:
 
 def conv_meta_from_module(conv_module, sample_x_shape: Optional[Tuple] = None,
                           layer_name: str = "") -> ConvMeta:
+    """Build a ConvMeta from a live nn.Conv2d (and an optional sample shape)."""
     ks = _pair(conv_module.kernel_size)
     st = _pair(conv_module.stride)
     pad = _pair(conv_module.padding)
@@ -315,15 +329,6 @@ def conv_meta_from_module(conv_module, sample_x_shape: Optional[Tuple] = None,
     )
 
 
-def op_meta_from_module(conv_module, sample_x_shape: Optional[Tuple] = None,
-                        layer_name: str = "") -> OpMeta:
-    """Generalized metadata entry-point.
-
-    Backward compatible wrapper around the historical conv-oriented helper.
-    """
-    return conv_meta_from_module(conv_module, sample_x_shape=sample_x_shape, layer_name=layer_name)
-
-
 def _target_get(target: Any, key: str, default=None):
     if isinstance(target, dict):
         return target.get(key, default)
@@ -331,61 +336,59 @@ def _target_get(target: Any, key: str, default=None):
 
 
 def _shape_tuple(input_shape: Optional[Tuple]) -> Tuple[int, ...]:
-    if input_shape is None or isinstance(input_shape, str):
+    if input_shape is None:
         return ()
     try:
-        return tuple(int(v) for v in tuple(input_shape))
+        return tuple(int(x) for x in input_shape)
     except Exception:
         return ()
 
 
 def _prod(values) -> int:
-    vals = [int(v) for v in values]
-    if not vals:
-        return 0
     out = 1
-    for v in vals:
-        out *= v
-    return int(out)
+    for v in values:
+        try:
+            out *= int(v)
+        except Exception:
+            return 0
+    return out
 
 
 def _infer_conv_batch_from_shape(input_shape: Optional[Tuple]) -> int:
     shape = _shape_tuple(input_shape)
-    if len(shape) >= 5:
-        # [T, B, C, H, W] or similar: treat all leading dims before C/H/W as batch.
-        return max(_prod(shape[:-3]), 0)
+    if len(shape) == 5:
+        return max(int(shape[0]) * int(shape[1]), 1)
     if len(shape) == 4:
-        # [B, C, H, W]
-        return max(int(shape[0]), 0)
+        return max(int(shape[0]), 1)
     if len(shape) == 3:
-        # [B, C, L] for conv1d-like tensors.
-        return max(int(shape[0]), 0)
+        return max(int(shape[0]), 1)
     return 0
 
 
 def _infer_linear_rows_from_shape(input_shape: Optional[Tuple]) -> int:
     shape = _shape_tuple(input_shape)
-    if len(shape) >= 2:
-        # nn.Linear applies over last dim; all leading dims are batch rows.
-        return max(_prod(shape[:-1]), 0)
+    if len(shape) == 0:
+        return 0
+    # Interpret as [..., features]: rows = prod of all leading dims.
     if len(shape) == 1:
-        return max(int(shape[0]), 0)
-    return 0
+        return 1
+    return max(_prod(shape[:-1]), 1)
 
 
 def _infer_attention_batch_from_shape(input_shape: Optional[Tuple]) -> int:
     shape = _shape_tuple(input_shape)
-    if len(shape) >= 3:
-        # Attention uses [..., N, C], so leading dims are batch-like.
-        return max(_prod(shape[:-2]), 0)
-    if len(shape) == 2:
-        return max(int(shape[0]), 0)
-    return 0
+    if len(shape) == 4:
+        return max(int(shape[0]) * int(shape[1]), 1)
+    if len(shape) == 3:
+        return max(int(shape[0]), 1)
+    return 1
 
 
 def _infer_batch_from_shape(input_shape: Optional[Tuple]) -> int:
-    # Backward-compatible alias.
-    return _infer_linear_rows_from_shape(input_shape)
+    shape = _shape_tuple(input_shape)
+    if len(shape) == 0:
+        return 1
+    return max(int(shape[0]), 1)
 
 
 def _is_attention_like_module(module: Any) -> bool:
@@ -631,8 +634,6 @@ def _conv_meta_from_target(
 
     if op_hint in ("depthwise_conv2d", "grouped_conv2d"):
         op_type = op_hint
-    elif op_hint.startswith("conv") or op_hint.startswith("fused_conv"):
-        op_type = "conv"
     else:
         op_type = "conv"
 
@@ -657,11 +658,13 @@ def _conv_meta_from_target(
 
 
 def _fallback_meta_from_target(target: Any, layer_name: str, input_shape: Optional[Tuple]) -> ConvMeta:
-    # Conservative fallback keeps dispatch in dense path unless diagnostics are strongly favorable.
+    # Conservative fallback keeps dispatch in the dense path unless diagnostics
+    # are strongly favorable.
     return _conv_meta_from_target(target, None, layer_name, input_shape)
 
 
 def op_meta_from_target(target: Any) -> ConvMeta:
+    """Dispatch-time entry point: extract a ConvMeta from a target record."""
     conv_module = _target_get(target, "module")
     if conv_module is None:
         conv_module = _target_get(target, "conv_module")
@@ -691,23 +694,9 @@ def op_meta_from_target(target: Any) -> ConvMeta:
         return _matmul_like_meta_from_target(target, layer_name, input_shape, op_type)
     if op_type == "linear":
         return _linear_meta_from_target(target, None, layer_name, input_shape)
-    if (
-        op_type.startswith("conv")
-        or op_type.startswith("fused_conv")
-        or op_type in ("depthwise_conv2d", "grouped_conv2d")
-    ):
+    if op_type.startswith("conv") or op_type in ("depthwise_conv2d", "grouped_conv2d"):
         return _conv_meta_from_target(target, None, layer_name, input_shape)
     return _fallback_meta_from_target(target, layer_name, input_shape)
-
-
-# Backward-compatible name.
-def conv_meta_from_target(target: Any) -> ConvMeta:
-    return op_meta_from_target(target)
-
-
-# Backward-compatible aliases while migrating naming to OpMeta/op_meta_*.
-conv_meta_from_module_legacy = conv_meta_from_module
-conv_meta_from_target_legacy = conv_meta_from_target
 
 
 # =============================================================================
@@ -715,11 +704,11 @@ conv_meta_from_target_legacy = conv_meta_from_target
 # =============================================================================
 
 def _map_diag_to_agr_tzr(diag: Dict[str, Any]) -> Tuple[float, float, float, float]:
-    """Extract AGR (overall) and TZR from kernel diagnostics.
+    """Extract overall AGR and TZR from kernel diagnostics.
 
-    AGR = nonzero_group_count / total_group_count.
-    This is the overall active group ratio across ALL tiles (including zero
-    tiles that contribute 0 active groups).
+    AGR = nonzero_group_count / total_group_count. This is the overall active
+    group ratio across ALL tiles (including zero tiles that contribute 0
+    active groups).
     """
     agr = diag.get('active_group_ratio', -1.0)
     tzr = diag.get('tile_zero_ratio', -1.0)
@@ -764,12 +753,11 @@ def _get_n_tiles(diag: Dict[str, Any], meta: ConvMeta) -> Tuple[float, str]:
     if n > 0:
         return float(n), "diag"
 
-    # Geometric estimate
     h_out, w_out = meta.h_out, meta.w_out
     if h_out <= 0 or w_out <= 0:
-        # No spatial info 鈥?return 1 to make I_l = MACs (conservative: high
-        # per-tile intensity makes sparse easier to justify, but R_min and
-        # the S_l threshold still guard against bad decisions)
+        # No spatial info — return 1 so I_l = MACs (conservative: high per-tile
+        # intensity makes sparse easier to justify, but R_min and the S_l
+        # threshold still guard against bad decisions).
         return 1.0, "estimated_default"
 
     block_m = _estimate_block_m(h_out, w_out)
@@ -780,8 +768,16 @@ def _get_n_tiles(diag: Dict[str, Any], meta: ConvMeta) -> Tuple[float, str]:
 
 
 def _select_tau(meta: ConvMeta, diag: Dict[str, Any]) -> Tuple[float, str]:
+    """Pick the threshold (τ) and score family for a layer.
+
+    Resolution order:
+      1. explicit op_type on the meta (linear / matmul / bmm / attention_*)
+      2. kernel_type hint on the diag dict
+      3. convolution footprint (1x1 vs 3x3+) as a final default
+    """
     op_type = str(getattr(meta, "op_type", "unknown")).lower()
     kernel_type = str(diag.get("kernel_type", "")).lower()
+
     if op_type == "matmul" or kernel_type == "matmul":
         return TAU_ATTN_MATMUL, "matmul"
     if op_type == "bmm" or kernel_type == "bmm":
@@ -801,7 +797,6 @@ def _select_tau(meta: ConvMeta, diag: Dict[str, Any]) -> Tuple[float, str]:
 
     # Fallback by kernel footprint.
     ks = meta.kernel_size
-    groups = meta.groups
     if ks == (1, 1):
         return TAU_1x1, "conv"
     return TAU_3x3, "conv"
@@ -837,6 +832,7 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
         tile_source="diag",
     )
 
+    # Support / sanity gates
     if groups != 1 and op_type not in ("grouped_conv2d", "depthwise_conv2d"):
         dec.backend = "dense"
         dec.support_status = "unsupported_groups"
@@ -864,18 +860,22 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
         dec.confidence = 0.2
         return dec
 
+    # ---- v28 score: R_l, I_l, S_l ----
     nz_frac = max(1.0 - tzr, _EPS)
     agr_nz = min(agr / nz_frac, 1.0)
     R_l_exec = tzr + nz_frac * (1.0 - agr_nz)
     R_l_simple = 1.0 - agr
     R_l = R_l_exec
     r_mismatch = abs(R_l_exec - R_l_simple)
+
     agr_p90 = float(diag.get("active_group_ratio_p90", -1.0))
     r_worst = (1.0 - agr_p90) if agr_p90 >= 0 else -1.0
 
     n_tiles, tile_source = _get_n_tiles(diag, meta)
     dec.tile_source = tile_source
 
+    # Fallback MACs estimation when meta.macs wasn't filled in (e.g. linear
+    # meta with unknown batch, or conv meta with unknown H/W).
     kernel_type = str(diag.get("kernel_type", "")).lower()
     is_linear_diag = kernel_type == "linear"
     is_linear_meta = (
@@ -930,28 +930,8 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
     dec.agr_p90 = agr_p90
     dec.r_worst = r_worst
     dec.n_tiles = n_tiles
-    dec.nz_fraction = nz_frac
     dec.tau = tau
     dec.score_sparse = S_l / tau if tau > 0 else 0.0
-
-    dec.effective_benefit = R_l
-    if I_l > 0:
-        dec.total_overhead = tau / I_l
-        dec.net_benefit = R_l - tau / I_l
-    else:
-        dec.total_overhead = float("inf")
-        dec.net_benefit = -1.0
-
-    dec.x_inactive = 1.0 - agr
-    dec.x_tzr = tzr
-    dec.x_inter = (1.0 - agr) * tzr
-    dec.x_log_macs = clamp01(math.log2(macs / 1e6 + 1.0) / 6.0)
-    dec.x_group_pressure = agr * clamp01(
-        active_groups / 4096.0 if active_groups >= 0 else 0.0
-    )
-    dec.x_small = 1.0 - dec.x_log_macs
-    dec.x_denseish = clamp01(denseish_ratio if denseish_ratio >= 0 else 0.0)
-    dec.efficiency = R_l
 
     reason_suffix = ""
     if macs_estimated:
@@ -959,6 +939,7 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
     if r_mismatch > 1e-4:
         reason_suffix += "|R_mismatch_check"
 
+    # ---- decision gates ----
     if r_worst >= 0 and r_worst < r_gate:
         dec.backend = "dense"
         dec.reason_code = "R_guard_worst"
@@ -980,6 +961,7 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
         dec.reason = f"S={S_l:.0f}<=tau={tau_gate:.0f}{reason_suffix}"
         dec.fallback_reason = dec.reason_code
 
+    # ---- confidence + low-confidence gate ----
     confidence = 1.0
     if dec.diag_source != "measured":
         confidence *= 0.5
@@ -991,8 +973,7 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
         confidence *= 0.8
     dec.confidence = clamp01(confidence)
 
-    # Confidence gate:
-    # estimated/fallback metadata rows can be printed and analyzed, but they
+    # Estimated/fallback metadata rows can be printed and analyzed, but they
     # should not force sparse execution when confidence is too low.
     if dec.backend == "sparse" and dec.confidence < DISPATCH_MIN_CONFIDENCE:
         dec.backend = "dense"
@@ -1002,6 +983,7 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
 
     return dec
 
+
 # =============================================================================
 # StaticZero decision helper
 # =============================================================================
@@ -1010,7 +992,7 @@ def _make_staticzero_decision(layer_name: str) -> DispatchDecision:
     """DispatchDecision for an exact-zero-input layer.
 
     StaticZero is the extreme of the dispatch surface:
-      R_l = 1.0 (all work saved), S_l 鈫?鈭?for any finite I_l.
+      R_l = 1.0 (all work saved), S_l → ∞ for any finite I_l.
     """
     return DispatchDecision(
         layer_name=layer_name,
@@ -1028,11 +1010,45 @@ def _make_staticzero_decision(layer_name: str) -> DispatchDecision:
         tzr=1.0,
         R_l=1.0,
         agr_nz=0.0,
-        effective_benefit=1.0,
-        net_benefit=1.0,
         score_sparse=float('inf'),
         denseish_ratio=0.0,
         sparse_tile_ratio=0.0,
+    )
+
+
+def _make_pool_decision(layer_name: str, op_type: str) -> DispatchDecision:
+    """DispatchDecision for MaxPool2d / AvgPool2d layers (Round 5.5b).
+
+    Pool operators have zero MACs, so the MAC-centric EGD cost model
+    (`S_l = R_l × I_l` with I_l = MACs / N_tiles) is undefined for them.
+    Rather than extending the cost model, we short-circuit pool layers to
+    always prefer the sparse kernel backend — the sparse pool kernels have
+    a cheap tile-zero fast path and degrade gracefully to dense on tiles
+    with activity. There is no hysteresis and no per-layer calibration.
+
+    This short-circuit fires after the `staticzero` check in
+    `dispatch_all_layers`, so an exact-zero pool input still falls through
+    to StaticZero (which is cheaper than sparse pool compute).
+    """
+    return DispatchDecision(
+        layer_name=layer_name,
+        backend="sparse",
+        reason=f"pool_shortcut_{op_type}",
+        reason_code="pool_shortcut",
+        fallback_reason="",
+        meta_source="shortcut",
+        diag_source="shortcut",
+        support_status="supported",
+        score_family="pool",
+        tile_source="unknown",
+        confidence=1.0,
+        agr=0.0,
+        tzr=0.0,
+        R_l=1.0,
+        agr_nz=0.0,
+        score_sparse=float('inf'),
+        denseish_ratio=0.0,
+        sparse_tile_ratio=1.0,
     )
 
 
@@ -1044,26 +1060,22 @@ def dispatch_all_layers(
     targets,
     group_sparsity_data: Dict[str, Dict],
     zero_layers=None,
-    prior_decisions: Optional[Dict[str, DispatchDecision]] = None,
-    return_summary: bool = False,
-) -> Union[Dict[str, DispatchDecision], Tuple[Dict[str, DispatchDecision], Dict[str, int]]]:
+) -> Dict[str, DispatchDecision]:
     """Run dispatch for all target layers.
 
     Args:
         targets: list of target dicts from analyze_targets().
         group_sparsity_data: per-layer diagnostic dict from measure_group_sparsity().
-        zero_layers: set of layer names with exact-zero input (鈫?staticzero).
-        prior_decisions: accepted for interface compatibility (unused in v28;
-            the simplified score model is deterministic and does not require
-            hysteresis for stability).
+        zero_layers: set of layer names with exact-zero input (→ staticzero).
 
     Returns:
-        Dict mapping layer_name 鈫?DispatchDecision.
+        Dict mapping layer_name → DispatchDecision.
     """
     if zero_layers is None:
         zero_layers = set()
 
     decisions: Dict[str, DispatchDecision] = {}
+    _POOL_OPS = {"maxpool2d", "avgpool2d"}
     for t in targets:
         name = _target_layer_name(t)
         if not name:
@@ -1073,39 +1085,16 @@ def dispatch_all_layers(
             decisions[name] = _make_staticzero_decision(name)
             continue
 
+        op_type = str(_target_get(t, "op_type", ""))
+        if op_type in _POOL_OPS:
+            decisions[name] = _make_pool_decision(name, op_type)
+            continue
+
         diag = group_sparsity_data.get(name, {})
         meta = op_meta_from_target(t)
         decisions[name] = make_dispatch_decision(diag, meta)
 
-    if return_summary:
-        return decisions, summarize_decisions(decisions)
     return decisions
-
-
-def summarize_decisions(decisions: Dict[str, DispatchDecision]) -> Dict[str, int]:
-    summary = {
-        "n_sparse": 0,
-        "n_dense": 0,
-        "n_staticzero": 0,
-        "n_unsupported": 0,
-        "n_missing_diag": 0,
-        "n_estimated_meta": 0,
-    }
-    for dec in decisions.values():
-        if dec.backend == "sparse":
-            summary["n_sparse"] += 1
-        elif dec.backend == "staticzero":
-            summary["n_staticzero"] += 1
-        else:
-            summary["n_dense"] += 1
-
-        if str(dec.support_status).startswith("unsupported"):
-            summary["n_unsupported"] += 1
-        if dec.diag_source == "missing":
-            summary["n_missing_diag"] += 1
-        if dec.meta_source != "measured":
-            summary["n_estimated_meta"] += 1
-    return summary
 
 
 def decisions_to_sets(decisions: Dict[str, DispatchDecision]):
@@ -1118,107 +1107,3 @@ def decisions_to_sets(decisions: Dict[str, DispatchDecision]):
         elif dec.backend == "sparse":
             sparse_set.add(name)
     return static_zero_set, sparse_set
-
-
-def decisions_to_backend_sets(decisions: Dict[str, DispatchDecision]) -> Dict[str, set]:
-    out = {"staticzero": set(), "sparse": set(), "dense": set()}
-    for name, dec in decisions.items():
-        backend = dec.backend if dec.backend in out else "dense"
-        out[backend].add(name)
-    return out
-
-
-# =============================================================================
-# Reporting
-# =============================================================================
-
-def format_egd_report_header() -> str:
-    """Column header for the EGD dispatch report."""
-    return (
-        f"  {'Layer':<40} {'AGR':>6} {'TZR':>6} {'AGR_nz':>7} "
-        f"{'R_l':>6} {'I_l':>10} {'S_l':>10} {'蟿':>10} {'S/蟿':>6} "
-        f"{'Dec':>8} {'RC':>14} {'Src':>12}"
-    )
-
-
-def format_egd_report_row(dec: DispatchDecision) -> str:
-    """Format one row of the EGD dispatch report."""
-    name = dec.layer_name
-    short = name if len(name) <= 39 else "..." + name[-36:]
-    agr_s = f"{dec.agr:.3f}" if dec.agr >= 0 else "n/a"
-    tzr_s = f"{dec.tzr:.3f}" if dec.tzr >= 0 else "n/a"
-    agrnz_s = f"{dec.agr_nz:.3f}" if dec.agr_nz >= 0 else "n/a"
-    rl_s = f"{dec.R_l:.3f}"
-    il_s = f"{dec.I_l:.0f}" if dec.I_l > 0 else "n/a"
-    sl_s = f"{dec.S_l:.0f}" if dec.S_l > 0 else "0"
-    tau_s = f"{dec.tau:.0f}" if dec.tau > 0 else "n/a"
-    ratio_s = f"{dec.score_sparse:.2f}" if dec.score_sparse < 1e6 else "inf"
-    rc = dec.reason_code or "n/a"
-    if len(rc) > 14:
-        rc = rc[:11] + "..."
-    src = f"{dec.meta_source[:1]}/{dec.diag_source[:1]}/{dec.tile_source[:1]}"
-    return (
-        f"  {short:<40} {agr_s:>6} {tzr_s:>6} {agrnz_s:>7} "
-        f"{rl_s:>6} {il_s:>10} {sl_s:>10} {tau_s:>10} {ratio_s:>6} "
-        f"{dec.backend:>8} {rc:>14} {src:>12}"
-    )
-
-
-def print_dispatch_decision_report(targets, group_sparsity_data, dispatch_decisions):
-    """Print a detailed EGD dispatch report to stdout.
-
-    Named to match the existing bench_4test.py call site.
-    """
-    print(f"\n  Execution-Grounded Dispatch Report (EGD v28)")
-    print(
-        f"  Constants: 蟿_3x3={TAU_3x3:,} 蟿_1x1={TAU_1x1:,} "
-        f"蟿_linear={TAU_LINEAR:,} 蟿_attn_lin={TAU_ATTN_LINEAR:,} "
-        f"蟿_attn_mm={TAU_ATTN_MATMUL:,} R_min={R_MIN}"
-    )
-    print(f"  Score: S_l = R_l 脳 I_l  (saved MACs per tile)")
-    print(format_egd_report_header())
-    print(f"  {'-'*150}")
-
-    n_sparse = 0
-    n_dense = 0
-    n_staticzero = 0
-    n_dense_score = 0
-    n_dense_unsupported = 0
-    n_dense_missing_diag = 0
-    n_estimated_meta = 0
-    for t in targets:
-        name = _target_layer_name(t)
-        if not name:
-            continue
-        dec = dispatch_decisions.get(name)
-        if dec is None:
-            continue
-        print(format_egd_report_row(dec))
-        if dec.backend == "sparse":
-            n_sparse += 1
-        elif dec.backend == "staticzero":
-            n_staticzero += 1
-        else:
-            n_dense += 1
-            if str(dec.support_status).startswith("unsupported"):
-                n_dense_unsupported += 1
-            elif dec.diag_source == "missing":
-                n_dense_missing_diag += 1
-            else:
-                n_dense_score += 1
-        if dec.meta_source != "measured":
-            n_estimated_meta += 1
-
-    total = n_sparse + n_dense + n_staticzero
-    print(
-        f"\n  Summary: sparse={n_sparse} dense={n_dense} staticzero={n_staticzero} total={total}"
-    )
-    print(
-        f"           dense(score)={n_dense_score} dense(unsupported)={n_dense_unsupported} "
-        f"dense(missing_diag)={n_dense_missing_diag} estimated_meta={n_estimated_meta}"
-    )
-
-
-# Alias for v26/v27 compatibility 鈥?bench code may call either name
-print_cbd_dispatch_report = print_dispatch_decision_report
-

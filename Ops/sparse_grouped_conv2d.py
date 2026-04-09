@@ -1,15 +1,25 @@
 """
 SparseFlow Ops/sparse_grouped_conv2d.py
 
-SparseGroupedConv2d module wrapper.
-
-This module aligns grouped Conv2d with the same framework contract used by the
-other SparseFlow operators:
+SparseGroupedConv2d module wrapper — a contract-aligned grouped Conv2d with
   - from_dense()
   - 4D / 5D input support
   - metadata-first sparse execution
   - return_ms / fallback_ratio / launch_all_tiles
   - structured diagnostics via backend_meta + tile_stats
+
+Also the base class for SparseDepthwiseConv2d (groups == in_channels ==
+out_channels); subclass rebinds backend_family / diag_path.
+
+Round 5 cleanup (no semantic changes):
+  - Hoisted per-call imports out of `_ensure_group_buffers` and `_forward_4d`
+    into a module-level try/except, matching Ops/sparse_conv2d.py v26. The
+    `triton`, `_select_tile_sizes`, and `sparse_grouped_conv2d_forward`
+    symbols are now resolved once at import time.
+  - Removed the `get_diag()` method — it had zero external callers
+    (verified by full-repo grep). Diagnostics are read directly via
+    `self._last_diag` / `self.backend_family` / `self.diag_path` by
+    Core/replacer's observability hooks.
 """
 
 from __future__ import annotations
@@ -18,15 +28,30 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 from Utils.config import PRESCAN_ACTIVITY_EPS, SPARSE_DENSE_RATIO_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# Module-level kernel availability probe (resolved once at import time).
+# ---------------------------------------------------------------------------
+try:
+    import triton  # noqa: F401
+    from Kernels.conv2d import _select_tile_sizes
+    from Kernels.grouped_conv2d import sparse_grouped_conv2d_forward
+    _TRITON_AVAILABLE = True
+except ImportError:
+    triton = None  # type: ignore[assignment]
+    _select_tile_sizes = None  # type: ignore[assignment]
+    sparse_grouped_conv2d_forward = None  # type: ignore[assignment]
+    _TRITON_AVAILABLE = False
 
 
 class SparseGroupedConv2d(nn.Module):
@@ -75,20 +100,16 @@ class SparseGroupedConv2d(nn.Module):
         if self.bias is not None:
             nn.init.zeros_(self.bias)
 
-        self._triton_available = False
-        try:
-            import triton  # noqa: F401
+        self._triton_available = _TRITON_AVAILABLE
 
-            self._triton_available = True
-        except Exception:
-            pass
-
+        # Per-group buffer caches (lazily allocated on first forward).
         self._w_cl_groups: Optional[List[torch.Tensor]] = None
         self._w_cl_version: int = -1
         self._ag_mask_bufs: Optional[List[torch.Tensor]] = None
         self._tile_class_bufs: Optional[List[torch.Tensor]] = None
         self._active_tile_ids_bufs: Optional[List[torch.Tensor]] = None
 
+        # Unified observability contract
         self.collect_diag = False
         self.profile_runtime = False
         self._inference_mode = False
@@ -106,7 +127,8 @@ class SparseGroupedConv2d(nn.Module):
         self.score_family = "conv"
 
     @classmethod
-    def from_dense(cls, conv: nn.Conv2d, threshold: float = PRESCAN_ACTIVITY_EPS, return_ms: bool = False, **kwargs):
+    def from_dense(cls, conv: nn.Conv2d, threshold: float = PRESCAN_ACTIVITY_EPS,
+                   return_ms: bool = False, **kwargs):
         sparse = cls(
             in_channels=conv.in_channels,
             out_channels=conv.out_channels,
@@ -132,6 +154,9 @@ class SparseGroupedConv2d(nn.Module):
             self.collect_diag = False
             self.profile_runtime = False
 
+    # ------------------------------------------------------------------
+    # Per-group weight layout cache
+    # ------------------------------------------------------------------
     def _group_weight_layouts(self) -> List[torch.Tensor]:
         version = self.weight._version
         if self._w_cl_groups is not None and self._w_cl_version == version:
@@ -153,9 +178,6 @@ class SparseGroupedConv2d(nn.Module):
         return layouts
 
     def _ensure_group_buffers(self, x4d: torch.Tensor):
-        from Kernels.conv2d import _select_tile_sizes
-        import triton
-
         _, _, h_in, w_in = x4d.shape
         bh, bw = _select_tile_sizes(h_in, w_in)
         n_tiles = x4d.shape[0] * triton.cdiv(h_in, bh) * triton.cdiv(w_in, bw)
@@ -174,6 +196,9 @@ class SparseGroupedConv2d(nn.Module):
         self._active_tile_ids_bufs = _alloc_list(self._active_tile_ids_bufs)
         return self._ag_mask_bufs, self._tile_class_bufs, self._active_tile_ids_bufs
 
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim == 5:
             t, n, c, h, w = x.shape
@@ -191,8 +216,6 @@ class SparseGroupedConv2d(nn.Module):
             self.diag_source = "missing"
             self.fallback_reason = "no_triton_or_not_cuda_or_groups<=1"
             return self._fallback(x)
-
-        from Kernels.grouped_conv2d import sparse_grouped_conv2d_forward
 
         w_cl_groups = self._group_weight_layouts()
         ag_mask_bufs, tile_class_bufs, active_tile_ids_bufs = self._ensure_group_buffers(x)
@@ -246,7 +269,7 @@ class SparseGroupedConv2d(nn.Module):
             avg_active_ratio = result[idx]
             idx += 1
 
-        tile_stats = {}
+        tile_stats: Dict[str, Any] = {}
         if self.collect_diag and len(result) > idx and isinstance(result[idx], dict):
             tile_stats = result[idx]
             idx += 1
@@ -316,7 +339,9 @@ class SparseGroupedConv2d(nn.Module):
                 self._last_diag["tile_zero_count"] = float(self._last_diag.get("zero_tiles", -1))
                 self._last_diag["total_tile_count"] = float(total_tiles)
                 if total_tiles > 0:
-                    self._last_diag["tile_zero_ratio"] = float(self._last_diag.get("zero_tiles", 0)) / float(total_tiles)
+                    self._last_diag["tile_zero_ratio"] = (
+                        float(self._last_diag.get("zero_tiles", 0)) / float(total_tiles)
+                    )
 
         return y
 
@@ -332,19 +357,6 @@ class SparseGroupedConv2d(nn.Module):
             self.dilation,
             self.groups,
         ).float()
-
-    def get_diag(self) -> Dict[str, Any]:
-        diag = dict(self._last_diag or {})
-        diag.setdefault("backend_family", self.backend_family)
-        diag.setdefault("diag_path", self.diag_path)
-        diag.setdefault("fallback_reason", self.fallback_reason)
-        diag.setdefault("meta_source", self.meta_source)
-        diag.setdefault("diag_source", self.diag_source)
-        diag.setdefault("support_status", self.support_status)
-        diag.setdefault("score_family", self.score_family)
-        diag.setdefault("sparse_total_ms", float(self._last_sparse_ms))
-        diag.setdefault("dense_fallback_ms", float(self._last_dense_ms))
-        return diag
 
     def extra_repr(self) -> str:
         return (

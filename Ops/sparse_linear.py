@@ -15,6 +15,25 @@ import torch.nn.functional as F
 from Utils.config import PRESCAN_ACTIVITY_EPS, SPARSE_DENSE_RATIO_THRESHOLD
 
 
+# ---------------------------------------------------------------------------
+# Module-level kernel resolution (Round 6).
+#
+# These symbols were previously re-imported on every forward() call via
+# `from Kernels.linear import ...` inside _ensure_buffers() and the forward
+# hot path. Each per-call import paid GIL + sys.modules lookup overhead.
+# They are now resolved once at import time, mirroring sparse_conv2d.py v26.
+# ---------------------------------------------------------------------------
+try:
+    import triton  # noqa: F401
+    from Kernels.linear import _select_linear_block_m, sparse_linear_forward
+    _TRITON_AVAILABLE = True
+except ImportError:
+    triton = None  # type: ignore[assignment]
+    _select_linear_block_m = None  # type: ignore[assignment]
+    sparse_linear_forward = None  # type: ignore[assignment]
+    _TRITON_AVAILABLE = False
+
+
 @dataclass
 class _ProfileStats:
     calls: int = 0
@@ -260,9 +279,6 @@ class SparseLinear(nn.Module):
         raise RuntimeError(f"Unknown restore mode: {mode}")
 
     def _ensure_buffers(self, x2d: torch.Tensor):
-        from Kernels.linear import _select_linear_block_m
-        import triton
-
         n_rows = x2d.shape[0]
         block_m = _select_linear_block_m(n_rows)
         n_tiles = triton.cdiv(n_rows, block_m)
@@ -505,8 +521,6 @@ class SparseLinear(nn.Module):
         Mirrors SparseConv2d convention:
           return (y, ms) + optional ratio + optional tile_stats + backend_meta
         """
-        from Kernels.linear import sparse_linear_forward
-
         if self.profile_runtime:
             t0 = self._stamp()
 

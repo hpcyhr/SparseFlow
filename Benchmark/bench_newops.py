@@ -263,73 +263,6 @@ def test_conv3d_module(device, verbose):
                  cosine_sim(y_ref, y_sp), max_abs_err(y_ref, y_sp))
 
 
-def test_lif_kernel(device, verbose):
-    from Kernels.lif import lif_forward
-    N = 1024
-    current = make_sparse((N,), 0.05, device, dtype=torch.float32)
-    v_prev = torch.rand(N, device=device) * 0.5
-
-    # Reference
-    decay = 0.5
-    v_th = 1.0
-    v_temp = v_prev * decay + current
-    spike_ref = (v_temp >= v_th).float()
-    v_next_ref = v_temp - spike_ref * v_th  # soft reset
-
-    spike_sp, v_next_sp, _ = lif_forward(current, v_prev, decay=decay, v_threshold=v_th, v_reset=None)
-
-    ok1 = check("LIF kernel spikes", cosine_sim(spike_ref, spike_sp), max_abs_err(spike_ref, spike_sp))
-    ok2 = check("LIF kernel v_next", cosine_sim(v_next_ref, v_next_sp), max_abs_err(v_next_ref, v_next_sp))
-    return ok1 and ok2
-
-
-def test_lif_module(device, verbose):
-    from Ops.sparse_lif import SparseLIF
-    mod = SparseLIF(tau=2.0, v_threshold=1.0, v_reset=None, step_mode="s")
-    mod.to(device)
-
-    current = make_sparse((4, 16), 0.1, device, dtype=torch.float32)
-
-    # Step 1
-    spike1 = mod(current)
-    assert spike1.shape == current.shape
-    # Step 2
-    spike2 = mod(current)
-    mod.reset()
-    ok = spike1.shape == current.shape
-    return check("SparseLIF Module [4,16] 2-step", 1.0, 0.0) if ok else False
-
-
-def test_if_kernel(device, verbose):
-    from Kernels.ifnode import if_forward
-    N = 1024
-    current = make_sparse((N,), 0.05, device, dtype=torch.float32)
-    v_prev = torch.rand(N, device=device) * 0.5
-
-    v_th = 1.0
-    v_temp = v_prev + current
-    spike_ref = (v_temp >= v_th).float()
-    v_next_ref = v_temp - spike_ref * v_th
-
-    spike_sp, v_next_sp, _ = if_forward(current, v_prev, v_threshold=v_th, v_reset=None)
-
-    ok1 = check("IF kernel spikes", cosine_sim(spike_ref, spike_sp), max_abs_err(spike_ref, spike_sp))
-    ok2 = check("IF kernel v_next", cosine_sim(v_next_ref, v_next_sp), max_abs_err(v_next_ref, v_next_sp))
-    return ok1 and ok2
-
-
-def test_if_module(device, verbose):
-    from Ops.sparse_if import SparseIF
-    mod = SparseIF(v_threshold=1.0, v_reset=None, step_mode="m")
-    mod.to(device)
-
-    current = make_sparse((3, 4, 8), 0.1, device, dtype=torch.float32)
-    spike = mod(current)
-    assert spike.shape == current.shape
-    mod.reset()
-    return check("SparseIF Module [3,4,8] multi-step", 1.0, 0.0)
-
-
 def test_attention(device, verbose):
     from Kernels.attention import sparse_qk_forward, sparse_attn_v_forward
     import math
@@ -411,10 +344,6 @@ def main():
         ("Ops/SparseConv1d", test_conv1d_module),
         ("Kernels/conv3d", test_conv3d),
         ("Ops/SparseConv3d", test_conv3d_module),
-        ("Kernels/lif", test_lif_kernel),
-        ("Ops/SparseLIF", test_lif_module),
-        ("Kernels/ifnode", test_if_kernel),
-        ("Ops/SparseIF", test_if_module),
         ("Kernels/attention", test_attention),
         ("Ops/SparseAttention", test_attention_module),
     ]

@@ -1,34 +1,46 @@
 """
-SparseFlow Utils/sparse_helpers.py 鈥?Shared prescan & metadata helpers
+SparseFlow Utils/sparse_helpers.py — Shared prescan metadata primitives.
 
-Minimal shared code factored out from the row-geometry prescan pattern
-used by Linear, Matmul, and BMM kernels.  Conv2d has its own spatial
-prescan and does NOT use this module.
+Leaf-level module that provides:
+  - Tile classification constants (single source of truth for the repo).
+  - choose_group_size() : reduction-dim group sizing.
+  - popcount_buf()      : vectorised SWAR popcount on an int32 bitmask.
 
-This file must remain small and stable 鈥?it is a leaf dependency.
+Round 6 cleanup: deleted the DEPRECATED row-geometry single-stage prescan
+(`select_row_tile_sizes`, `_prescan_rows_kernel`, `build_row_metadata`).
+Kernels/matmul.py was the last remaining caller and has been migrated to
+the three-stage prescan pipeline exported by Kernels/linear.py.
+
+This file must remain small and stable — it is a leaf dependency.
 """
 
 import torch
-import triton
-import triton.language as tl
-
-# ---------------------------------------------------------------------------
-# Tile classification constants (same as conv2d.py / linear.py for compat)
-# ---------------------------------------------------------------------------
-TILE_ZERO = 0
-TILE_SPARSE = 1
-TILE_DENSEISH = 2
 
 
 # ---------------------------------------------------------------------------
-# Group-size selection (shared logic, mirrors conv2d choose_group_size)
+# Tile classification constants (single source of truth for the repo)
+# ---------------------------------------------------------------------------
+# Values 0..2 are the final classes produced by the three-stage prescan and
+# consumed by the compute kernels. Values 3..4 are intermediate classes used
+# internally by the three-stage prescan pipeline in Kernels/conv2d.py and
+# Kernels/linear.py; they never appear in the final tile_class buffer at
+# compute time.
+TILE_ZERO           = 0
+TILE_SPARSE         = 1
+TILE_DENSEISH       = 2
+TILE_UNCERTAIN      = 3
+TILE_ZERO_CANDIDATE = 4
+
+
+# ---------------------------------------------------------------------------
+# Group-size selection
 # ---------------------------------------------------------------------------
 
 def choose_group_size(k_dim: int) -> int:
-    """
-    Select GROUP_SIZE for the reduction dimension.
-    Matches conv2d.py convention: 16 for k<=128, else 32, capped so
-    NUM_GROUPS <= 32 (fits in a uint32 bitmask).
+    """Select GROUP_SIZE for the reduction dimension.
+
+    Convention: 16 for k<=128, else 32, then capped upward so NUM_GROUPS
+    never exceeds 32 (keeps the active-group bitmask in a single uint32).
     """
     if k_dim <= 128:
         gs = 16
@@ -42,36 +54,19 @@ def choose_group_size(k_dim: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Row-geometry tile sizing
-# ---------------------------------------------------------------------------
-
-def select_row_tile_sizes(M: int, N: int):
-    """
-    Select (BLOCK_M, BLOCK_N) for a flat [M, N] output.
-    Used by matmul / bmm kernels.
-    """
-    if M >= 128:
-        bm = 64
-    elif M >= 32:
-        bm = 32
-    else:
-        bm = 16
-
-    if N >= 256:
-        bn = 64
-    elif N >= 64:
-        bn = 32
-    else:
-        bn = 16
-    return bm, bn
-
-
-# ---------------------------------------------------------------------------
-# Vectorised bitmask popcount (reusable)
+# Vectorised bitmask popcount
 # ---------------------------------------------------------------------------
 
 def popcount_buf(ag_mask_buf: torch.Tensor, count: int) -> torch.Tensor:
-    """SWAR popcount on int32 bitmask buffer, returns int32 tensor."""
+    """SWAR popcount on a prefix of an int32 bitmask buffer.
+
+    Args:
+        ag_mask_buf: int32 tensor holding one bitmask per tile.
+        count:       number of entries to process from the front of the buffer.
+
+    Returns:
+        int32 tensor of shape [count] with the popcount of each entry.
+    """
     v = ag_mask_buf[:count].int()
     v = v - ((v >> 1) & 0x55555555)
     v = (v & 0x33333333) + ((v >> 2) & 0x33333333)
@@ -79,90 +74,3 @@ def popcount_buf(ag_mask_buf: torch.Tensor, count: int) -> torch.Tensor:
     v = v + (v >> 8)
     v = v + (v >> 16)
     return (v & 0x3F).to(torch.int32)
-
-
-# ---------------------------------------------------------------------------
-# Row-geometry prescan kernel (1D reduction dim)
-# ---------------------------------------------------------------------------
-
-@triton.jit
-def _prescan_rows_kernel(
-    x_ptr,            # [M, K] input, row-major, fp16
-    ag_mask_ptr,      # [N_TILES_M] output bitmask
-    tile_class_ptr,   # [N_TILES_M] output class
-    M: tl.constexpr,
-    K: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    GROUP_SIZE_C: tl.constexpr,
-    NUM_GROUPS: tl.constexpr,
-    ALL_ONES: tl.constexpr,
-    THRESHOLD: tl.constexpr,
-):
-    """
-    Per-tile-row prescan: for each BLOCK_M-row tile, build a uint32
-    bitmask indicating which K-groups have any nonzero element.
-    """
-    tile_id = tl.program_id(0)
-    row_start = tile_id * BLOCK_M
-    rows = row_start + tl.arange(0, BLOCK_M)
-    row_mask = rows < M
-    off1 = tl.arange(0, 1)
-
-    ag_mask = tl.zeros([1], dtype=tl.int32)
-    any_nonzero = tl.zeros([1], dtype=tl.int32)
-
-    for g in range(NUM_GROUPS):
-        col_start = g * GROUP_SIZE_C
-        cols = col_start + tl.arange(0, GROUP_SIZE_C)
-        col_mask = cols < K
-
-        addrs = rows[:, None] * K + cols[None, :]
-        mask = row_mask[:, None] & col_mask[None, :]
-        vals = tl.load(x_ptr + addrs, mask=mask, other=0.0)
-
-        has_nonzero = (tl.sum((tl.abs(vals) > THRESHOLD).to(tl.int32), axis=0) > 0).to(tl.int32)
-        ag_mask = ag_mask + has_nonzero * (1 << g)
-        any_nonzero = tl.maximum(any_nonzero, has_nonzero)
-
-    tl.store(ag_mask_ptr + tile_id + off1, ag_mask)
-
-    if tl.sum(any_nonzero) == 0:
-        tl.store(tile_class_ptr + tile_id + off1, tl.zeros([1], dtype=tl.int32))
-    else:
-        if tl.sum(ag_mask == ALL_ONES) > 0:
-            tl.store(tile_class_ptr + tile_id + off1, tl.full([1], TILE_DENSEISH, dtype=tl.int32))
-        else:
-            tl.store(tile_class_ptr + tile_id + off1, tl.full([1], TILE_SPARSE, dtype=tl.int32))
-
-
-def build_row_metadata(
-    x: torch.Tensor,     # [M, K] fp16, contiguous
-    M: int, K: int,
-    BLOCK_M: int,
-    GROUP_SIZE_C: int,
-    threshold: float,
-    ag_mask_buf: torch.Tensor = None,
-    tile_class_buf: torch.Tensor = None,
-):
-    """
-    Run row-geometry prescan. Returns (ag_mask_buf, tile_class_buf, N_TILES).
-    """
-    device = x.device
-    NUM_GROUPS = triton.cdiv(K, GROUP_SIZE_C)
-    ALL_ONES = (1 << NUM_GROUPS) - 1
-    N_TILES = triton.cdiv(M, BLOCK_M)
-
-    if ag_mask_buf is None or ag_mask_buf.numel() < N_TILES:
-        ag_mask_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
-    if tile_class_buf is None or tile_class_buf.numel() < N_TILES:
-        tile_class_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
-
-    _prescan_rows_kernel[(N_TILES,)](
-        x, ag_mask_buf, tile_class_buf,
-        M=M, K=K, BLOCK_M=BLOCK_M,
-        GROUP_SIZE_C=GROUP_SIZE_C,
-        NUM_GROUPS=NUM_GROUPS,
-        ALL_ONES=ALL_ONES,
-        THRESHOLD=threshold,
-    )
-    return ag_mask_buf, tile_class_buf, N_TILES

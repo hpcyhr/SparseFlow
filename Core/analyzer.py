@@ -1,13 +1,50 @@
+"""
+Core/analyzer.py — Replacement-target discovery.
+
+Finds modules that follow a spike source (LIF / IF / …) and are eligible
+for sparse replacement. Runs in three modes in order, falling back on
+failure:
+
+    1. torch.fx symbolic trace  → BFS from spike nodes to the next
+       conv1d / conv2d / conv3d / linear / attention consumer
+    2. Runtime-order scan       → forward-hook event trace under a sample
+       input, then pair each spike event with its next target event
+    3. Module-order fallback    → linear scan over named_modules()
+
+Attention blocks are discovered by a separate pass because they're
+composite `nn.Module`s (q/k/v/proj + attn_lif) rather than leaf ops.
+
+Round 4 cleanup (no semantic changes):
+  - Removed Conv+LIF fusion detection (`_look_ahead_for_lif`,
+    `_eligible_direct_fusion_conv_name`, fused op_type rewriting inside
+    `_make_conv2d_target`). Fused operators are out of scope for the
+    current codebase.
+  - Removed `lif_name`, `lif_module`, `bn_name`, `bn_module` fields from
+    `ReplacementTarget`. Bench code that defensively assigned these via
+    `hasattr(t, "lif_name")` continues to work unchanged.
+  - Removed fused op_type entries from `display_block_info`.
+
+Round 5.5b (additive — Pool2d integration):
+  - `nn.MaxPool2d` and `nn.AvgPool2d` were removed from the transparent
+    whitelist and are now detected as replaceable targets by the three
+    discovery paths (fx BFS, runtime-order hook trace, linear fallback).
+  - Added `_is_maxpool2d_node` / `_is_avgpool2d_node` predicates and
+    `_make_maxpool2d_target` / `_make_avgpool2d_target` factories; these
+    emit `op_type="maxpool2d"` / `"avgpool2d"`, matched by Core/replacer
+    and short-circuited by Utils/dispatch_model's pool branch.
+  - The other pool types (Adaptive*, 1d, 3d) remain transparent.
+"""
+
 import sys
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
-import warnings
 import torch
 import torch.nn as nn
 
@@ -16,7 +53,13 @@ from Core.registry import SpikeOpRegistry
 
 @dataclass
 class ReplacementTarget:
-    # Kept for backward compatibility with existing replacer API.
+    """Record describing one replaceable module.
+
+    `conv_name` / `conv_module` are historical names — the target may be
+    any op type (conv1d/2d/3d, linear, attention block); the field names
+    are kept for backward compatibility with existing downstream code.
+    """
+
     conv_name: str
     conv_module: nn.Module
     spike_name: str
@@ -27,12 +70,8 @@ class ReplacementTarget:
     input_w: int = 0
     input_d: int = 0
 
-    lif_name: Optional[str] = None
-    lif_module: Optional[nn.Module] = None
-    bn_name: Optional[str] = None
-    bn_module: Optional[nn.Module] = None
-
-    # optional extension payload for non-conv ops
+    # Optional extension payload for non-conv ops (e.g. attention blocks
+    # carry num_heads / head_dim here).
     extra: Optional[dict] = None
 
 
@@ -42,13 +81,22 @@ _TRANSPARENT_MODULES = (
     nn.Flatten,
     nn.AdaptiveAvgPool1d, nn.AdaptiveAvgPool2d, nn.AdaptiveAvgPool3d,
     nn.AdaptiveMaxPool1d, nn.AdaptiveMaxPool2d, nn.AdaptiveMaxPool3d,
-    nn.AvgPool1d, nn.AvgPool2d, nn.AvgPool3d,
-    nn.MaxPool1d, nn.MaxPool2d, nn.MaxPool3d,
+    nn.AvgPool1d, nn.AvgPool3d,
+    nn.MaxPool1d, nn.MaxPool3d,
     nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
     nn.ReLU, nn.ReLU6, nn.LeakyReLU, nn.GELU, nn.SiLU,
     nn.Sequential,
 )
+# NOTE (Round 5.5b): nn.MaxPool2d and nn.AvgPool2d were removed from this
+# whitelist and are now detected as replacement targets in their own right
+# by _is_maxpool2d_node / _is_avgpool2d_node below. The other pool types
+# (Adaptive*, 1d, 3d) remain transparent — only 2d pools have sparse
+# kernel backends (Kernels/maxpool2d.py, Kernels/avgpool2d.py).
 
+
+# =============================================================================
+# Node / module predicates
+# =============================================================================
 
 def _is_conv1d_node(node, modules_dict: dict) -> bool:
     return node.op == "call_module" and isinstance(modules_dict.get(node.target), nn.Conv1d)
@@ -66,7 +114,16 @@ def _is_linear_node(node, modules_dict: dict) -> bool:
     return node.op == "call_module" and isinstance(modules_dict.get(node.target), nn.Linear)
 
 
+def _is_maxpool2d_node(node, modules_dict: dict) -> bool:
+    return node.op == "call_module" and isinstance(modules_dict.get(node.target), nn.MaxPool2d)
+
+
+def _is_avgpool2d_node(node, modules_dict: dict) -> bool:
+    return node.op == "call_module" and isinstance(modules_dict.get(node.target), nn.AvgPool2d)
+
+
 def _is_attention_like_module(module: nn.Module) -> bool:
+    """Heuristic: an attention block carries Linear q/k/v/proj + attn_lif."""
     if module is None:
         return False
     for attr in ("q", "k", "v", "proj"):
@@ -82,8 +139,7 @@ def _is_attention_like_module(module: nn.Module) -> bool:
 def _is_attention_node(node, modules_dict: dict) -> bool:
     if node.op != "call_module":
         return False
-    mod = modules_dict.get(node.target)
-    return _is_attention_like_module(mod)
+    return _is_attention_like_module(modules_dict.get(node.target))
 
 
 def _infer_attention_variant(module: nn.Module) -> str:
@@ -114,16 +170,14 @@ def _as_pair(x) -> Tuple[int, int]:
     return int(x), int(x)
 
 
+# =============================================================================
+# Display helper
+# =============================================================================
+
 def display_block_info(target: ReplacementTarget) -> str:
+    """Compact one-line summary of a target's spatial shape and tile size."""
     op = target.op_type
-    if op in (
-        "conv2d_3x3",
-        "conv2d_3x3_s2",
-        "conv2d_1x1",
-        "fused_conv3x3_lif",
-        "fused_conv1x1_lif",
-        "fused_conv3x3s2_lif",
-    ):
+    if op in ("conv2d_3x3", "conv2d_3x3_s2", "conv2d_1x1"):
         h, w = target.input_h, target.input_w
         if h <= 0 or w <= 0:
             return "H=? BLOCK_M=?"
@@ -133,7 +187,7 @@ def display_block_info(target: ReplacementTarget) -> str:
             c_in = getattr(target.conv_module, "in_channels", 64)
             c_out = getattr(target.conv_module, "out_channels", 64)
             k = 3 if "3x3" in op else 1
-            s = 2 if ("s2" in op) else 1
+            s = 2 if "s2" in op else 1
             _, _, block_m, _, _ = _select_block_sizes(h, w, c_in, c_out, k, s)
             return f"H={h} BLOCK_M={block_m}"
         except Exception:
@@ -169,35 +223,9 @@ def display_block_info(target: ReplacementTarget) -> str:
     return ""
 
 
-def _eligible_direct_fusion_conv_name(conv_name: str) -> bool:
-    # Conservative rule for SpikingJelly ResNet/Bottleneck:
-    # conv1 -> bn1 -> sn1 : safe
-    # conv2 -> bn2 -> sn2 : safe
-    # conv3 -> bn3 -> add -> sn3 : not fused here
-    leaf = conv_name.rsplit(".", 1)[-1]
-    return leaf in ("conv1", "conv2")
-
-
-def _look_ahead_for_lif(module_list, conv_idx, registry, max_distance=5):
-    conv_name, _ = module_list[conv_idx]
-    if not _eligible_direct_fusion_conv_name(conv_name):
-        return None
-
-    bn_name = None
-    bn_module = None
-    for j in range(conv_idx + 1, min(conv_idx + max_distance + 1, len(module_list))):
-        name_j, mod_j = module_list[j]
-        if isinstance(mod_j, nn.BatchNorm2d):
-            bn_name = name_j
-            bn_module = mod_j
-            continue
-        if isinstance(mod_j, nn.Identity):
-            continue
-        if registry.is_spike_op(mod_j):
-            return name_j, mod_j, bn_name, bn_module
-        break
-    return None
-
+# =============================================================================
+# NetworkAnalyzer
+# =============================================================================
 
 class NetworkAnalyzer:
     FALLBACK_SEARCH_WINDOW = 15
@@ -255,6 +283,10 @@ class NetworkAnalyzer:
         merged = self._merge_targets(fb_targets, attention_targets, attention_names)
         return merged
 
+    # ----------------------------------------------------------------
+    # Target merging
+    # ----------------------------------------------------------------
+
     @staticmethod
     def _is_inside_attention_target(module_name: str, attention_names: Set[str]) -> bool:
         for attn_name in attention_names:
@@ -268,13 +300,17 @@ class NetworkAnalyzer:
         attention_targets: List[ReplacementTarget],
         attention_names: Set[str],
     ) -> List[ReplacementTarget]:
+        """Merge base targets with attention block targets.
+
+        Rule: if a base target lives inside an attention block, the parent
+        attention replacement takes priority and the child is dropped.
+        """
         merged: List[ReplacementTarget] = []
         seen: Set[str] = set()
 
         for t in base_targets:
             name = t.conv_name
             if self._is_inside_attention_target(name, attention_names):
-                # Parent attention block replacement has priority over child linears.
                 continue
             if name in seen:
                 continue
@@ -288,6 +324,10 @@ class NetworkAnalyzer:
             seen.add(t.conv_name)
 
         return merged
+
+    # ----------------------------------------------------------------
+    # Attention-block pass
+    # ----------------------------------------------------------------
 
     def _analyze_attention_modules(self, model: nn.Module, input_shapes: dict) -> List[ReplacementTarget]:
         targets: List[ReplacementTarget] = []
@@ -304,11 +344,16 @@ class NetworkAnalyzer:
                 targets.append(target)
         return targets
 
+    # ----------------------------------------------------------------
+    # Mode 1: torch.fx
+    # ----------------------------------------------------------------
+
     def _analyze_fx(self, model: nn.Module, input_shapes: dict) -> List[ReplacementTarget]:
         graph_module = torch.fx.symbolic_trace(model)
         modules_dict = dict(graph_module.named_modules())
         spike_nodes = [
-            n for n in graph_module.graph.nodes if _is_spike_node(n, modules_dict, self.registry)
+            n for n in graph_module.graph.nodes
+            if _is_spike_node(n, modules_dict, self.registry)
         ]
 
         targets: List[ReplacementTarget] = []
@@ -323,7 +368,6 @@ class NetworkAnalyzer:
                     target_type,
                     spike_name,
                     input_shapes,
-                    model=model,
                 )
                 if target is not None:
                     targets.append(target)
@@ -364,63 +408,32 @@ class NetworkAnalyzer:
                 if name not in visited:
                     found.append((name, "linear"))
                 continue
+            if _is_maxpool2d_node(node, modules_dict):
+                name = node.target
+                if name not in visited:
+                    found.append((name, "maxpool2d"))
+                continue
+            if _is_avgpool2d_node(node, modules_dict):
+                name = node.target
+                if name not in visited:
+                    found.append((name, "avgpool2d"))
+                continue
             if _is_attention_node(node, modules_dict):
                 name = node.target
                 if name not in visited:
                     found.append((name, "attention"))
                 continue
             if _is_spike_node(node, modules_dict, self.registry):
+                # Don't cross another spike boundary.
                 continue
 
             for user in node.users:
                 queue.append((user, depth + 1))
         return found
 
-    def _analyze_fallback(self, model: nn.Module, input_shapes: dict) -> List[ReplacementTarget]:
-        module_list = list(model.named_modules())
-        targets: List[ReplacementTarget] = []
-        visited: Set[str] = set()
-
-        for i, (name, module) in enumerate(module_list):
-            if not self.registry.is_spike_op(module):
-                continue
-
-            for j in range(i + 1, min(i + self.FALLBACK_SEARCH_WINDOW, len(module_list))):
-                next_name, next_module = module_list[j]
-                if next_name in visited:
-                    continue
-                if self.registry.is_spike_op(next_module):
-                    break
-                if _is_transparent_fallback(next_module):
-                    continue
-
-                target_type = None
-                if isinstance(next_module, nn.Conv1d):
-                    target_type = "conv1d"
-                elif isinstance(next_module, nn.Conv2d):
-                    target_type = "conv2d"
-                elif isinstance(next_module, nn.Conv3d):
-                    target_type = "conv3d"
-                elif isinstance(next_module, nn.Linear):
-                    target_type = "linear"
-                elif _is_attention_like_module(next_module):
-                    target_type = "attention"
-                else:
-                    continue
-
-                target = self._make_target(
-                    next_name,
-                    next_module,
-                    target_type,
-                    name,
-                    input_shapes,
-                    model=model,
-                )
-                if target is not None:
-                    targets.append(target)
-                    visited.add(next_name)
-
-        return targets
+    # ----------------------------------------------------------------
+    # Mode 2: runtime-order fallback
+    # ----------------------------------------------------------------
 
     def _analyze_runtime_fallback(
         self,
@@ -441,6 +454,10 @@ class NetworkAnalyzer:
                 return "conv3d"
             if isinstance(mod, nn.Linear):
                 return "linear"
+            if isinstance(mod, nn.MaxPool2d):
+                return "maxpool2d"
+            if isinstance(mod, nn.AvgPool2d):
+                return "avgpool2d"
             if _is_attention_like_module(mod):
                 return "attention"
             return None
@@ -493,13 +510,69 @@ class NetworkAnalyzer:
                 target_type,
                 last_spike_name,
                 input_shapes,
-                model=model,
             )
             if target is not None:
                 targets.append(target)
                 visited.add(name)
 
         return targets
+
+    # ----------------------------------------------------------------
+    # Mode 3: linear module-order fallback
+    # ----------------------------------------------------------------
+
+    def _analyze_fallback(self, model: nn.Module, input_shapes: dict) -> List[ReplacementTarget]:
+        module_list = list(model.named_modules())
+        targets: List[ReplacementTarget] = []
+        visited: Set[str] = set()
+
+        for i, (name, module) in enumerate(module_list):
+            if not self.registry.is_spike_op(module):
+                continue
+
+            for j in range(i + 1, min(i + self.FALLBACK_SEARCH_WINDOW, len(module_list))):
+                next_name, next_module = module_list[j]
+                if next_name in visited:
+                    continue
+                if self.registry.is_spike_op(next_module):
+                    break
+                if _is_transparent_fallback(next_module):
+                    continue
+
+                target_type = None
+                if isinstance(next_module, nn.Conv1d):
+                    target_type = "conv1d"
+                elif isinstance(next_module, nn.Conv2d):
+                    target_type = "conv2d"
+                elif isinstance(next_module, nn.Conv3d):
+                    target_type = "conv3d"
+                elif isinstance(next_module, nn.Linear):
+                    target_type = "linear"
+                elif isinstance(next_module, nn.MaxPool2d):
+                    target_type = "maxpool2d"
+                elif isinstance(next_module, nn.AvgPool2d):
+                    target_type = "avgpool2d"
+                elif _is_attention_like_module(next_module):
+                    target_type = "attention"
+                else:
+                    continue
+
+                target = self._make_target(
+                    next_name,
+                    next_module,
+                    target_type,
+                    name,
+                    input_shapes,
+                )
+                if target is not None:
+                    targets.append(target)
+                    visited.add(next_name)
+
+        return targets
+
+    # ----------------------------------------------------------------
+    # Target builders
+    # ----------------------------------------------------------------
 
     def _make_target(
         self,
@@ -508,18 +581,21 @@ class NetworkAnalyzer:
         target_type: str,
         spike_name: str,
         input_shapes: dict,
-        model: Optional[nn.Module] = None,
     ) -> Optional[ReplacementTarget]:
         if target_type == "conv1d":
             return self._make_conv1d_target(module_name, module, spike_name, input_shapes)
         if target_type == "conv2d":
-            return self._make_conv2d_target(module_name, module, spike_name, input_shapes, model=model)
+            return self._make_conv2d_target(module_name, module, spike_name, input_shapes)
         if target_type == "conv3d":
             return self._make_conv3d_target(module_name, module, spike_name, input_shapes)
         if target_type == "linear":
             return self._make_linear_target(module_name, module, spike_name)
         if target_type == "attention":
             return self._make_attention_target(module_name, module, spike_name, input_shapes)
+        if target_type == "maxpool2d":
+            return self._make_maxpool2d_target(module_name, module, spike_name, input_shapes)
+        if target_type == "avgpool2d":
+            return self._make_avgpool2d_target(module_name, module, spike_name, input_shapes)
         return None
 
     def _make_conv2d_target(
@@ -528,7 +604,6 @@ class NetworkAnalyzer:
         conv_module: nn.Conv2d,
         spike_name: str,
         input_shapes: dict,
-        model: Optional[nn.Module] = None,
     ) -> Optional[ReplacementTarget]:
         if not isinstance(conv_module, nn.Conv2d):
             return None
@@ -538,7 +613,7 @@ class NetworkAnalyzer:
         p = _as_pair(conv_module.padding)
         g = int(conv_module.groups)
 
-        # Depthwise path
+        # Depthwise special case.
         if (
             g == conv_module.in_channels
             and conv_module.out_channels == conv_module.in_channels
@@ -557,46 +632,24 @@ class NetworkAnalyzer:
                 input_w=w,
             )
 
-        # Current sparse conv2d kernel supports only groups=1 special patterns.
+        # Grouped (non-depthwise) conv2d is not supported by the current
+        # sparse kernel.
         if g != 1:
             return None
 
         if k == (3, 3) and s == (1, 1) and p == (1, 1):
-            base_op = "conv2d_3x3"
+            op_type = "conv2d_3x3"
         elif k == (3, 3) and s == (2, 2) and p == (1, 1):
-            base_op = "conv2d_3x3_s2"
+            op_type = "conv2d_3x3_s2"
         elif k == (1, 1) and s == (1, 1) and p == (0, 0):
-            base_op = "conv2d_1x1"
+            op_type = "conv2d_1x1"
         else:
             return None
 
         h, w = self._extract_hw(input_shapes.get(conv_name))
+        # Small feature maps: per-tile overhead dominates; skip sparse path.
         if h > 0 and w > 0 and min(h, w) < 7:
             return None
-
-        lif_name = None
-        lif_module = None
-        bn_name = None
-        bn_module = None
-        op_type = base_op
-
-        if model is not None:
-            module_list = list(model.named_modules())
-            conv_idx = None
-            for idx, (mname, _) in enumerate(module_list):
-                if mname == conv_name:
-                    conv_idx = idx
-                    break
-            if conv_idx is not None:
-                fusion = _look_ahead_for_lif(module_list, conv_idx, self.registry, max_distance=5)
-                if fusion is not None and _eligible_direct_fusion_conv_name(conv_name):
-                    lif_name, lif_module, bn_name, bn_module = fusion
-                    if base_op == "conv2d_3x3_s2":
-                        op_type = "fused_conv3x3s2_lif"
-                    elif base_op == "conv2d_3x3":
-                        op_type = "fused_conv3x3_lif"
-                    else:
-                        op_type = "fused_conv1x1_lif"
 
         return ReplacementTarget(
             conv_name=conv_name,
@@ -606,10 +659,6 @@ class NetworkAnalyzer:
             block_size=None,
             input_h=h,
             input_w=w,
-            lif_name=lif_name,
-            lif_module=lif_module,
-            bn_name=bn_name,
-            bn_module=bn_module,
         )
 
     def _make_conv1d_target(
@@ -681,10 +730,12 @@ class NetworkAnalyzer:
         ishape = input_shapes.get(name)
         n, c = self._extract_nc(ishape)
         op_type = _infer_attention_variant(module)
-        extra = {
-            "num_heads": int(getattr(module, "num_heads", 1)),
-            "head_dim": int(getattr(module, "head_dim", max(1, c // max(1, int(getattr(module, "num_heads", 1)))))),
-        }
+        num_heads = int(getattr(module, "num_heads", 1))
+        head_dim = int(getattr(
+            module, "head_dim",
+            max(1, c // max(1, num_heads)),
+        ))
+        extra = {"num_heads": num_heads, "head_dim": head_dim}
 
         return ReplacementTarget(
             conv_name=name,
@@ -696,6 +747,55 @@ class NetworkAnalyzer:
             input_w=c,   # channel dim
             extra=extra,
         )
+
+    def _make_maxpool2d_target(
+        self,
+        name: str,
+        module: nn.MaxPool2d,
+        spike_name: str,
+        input_shapes: dict,
+    ) -> Optional[ReplacementTarget]:
+        if not isinstance(module, nn.MaxPool2d):
+            return None
+        h, w = self._extract_hw(input_shapes.get(name))
+        # Very small feature maps: dispatch/launch overhead dominates.
+        if h > 0 and w > 0 and min(h, w) < 4:
+            return None
+        return ReplacementTarget(
+            conv_name=name,
+            conv_module=module,
+            spike_name=spike_name,
+            op_type="maxpool2d",
+            block_size=None,
+            input_h=h,
+            input_w=w,
+        )
+
+    def _make_avgpool2d_target(
+        self,
+        name: str,
+        module: nn.AvgPool2d,
+        spike_name: str,
+        input_shapes: dict,
+    ) -> Optional[ReplacementTarget]:
+        if not isinstance(module, nn.AvgPool2d):
+            return None
+        h, w = self._extract_hw(input_shapes.get(name))
+        if h > 0 and w > 0 and min(h, w) < 4:
+            return None
+        return ReplacementTarget(
+            conv_name=name,
+            conv_module=module,
+            spike_name=spike_name,
+            op_type="avgpool2d",
+            block_size=None,
+            input_h=h,
+            input_w=w,
+        )
+
+    # ----------------------------------------------------------------
+    # Shape extractors
+    # ----------------------------------------------------------------
 
     @staticmethod
     def _extract_hw(ishape) -> Tuple[int, int]:
@@ -723,17 +823,20 @@ class NetworkAnalyzer:
 
     @staticmethod
     def _extract_nc(ishape) -> Tuple[int, int]:
-        # For attention block input:
-        # [T, B, N, C] or [B, N, C]
+        """Attention-block input shape: [T, B, N, C] or [B, N, C]."""
         if ishape is None:
             return 0, 0
         if len(ishape) >= 2:
             return int(ishape[-2]), int(ishape[-1])
         return 0, 0
 
+    # ----------------------------------------------------------------
+    # Shape inference under a sample input
+    # ----------------------------------------------------------------
+
     @staticmethod
-    def _infer_input_shapes(model: nn.Module, sample_input: torch.Tensor):
-        input_shapes = {}
+    def _infer_input_shapes(model: nn.Module, sample_input: torch.Tensor) -> Dict[str, tuple]:
+        input_shapes: Dict[str, tuple] = {}
         hooks = []
 
         def make_hook(name):

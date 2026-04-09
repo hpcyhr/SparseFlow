@@ -1,29 +1,45 @@
 """
-Ops/sparse_conv3d.py
+Ops/sparse_conv3d.py — SparseConv3d wrapper.
 
-SparseConv3d wrapper.
+Maturity: main_path. Prescan + active-tile sparse compute via
+Kernels/conv3d.sparse_conv3d_forward.
 
-Current maturity: main_path.
-This operator runs prescan + active-tile sparse compute in kernel v2.
+Round 5 cleanup (no semantic changes):
+  - Hoisted `from Kernels.conv3d import sparse_conv3d_forward` out of the
+    forward hot path into a module-level try/except, mirroring the pattern
+    used by Ops/sparse_conv2d.py v26.
+  - Removed the stale `_warned_v2` migration warning and the `warnings`
+    module import.
 """
 
+from __future__ import annotations
+
 import sys
-import warnings
 from pathlib import Path
 from typing import Any, Dict
-
-_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+
+# ---------------------------------------------------------------------------
+# Module-level kernel availability probe (resolved once at import time).
+# ---------------------------------------------------------------------------
+try:
+    import triton  # noqa: F401
+    from Kernels.conv3d import sparse_conv3d_forward
+    _TRITON_AVAILABLE = True
+except ImportError:
+    sparse_conv3d_forward = None  # type: ignore[assignment]
+    _TRITON_AVAILABLE = False
+
 
 class SparseConv3d(nn.Module):
-    _warned_v2 = False
-
     def __init__(
         self,
         in_channels: int,
@@ -53,7 +69,9 @@ class SparseConv3d(nn.Module):
         self.launch_all_tiles = bool(launch_all_tiles)
         self.return_ms = bool(return_ms)
 
-        self.weight = nn.Parameter(torch.empty(out_channels, in_channels // groups, ks, ks, ks))
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, in_channels // groups, ks, ks, ks)
+        )
         if bias:
             self.bias = nn.Parameter(torch.empty(out_channels))
         else:
@@ -63,13 +81,7 @@ class SparseConv3d(nn.Module):
         if self.bias is not None:
             nn.init.zeros_(self.bias)
 
-        self._triton_available = False
-        try:
-            import triton  # noqa: F401
-
-            self._triton_available = True
-        except Exception:
-            pass
+        self._triton_available = _TRITON_AVAILABLE
 
         # Unified observability contract
         self.collect_diag = False
@@ -86,13 +98,8 @@ class SparseConv3d(nn.Module):
         self.score_family = "conv"
 
     @classmethod
-    def from_dense(cls, conv: nn.Conv3d, threshold: float = 1e-6, return_ms: bool = False, **kwargs):
-        if not cls._warned_v2:
-            warnings.warn(
-                "[SparseFlow] SparseConv3d now uses active-tile sparse compute (v2).",
-                UserWarning,
-            )
-            cls._warned_v2 = True
+    def from_dense(cls, conv: nn.Conv3d, threshold: float = 1e-6,
+                   return_ms: bool = False, **kwargs):
         sparse = cls(
             in_channels=conv.in_channels,
             out_channels=conv.out_channels,
@@ -135,8 +142,6 @@ class SparseConv3d(nn.Module):
             self.diag_source = "missing"
             return self._fallback(x)
 
-        from Kernels.conv3d import sparse_conv3d_forward
-
         result = sparse_conv3d_forward(
             x=x,
             weight=self.weight,
@@ -153,7 +158,7 @@ class SparseConv3d(nn.Module):
         y = result[0]
         self._last_sparse_ms = float(result[1])
 
-        stats = {}
+        stats: Dict[str, Any] = {}
         idx = 2
         if self.collect_diag and len(result) > idx and isinstance(result[idx], dict):
             stats = result[idx]
@@ -175,7 +180,7 @@ class SparseConv3d(nn.Module):
         self.diag_source = "measured" if self.collect_diag else "missing"
         if self.collect_diag:
             self._last_diag = {
-                "sparse_path_executed": backend not in ("dense_fallback",),
+                "sparse_path_executed": backend != "dense_fallback",
                 "backend_family": self.backend_family,
                 "diag_path": self.diag_path,
                 "fallback_reason": self.fallback_reason,

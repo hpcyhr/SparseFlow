@@ -1,31 +1,81 @@
 """
-SparseConv2d — v25 Sync-gated + A/B tile launch + inference_mode
+SparseConv2d — v26 Import-hoisted (Round 2 cleanup)
 
-Changes from v24:
-  [P0] _triton_forward only requests ratio during warmup/calibration,
-       and passes this to sparse_conv2d_forward where syncs are gated.
-  [P1] launch_all_tiles parameter — A/B switch for tile launch strategy.
-       Mode A (False): existing active-tile-ID launch (1 sync from nonzero).
-       Mode B (True): launch all tiles, zero tiles early-return (0 syncs).
+Changes from v25 (Round 2 — no semantic changes):
+  - Hoisted per-call imports (`from Kernels.conv2d import ...`, `import triton`)
+    out of the hot path and into module-level. Previously each forward() did
+    multiple Python `import` calls per call, each paying GIL + cache-lookup
+    overhead. Now the kernel entry point and helpers are resolved once at
+    import time.
+  - Cached `_TRITON_AVAILABLE` as a module-level flag set from a single
+    top-level try/except, mirroring the pattern used by SparseConv1d /
+    SparseConv3d. `_supports_triton()` is now an O(1) attribute read.
+  - Fixed mojibake in the module docstring.
+  - Explicitly documented that `self.block_size` is inert: it is carried only
+    for compatibility with the `SparseConv2d.from_dense(..., block_size=...)`
+    signature used by Core/replacer.py and is never forwarded to the kernel.
+
+All v25 behaviour preserved:
+  [P0] _triton_forward only requests ratio during warmup/calibration; zero
+       GPU→CPU syncs when (collect_diag=False and profile_runtime=False and
+       calibration is not due).
+  [P1] launch_all_tiles — A/B switch for tile launch strategy.
+       Mode A (False): active-tile-ID launch (1 sync from nonzero()).
+       Mode B (True):  launch all tiles, zero tiles early-return (0 syncs).
   [P2] inference_mode flag — when set, _should_collect_ratio always returns
        False, preventing periodic calibration syncs during timed runs.
-  Updated diagnostics metadata_kind: "three_stage_nhwc_v25"
+  Diagnostics metadata_kind: "three_stage_nhwc_v25" (unchanged).
 """
 
-from Ops.static_zero_conv2d import make_zero_conv_output, ZERO_BACKEND_FAMILY
-import torch.nn.functional as F
-import torch.nn as nn
-import torch
-from typing import Any, Dict, Optional, Tuple
-from dataclasses import dataclass, asdict
-import time
+from __future__ import annotations
+
 import math
 import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
+
+from Ops.static_zero_conv2d import make_zero_conv_output, ZERO_BACKEND_FAMILY  # noqa: F401
+
+# ---------------------------------------------------------------------------
+# Module-level kernel availability probe.
+#
+# Previously `_supports_triton()` did `import triton` on every forward() and
+# each kernel call site did `from Kernels.conv2d import ...` per call. We now
+# resolve both exactly once at import time. If triton or the kernel module is
+# unavailable, we fall back to F.conv2d via `_fallback_forward()`.
+# ---------------------------------------------------------------------------
+try:
+    import triton  # noqa: F401
+    from Kernels.conv2d import (
+        sparse_conv2d_forward,
+        _select_tile_sizes,
+        choose_group_size,
+        _popcount_buf,
+        TILE_ZERO,
+        TILE_SPARSE,
+        TILE_DENSEISH,
+    )
+    _TRITON_AVAILABLE = True
+except ImportError:
+    triton = None  # type: ignore[assignment]
+    sparse_conv2d_forward = None  # type: ignore[assignment]
+    _select_tile_sizes = None  # type: ignore[assignment]
+    choose_group_size = None  # type: ignore[assignment]
+    _popcount_buf = None  # type: ignore[assignment]
+    TILE_ZERO = 0
+    TILE_SPARSE = 1
+    TILE_DENSEISH = 2
+    _TRITON_AVAILABLE = False
 
 
 @dataclass
@@ -58,16 +108,25 @@ class _ProfileStats:
 class SparseConv2d(nn.Module):
     """SparseConv2d with configurable tile launch and inference mode.
 
-    New parameters (v25):
-        launch_all_tiles: bool
-            Mode A (False, default): build active tile IDs, launch only active.
-            Mode B (True): launch all tiles, zero tiles early-return in kernel.
-            Mode B eliminates the nonzero() sync in _build_active_tile_ids.
-            Use set_launch_all_tiles() or the constructor to configure.
+    Parameters
+    ----------
+    block_size : Optional[int]
+        INERT. Stored for compatibility with the `from_dense(..., block_size=...)`
+        signature used by Core/replacer.py. The current v25 kernel performs
+        tile-size selection internally via `_select_tile_sizes(H, W)` based on
+        output geometry, and this constructor parameter is never forwarded to
+        the kernel. Only echoed by `extra_repr`.
 
-    New methods (v25):
-        set_inference_mode(enabled): disable periodic calibration for timing.
-        set_launch_all_tiles(enabled): switch tile launch mode at runtime.
+    launch_all_tiles : bool
+        Mode A (False, default): build active tile IDs, launch only active.
+        Mode B (True): launch all tiles, zero tiles early-return in kernel.
+        Mode B eliminates the nonzero() sync in _build_active_tile_ids.
+        Use set_launch_all_tiles() or the constructor to configure.
+
+    Public state-changing methods
+    -----------------------------
+    set_inference_mode(enabled): disable periodic calibration for timing.
+    set_launch_all_tiles(enabled): switch tile launch mode at runtime.
     """
 
     def __init__(
@@ -80,7 +139,7 @@ class SparseConv2d(nn.Module):
         ema_decay: float = 0.9, zero_streak_needed: int = 2,
         profile_runtime: bool = False,
         allow_sparse_1x1: bool = True,
-        launch_all_tiles: bool = False,    # NEW [P1]: A/B switch
+        launch_all_tiles: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -98,14 +157,15 @@ class SparseConv2d(nn.Module):
             dilation = (dilation, dilation)
         self.dilation = dilation
         self.groups = groups
-        self.block_size = block_size
+        self.block_size = block_size  # INERT — see class docstring.
         self.threshold = threshold
         self.return_ms = return_ms
         self.allow_sparse_1x1 = bool(allow_sparse_1x1)
-        self.launch_all_tiles = bool(launch_all_tiles)    # NEW [P1]
+        self.launch_all_tiles = bool(launch_all_tiles)
 
-        self.weight = nn.Parameter(torch.empty(out_channels, in_channels // groups,
-                                                *self.kernel_size))
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, in_channels // groups, *self.kernel_size)
+        )
         if bias:
             self.bias = nn.Parameter(torch.empty(out_channels))
         else:
@@ -117,7 +177,7 @@ class SparseConv2d(nn.Module):
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             nn.init.uniform_(self.bias, -bound, bound)
 
-        # Internal state
+        # Internal state — lazily allocated on first forward.
         self._w_cl = None
         self._w_cl_version = -1
         self._ag_mask_buf = None
@@ -141,7 +201,10 @@ class SparseConv2d(nn.Module):
         self._ema_active_ratio: Optional[float] = None
         self._force_zero = False
         self._force_dense = False
-        self._inference_mode = False    # NEW [P2]: disable calibration for timing
+        self._inference_mode = False  # disable calibration for timing
+
+        # Triton availability cached once at import time; no per-forward probe.
+        self._triton_available = _TRITON_AVAILABLE
 
         # Diagnostics (off by default)
         self.collect_diag = False
@@ -159,14 +222,14 @@ class SparseConv2d(nn.Module):
         self._runtime_dispatch_mismatch = 0
 
     # ----------------------------------------------------------------
-    # NEW [P1]: runtime A/B switch
+    # Runtime A/B switch
     # ----------------------------------------------------------------
     def set_launch_all_tiles(self, enabled: bool):
         """Switch between Mode A (active-tile-ID launch) and Mode B (launch-all)."""
         self.launch_all_tiles = bool(enabled)
 
     # ----------------------------------------------------------------
-    # NEW [P2]: inference mode
+    # Inference mode
     # ----------------------------------------------------------------
     def set_inference_mode(self, enabled: bool):
         """When enabled, _should_collect_ratio() always returns False.
@@ -180,7 +243,7 @@ class SparseConv2d(nn.Module):
             self.profile_runtime = False
 
     # ----------------------------------------------------------------
-    # Helpers
+    # Profiling helpers (only invoked when profile_runtime is True)
     # ----------------------------------------------------------------
     def _stamp(self):
         torch.cuda.synchronize(self.weight.device)
@@ -200,7 +263,10 @@ class SparseConv2d(nn.Module):
         p = self._profile
         if p.calls == 0:
             return "SparseConv2d runtime profile: no calls"
-        def avg(x): return x / max(1, p.calls)
+
+        def avg(x):
+            return x / max(1, p.calls)
+
         return (
             f"SparseConv2d runtime profile\n"
             f"  calls={p.calls}, last_path={p.last_path}\n"
@@ -217,11 +283,8 @@ class SparseConv2d(nn.Module):
     # Supports / layout helpers
     # ----------------------------------------------------------------
     def _supports_triton(self):
-        try:
-            import triton  # noqa: F401
-            return True
-        except ImportError:
-            return False
+        # Was `import triton` per call; now an O(1) attribute read.
+        return self._triton_available
 
     def _supports_sparse(self):
         k = self.kernel_size
@@ -257,13 +320,12 @@ class SparseConv2d(nn.Module):
                 self._w_cl = self.weight.data.half().permute(0, 2, 3, 1).contiguous()
             else:
                 self._w_cl = self.weight.data.half().reshape(
-                    self.out_channels, self.in_channels).contiguous()
+                    self.out_channels, self.in_channels
+                ).contiguous()
             self._w_cl_version = ver
         return self._w_cl
 
     def _ensure_buffers(self, x):
-        from Kernels.conv2d import _select_tile_sizes
-        import triton
         C_IN, H, W = x.shape[1], x.shape[2], x.shape[3]
         BH, BW = _select_tile_sizes(H, W)
         N_TILES = x.shape[0] * triton.cdiv(H, BH) * triton.cdiv(W, BW)
@@ -309,8 +371,8 @@ class SparseConv2d(nn.Module):
     def _should_collect_ratio(self):
         """Return True only when calibration data is needed.
 
-        [P2 FIX]: When _inference_mode is True, always returns False.
-        This ensures zero syncs during timed inference.
+        When _inference_mode is True, always returns False — guarantees zero
+        syncs during timed inference runs.
         """
         if self._inference_mode:
             return False
@@ -329,8 +391,10 @@ class SparseConv2d(nn.Module):
         if self._ema_active_ratio is None:
             self._ema_active_ratio = avg_active_ratio
         else:
-            self._ema_active_ratio = (self._ema_decay * self._ema_active_ratio
-                                       + (1 - self._ema_decay) * avg_active_ratio)
+            self._ema_active_ratio = (
+                self._ema_decay * self._ema_active_ratio
+                + (1 - self._ema_decay) * avg_active_ratio
+            )
         if avg_active_ratio == 0.0:
             self._zero_streak += 1
         else:
@@ -401,7 +465,7 @@ class SparseConv2d(nn.Module):
             self._profile_add("reshape_ms", ms)
             self._profile_set_last("last_reshape_ms", ms)
 
-        use_triton = self._supports_triton() and x4d.is_cuda
+        use_triton = self._triton_available and x4d.is_cuda
         if self.profile_runtime and use_triton:
             self._profile.triton_supported_calls += 1
 
@@ -495,18 +559,16 @@ class SparseConv2d(nn.Module):
         When need_ratio=False and collect_diag=False:
           → passes return_avg_active_ratio=False to kernel
           → kernel skips all .item() syncs (P0 fix in conv2d.py)
-          → if launch_all_tiles=True: ZERO GPU→CPU syncs total
-          → if launch_all_tiles=False: 1 sync (nonzero for active IDs)
+          → if launch_all_tiles=True:  ZERO GPU→CPU syncs total
+          → if launch_all_tiles=False: 1 sync (nonzero() for active IDs)
         """
-        from Kernels.conv2d import sparse_conv2d_forward
-
         if self.profile_runtime:
             t0 = self._stamp()
 
         ag_mask_buf, tile_class_buf, active_tile_ids_buf = self._ensure_buffers(x)
         w_cl = self._get_w_cl()
 
-        # Single .half() → x_f16 NCHW; derive NHWC from it
+        # Single .half() → x_f16 NCHW; derive NHWC from it.
         if x.dtype == torch.float16 and x.is_contiguous():
             x_f16 = x
         else:
@@ -523,11 +585,9 @@ class SparseConv2d(nn.Module):
         want_ratio = need_ratio or collect_tiles
         want_tiles = collect_tiles
 
-        # [P0+P1] Pass flags and launch mode to kernel.
-        # When want_ratio=False and want_tiles=False:
-        #   kernel skips all .item() syncs.
-        # When launch_all_tiles=True:
-        #   kernel skips _build_active_tile_ids (nonzero sync).
+        # When want_ratio=False and want_tiles=False: kernel skips all .item()
+        # syncs. When launch_all_tiles=True: kernel skips _build_active_tile_ids
+        # (nonzero() sync).
         result = sparse_conv2d_forward(
             x=x_f16,
             weight=self.weight, bias=self.bias,
@@ -542,11 +602,11 @@ class SparseConv2d(nn.Module):
             return_backend_meta=True,
             x_nhwc=x_nhwc,
             active_tile_ids_buf=active_tile_ids_buf,
-            launch_all_tiles=self.launch_all_tiles,   # [P1] A/B switch
+            launch_all_tiles=self.launch_all_tiles,
         )
 
         # --- Unpack result ---
-        # Return arity: (y, ms) + optional (ratio,) + optional (tile_stats,) + optional (meta,)
+        # Arity: (y, ms) + optional (ratio,) + optional (tile_stats,) + optional (meta,)
         if not isinstance(result, tuple) or len(result) < 2:
             raise TypeError(f"sparse_conv2d_forward bad return: {type(result)}")
 
@@ -563,7 +623,8 @@ class SparseConv2d(nn.Module):
             tile_stats = result[idx]; idx += 1
 
         backend_meta = result[idx] if idx < len(result) else {
-            "backend": "sparse_triton", "reason": "no_meta"}
+            "backend": "sparse_triton", "reason": "no_meta"
+        }
 
         # --- Update internal state ---
         backend_kind = backend_meta.get("backend", "sparse_triton") if backend_meta else "sparse_triton"
@@ -594,13 +655,9 @@ class SparseConv2d(nn.Module):
     def _collect_tile_group_diag(self, x, ag_mask_buf, tile_class_buf,
                                  sparse_ms, avg_active_ratio, tile_stats, backend_meta=None):
         """Collect diagnostics. Only called when self.collect_diag is True.
+
         NOTE: contains GPU→CPU syncs — must NOT be enabled during perf timing.
         """
-        from Kernels.conv2d import (
-            _select_tile_sizes, choose_group_size, _popcount_buf,
-            TILE_ZERO, TILE_SPARSE, TILE_DENSEISH,
-        )
-        import triton
         N, C_IN, H, W = x.shape
         GROUP_SIZE_C = choose_group_size(C_IN)
         NUM_GROUPS = triton.cdiv(C_IN, GROUP_SIZE_C)
@@ -661,8 +718,10 @@ class SparseConv2d(nn.Module):
     def _fallback_forward(self, x):
         if self.profile_runtime:
             t0 = self._stamp()
-        y = F.conv2d(x, self.weight, self.bias,
-                     self.stride, self.padding, self.dilation, self.groups)
+        y = F.conv2d(
+            x, self.weight, self.bias,
+            self.stride, self.padding, self.dilation, self.groups,
+        )
         self._last_sparse_ms = 0.0
         if self.profile_runtime:
             self._last_dense_ms = self._elapsed_ms(t0)

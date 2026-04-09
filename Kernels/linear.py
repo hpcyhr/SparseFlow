@@ -13,12 +13,12 @@ from Utils.sparse_helpers import (
     TILE_ZERO,
     TILE_SPARSE,
     TILE_DENSEISH,
+    TILE_UNCERTAIN,
+    TILE_ZERO_CANDIDATE,
     choose_group_size,
     popcount_buf,
 )
 
-TILE_UNCERTAIN = 3
-TILE_ZERO_CANDIDATE = 4
 TRITON_MAX_TENSOR_NUMEL = 131072
 FALLBACK_RATIO = SPARSE_DENSE_RATIO_THRESHOLD
 

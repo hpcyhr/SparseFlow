@@ -1,15 +1,25 @@
 """
-SparseFlow Conv2d Triton Kernels 鈥?v25.0
+SparseFlow Conv2d Triton Kernels — v25.1
 
 Maturity: main_path (production-facing sparse kernel).
 
-Changes from v24:
+Changes from v25.0 (Round 2 cleanup — no semantic changes):
+  - Fixed mojibake in docstrings.
+  - Removed dead helper _build_active_group_metadata (zero callers).
+  - Removed 7 unused "legacy compat" parameters from sparse_conv2d_forward
+    (block_size, counts_buf, tile_cin_buf, group_flags_buf, ag_count_buf,
+    ag_list_buf, tile_alive_buf). None of them were read by the function body
+    and no caller in the repository passed any of them.
+  - Deduplicated rf_h/rf_w/RF_SIZE computation in _build_two_stage_metadata
+    (previously recomputed three times in the kernel_size!=1 path).
+
+Changes from v24 (already in v25.0, retained):
   [P0] sparse_conv2d_forward: all .item() syncs gated behind need_stats flag.
        When return_avg_active_ratio=False AND return_tile_stats=False, the
-       function performs ZERO GPU鈫扖PU synchronizations.
-  [P1] New launch_all_tiles parameter for A/B tile launch comparison.
-       Mode A (False): existing active-tile-ID launch via nonzero().
-       Mode B (True): launch all N_TILES, zero tiles early-return in kernel.
+       function performs ZERO GPU→CPU synchronizations.
+  [P1] launch_all_tiles parameter for A/B tile launch comparison.
+       Mode A (False): active-tile-ID launch via nonzero() (1 sync).
+       Mode B (True):  launch all N_TILES, zero tiles early-return (0 sync).
   All Triton JIT kernels unchanged from v24.
 
 Supported patterns: 1x1/s1/p0, 1x1/s2/p0, 3x3/s1/p1, 3x3/s2/p1
@@ -77,7 +87,7 @@ def _popcount_buf(ag_mask_buf, N_TILES):
 
 
 def _check_dense_fallback(ag_mask_buf, N_TILES, NUM_GROUPS, fallback_ratio=FALLBACK_RATIO):
-    """NOTE: calls .mean().item() 鈫?GPU鈫扖PU sync. Only use in gated paths."""
+    """NOTE: calls .mean().item() → GPU→CPU sync. Only use in gated paths."""
     if NUM_GROUPS == 0:
         return False
     pc = _popcount_buf(ag_mask_buf, N_TILES)
@@ -86,7 +96,7 @@ def _check_dense_fallback(ag_mask_buf, N_TILES, NUM_GROUPS, fallback_ratio=FALLB
 
 
 def _build_active_tile_ids(tile_class_buf, N_TILES):
-    """NOTE: calls torch.nonzero() 鈫?GPU鈫扖PU sync. Only use in Mode A path."""
+    """NOTE: calls torch.nonzero() → GPU→CPU sync. Only use in Mode A path."""
     tc = tile_class_buf[:N_TILES]
     active = torch.nonzero(tc != TILE_ZERO, as_tuple=False).flatten()
     if active.numel() == 0:
@@ -479,6 +489,12 @@ def _build_two_stage_metadata(
     NUM_GROUPS = triton.cdiv(C_IN, GROUP_SIZE_C)
     ALL_ONES_MASK = (1 << NUM_GROUPS) - 1
 
+    # Receptive-field size for non-1x1 kernels. Shared across Stage 1, 2a, 2b.
+    if kernel_size != 1:
+        rf_h = (BH - 1) * stride + kernel_size
+        rf_w = (BW - 1) * stride + kernel_size
+        RF_SIZE = triton.next_power_of_2(max(rf_h * rf_w, 1))
+
     # Stage 1
     if kernel_size == 1:
         BM = BH * BW
@@ -491,9 +507,6 @@ def _build_two_stage_metadata(
             UNCERTAIN_CLASS=TILE_UNCERTAIN, ZERO_CANDIDATE_CLASS=TILE_ZERO_CANDIDATE,
         )
     else:
-        rf_h = (BH - 1) * stride + kernel_size
-        rf_w = (BW - 1) * stride + kernel_size
-        RF_SIZE = triton.next_power_of_2(max(rf_h * rf_w, 1))
         tile_coarse_classify_kernel[(N_TILES,)](
             x_f16, tile_class_buf, ag_mask_buf,
             N, C_IN, H_IN, W_IN, GH, GW,
@@ -522,9 +535,6 @@ def _build_two_stage_metadata(
             ZERO_CANDIDATE_CLASS=TILE_ZERO_CANDIDATE,
         )
     else:
-        rf_h = (BH - 1) * stride + kernel_size
-        rf_w = (BW - 1) * stride + kernel_size
-        RF_SIZE = triton.next_power_of_2(max(rf_h * rf_w, 1))
         zero_candidate_refine_kernel[(N_TILES,)](
             x_f16, tile_class_buf, ag_mask_buf,
             N, C_IN, H_IN, W_IN, H_OUT, W_OUT, GH, GW,
@@ -547,9 +557,6 @@ def _build_two_stage_metadata(
             UNCERTAIN_CLASS=TILE_UNCERTAIN,
         )
     else:
-        rf_h = (BH - 1) * stride + kernel_size
-        rf_w = (BW - 1) * stride + kernel_size
-        RF_SIZE = triton.next_power_of_2(max(rf_h * rf_w, 1))
         group_bitmask_refine_kernel[(N_TILES,)](
             x_f16, tile_class_buf, ag_mask_buf,
             N, C_IN, H_IN, W_IN, H_OUT, W_OUT, GH, GW,
@@ -569,34 +576,6 @@ def _build_two_stage_metadata(
         prescan_stats['stage2_uncertain_tiles'] = prescan_stats.get('stage1_uncertain', 0)
 
     return GROUP_SIZE_C, NUM_GROUPS
-
-
-# Backward-compat aliases for fused_conv_lif.py
-def _build_active_group_bitmask(
-    x_f16, N, C_IN, H_IN, W_IN, H_OUT, W_OUT,
-    BH, BW, GH, GW, kernel_size, stride, padding,
-    threshold, ag_mask_buf,
-):
-    N_TILES = N * GH * GW
-    device = x_f16.device
-    tile_class_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
-    return _build_two_stage_metadata(
-        x_f16, N, C_IN, H_IN, W_IN, H_OUT, W_OUT,
-        BH, BW, GH, GW, kernel_size, stride, padding,
-        threshold, ag_mask_buf, tile_class_buf,
-    )
-
-
-def _build_active_group_metadata(
-    x_f16, N, C_IN, H_IN, W_IN, H_OUT, W_OUT,
-    BH, BW, GH, GW, kernel_size, stride, padding,
-    threshold, ag_count_buf, ag_list_buf,
-):
-    return _build_active_group_bitmask(
-        x_f16, N, C_IN, H_IN, W_IN, H_OUT, W_OUT,
-        BH, BW, GH, GW, kernel_size, stride, padding,
-        threshold, ag_count_buf,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1081,7 +1060,7 @@ def sparse_conv3x3s2_nhwc_kernel_8x16(
 
 
 # ===================================================================
-# Python entry point 鈥?v25: sync-gated + A/B tile launch switch
+# Python entry point — v25: sync-gated + A/B tile launch switch
 # ===================================================================
 
 def sparse_conv2d_forward(
@@ -1094,10 +1073,6 @@ def sparse_conv2d_forward(
     return_backend_meta=False,
     x_nhwc=None, active_tile_ids_buf=None,
     launch_all_tiles=False,
-    # Legacy compat
-    block_size=None, counts_buf=None, tile_cin_buf=None,
-    group_flags_buf=None, ag_count_buf=None, ag_list_buf=None,
-    tile_alive_buf=None,
 ):
     import torch.nn.functional as Fn
 
@@ -1298,5 +1273,3 @@ def sparse_conv2d_forward(
     }
 
     return _finalize_return(y, sparse_ms, avg_active_ratio, tile_stats_base, backend_meta)
-
-
