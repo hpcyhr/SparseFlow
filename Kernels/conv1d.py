@@ -1,9 +1,14 @@
 """
-SparseFlow Kernels/conv1d.py - v2 unified Triton sparse Conv1d.
+SparseFlow Kernels/conv1d.py - v3 unified Triton sparse Conv1d.
 
 Two-stage Triton kernel following the canonical SparseFlow method:
   Stage 1: prescan kernel produces per-tile (tile_class, ag_mask) metadata.
   Stage 2: compute kernel branches per tile on tile_class.
+
+Change-log
+----------
+  - v3: migrated from Triton prescan kernel to shared PyTorch three-stage
+    prescan in Kernels/_prescan_common.py. Triton _prescan_conv1d_kernel removed.
 
 Changes from v2.0:
   [A.1]  Legacy compat kwargs removed.
@@ -31,6 +36,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from Utils.config import PRESCAN_ACTIVITY_EPS, SPARSE_DENSE_RATIO_THRESHOLD
+from Kernels._prescan_common import build_rf_prescan_metadata
 from Utils.sparse_helpers import (
     TILE_ZERO,
     TILE_SPARSE,
@@ -58,66 +64,6 @@ def _is_supported_sparse_pattern(kernel_size, stride, padding, dilation, groups)
     if kernel_size == 3 and stride in (1, 2) and padding == 1:
         return True
     return False
-
-
-# ===========================================================================
-# Stage 1: prescan kernel
-# ===========================================================================
-
-@triton.jit
-def _prescan_conv1d_kernel(
-    x_nlc_ptr, ag_mask_ptr, tile_class_ptr,
-    N_val,
-    C_IN: tl.constexpr, L_IN: tl.constexpr, L_OUT: tl.constexpr,
-    KS: tl.constexpr, STRIDE: tl.constexpr, PADDING: tl.constexpr,
-    GL: tl.constexpr, BLOCK_L: tl.constexpr,
-    GROUP_SIZE_C: tl.constexpr, NUM_GROUPS: tl.constexpr,
-    ALL_ONES: tl.constexpr, THRESHOLD: tl.constexpr,
-):
-    pid_n = tl.program_id(0)
-    pid_l = tl.program_id(1)
-    if pid_n >= N_val:
-        return
-
-    out_l = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
-    l_mask = out_l < L_OUT
-    n_offset = pid_n * L_IN * C_IN
-    off1 = tl.arange(0, 1)
-
-    ag_mask = tl.zeros([1], dtype=tl.int32)
-    any_nz = tl.zeros([1], dtype=tl.int32)
-
-    for g in range(NUM_GROUPS):
-        cs = g * GROUP_SIZE_C
-        offs_c = cs + tl.arange(0, GROUP_SIZE_C)
-        c_mask = offs_c < C_IN
-
-        group_nz_acc = tl.zeros([1], dtype=tl.int32)
-        for k in tl.static_range(KS):
-            in_l = out_l * STRIDE + k - PADDING
-            l_ok = l_mask & (in_l >= 0) & (in_l < L_IN)
-            safe_l = tl.minimum(tl.maximum(in_l, 0), L_IN - 1)
-
-            addrs = n_offset + safe_l[:, None] * C_IN + offs_c[None, :]
-            m = l_ok[:, None] & c_mask[None, :]
-            vals = tl.load(x_nlc_ptr + addrs, mask=m, other=0.0)
-            elem_nz = (tl.abs(vals) > THRESHOLD).to(tl.int32)
-            group_nz_acc = group_nz_acc + tl.sum(elem_nz)
-
-        has_nz = (group_nz_acc > 0).to(tl.int32)
-        ag_mask = ag_mask + has_nz * (1 << g)
-        any_nz = tl.maximum(any_nz, has_nz)
-
-    out_idx = pid_n * GL + pid_l
-    tl.store(ag_mask_ptr + out_idx + off1, ag_mask)
-
-    if tl.sum(any_nz) == 0:
-        tl.store(tile_class_ptr + out_idx + off1, tl.zeros([1], dtype=tl.int32))
-    else:
-        if tl.sum((ag_mask == ALL_ONES).to(tl.int32)) > 0:
-            tl.store(tile_class_ptr + out_idx + off1, tl.full([1], TILE_DENSEISH, tl.int32))
-        else:
-            tl.store(tile_class_ptr + out_idx + off1, tl.full([1], TILE_SPARSE, tl.int32))
 
 
 # ===========================================================================
@@ -328,8 +274,6 @@ def sparse_conv1d_forward(
 
     if NUM_GROUPS > 32:
         return _dense_fallback(f"num_groups_exceeds_uint32({NUM_GROUPS})")
-    ALL_ONES = (1 << NUM_GROUPS) - 1
-
     # ---- prepare buffers ----
     x_nlc = x.permute(0, 2, 1).contiguous().to(torch.float16)
 
@@ -344,15 +288,20 @@ def sparse_conv1d_forward(
         end_evt = torch.cuda.Event(enable_timing=True)
         start_evt.record()
 
-    # ---- Stage 1: prescan ----
-    _prescan_conv1d_kernel[(N, GL)](
-        x_nlc, ag_mask_buf, tile_class_buf, N,
-        C_IN=C_IN, L_IN=L_IN, L_OUT=L_OUT,
-        KS=KS, STRIDE=stride, PADDING=padding,
-        GL=GL, BLOCK_L=BLOCK_L,
-        GROUP_SIZE_C=GROUP_SIZE_C, NUM_GROUPS=NUM_GROUPS,
-        ALL_ONES=ALL_ONES, THRESHOLD=float(threshold),
+    # ---- Stage 1: shared PyTorch three-stage prescan ----
+    tile_class, ag_mask = build_rf_prescan_metadata(
+        x_channels_last=x_nlc,
+        spatial_dims=(L_OUT,),
+        kernel_dims=(KS,),
+        stride=stride,
+        padding=padding,
+        block_dims=(BLOCK_L,),
+        group_size_c=GROUP_SIZE_C,
+        num_groups=NUM_GROUPS,
+        threshold=float(threshold),
     )
+    tile_class_buf[:N_TILES].copy_(tile_class)
+    ag_mask_buf[:N_TILES].copy_(ag_mask)
 
     avg_active_ratio = None
     tile_stats = None
@@ -372,7 +321,7 @@ def sparse_conv1d_forward(
             tile_stats = {
                 "zero_tiles": zt, "sparse_tiles": sp_ct, "denseish_tiles": dt,
                 "total_tiles": int(N_TILES),
-                "prescan_mode": "triton_grouped_conv1d_v2",
+                "prescan_mode": "pytorch_three_stage_rf_common_v3",
                 "block_l": int(BLOCK_L),
                 "group_size_c": int(GROUP_SIZE_C),
                 "num_groups": int(NUM_GROUPS),

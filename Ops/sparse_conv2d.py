@@ -203,6 +203,8 @@ class SparseConv2d(nn.Module):
         self._force_zero = False
         self._force_dense = False
         self._inference_mode = False  # disable calibration for timing
+        self._fused_1x1_calibrated = False
+        self._fused_1x1_backend_mode = "warmup"
         self._auto_launch_small_tile_threshold = 32
         self._auto_launch_active_tile_threshold = 0.75
         self._auto_launch_group_ratio_threshold = min(self._dense_threshold, 0.60)
@@ -302,6 +304,17 @@ class SparseConv2d(nn.Module):
             (k == (3, 3) and s == (1, 1) and p == (1, 1))
             or (k == (3, 3) and s == (2, 2) and p == (1, 1))
         )
+
+    def _uses_sparse_1x1(self) -> bool:
+        return (
+            self.allow_sparse_1x1
+            and self.kernel_size == (1, 1)
+            and self.stride == (1, 1)
+            and self.padding == (0, 0)
+        )
+
+    def _needs_fused_1x1_calibration(self) -> bool:
+        return self._uses_sparse_1x1() and not self._fused_1x1_calibrated
 
     def _record_runtime_dispatch(self, runtime_backend: str):
         expected = str(
@@ -444,6 +457,11 @@ class SparseConv2d(nn.Module):
         if avg_active_ratio is None:
             return
         self._last_avg_active_ratio = avg_active_ratio
+        if self._uses_sparse_1x1():
+            self._fused_1x1_calibrated = True
+            self._fused_1x1_backend_mode = (
+                "dense" if avg_active_ratio > self._dense_threshold else "fused_persistent"
+            )
         if self._warmup_left > 0:
             self._warmup_left -= 1
             self._ema_active_ratio = avg_active_ratio
@@ -532,7 +550,11 @@ class SparseConv2d(nn.Module):
         # Determine if ratio collection is needed this forward
         if self.profile_runtime:
             t0 = self._stamp()
-        need_ratio = use_triton and self._should_collect_ratio() and (not self._force_dense)
+        need_ratio = (
+            use_triton
+            and (not self._force_dense)
+            and (self._should_collect_ratio() or self._needs_fused_1x1_calibration())
+        )
         if self.profile_runtime:
             ms = self._elapsed_ms(t0)
             self._profile_add("policy_ms", ms)
@@ -769,6 +791,7 @@ class SparseConv2d(nn.Module):
                 self._last_diag['denseish_ratio_nonzero'] = backend_meta['denseish_ratio_nonzero']
             if 'launch_mode_reason' in backend_meta:
                 self._last_diag['launch_mode_reason'] = backend_meta['launch_mode_reason']
+        self._last_diag['fused_1x1_backend_mode'] = self._fused_1x1_backend_mode
         self._last_diag['backend_family'] = self.backend_family
         self._last_diag['diag_path'] = self.diag_path
         self._last_diag['fallback_reason'] = self.fallback_reason

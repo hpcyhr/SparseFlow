@@ -7,15 +7,21 @@ Sparse BMM for [B, M, K] x [B, K, N] -> [B, M, N].
 Per-batch prescan on A, then dispatch per (batch, m-tile, n-tile).
 
 Critical for spike-transformer attention stages (QK^T and AttnV).
+
+Change-log
+----------
+  - Round 7: fixed autotune/prescan BLOCK_M misalignment by per-BM kernel
+    specialization. The launch grid also uses meta["BLOCK_N"] so BLOCK_N
+    autotune remains aligned with the output-column launch geometry.
 """
 
+import sys
+from pathlib import Path
 
 import torch
 import triton
 import triton.language as tl
 
-import sys
-from pathlib import Path
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
@@ -29,21 +35,35 @@ from Utils.config import PRESCAN_ACTIVITY_EPS, SPARSE_DENSE_RATIO_THRESHOLD
 FALLBACK_RATIO = SPARSE_DENSE_RATIO_THRESHOLD
 TRITON_MAX_TENSOR_NUMEL = 131072
 
-_BMM_CONFIGS = [
-    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4),
-    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4),
-    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4),
-]
 
-# ---------------------------------------------------------------------------
-# Prescan kernel — per batch element
-# ---------------------------------------------------------------------------
+def _make_bmm_configs(block_m: int):
+    configs = []
+    for block_n in (16, 32, 64):
+        for block_k in (32, 64):
+            for num_warps in (4, 8):
+                for num_stages in (1, 2):
+                    if block_n == 16 and num_warps == 8:
+                        continue
+                    configs.append(
+                        triton.Config(
+                            {'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k},
+                            num_warps=num_warps,
+                            num_stages=num_stages,
+                        )
+                    )
+    return configs
+
+
+_BMM_CONFIGS_BM16 = _make_bmm_configs(16)
+_BMM_CONFIGS_BM32 = _make_bmm_configs(32)
+_BMM_CONFIGS_BM64 = _make_bmm_configs(64)
+
 
 @triton.jit
 def _prescan_bmm_kernel(
-    a_ptr,             # [B, M, K] row-major
-    ag_mask_ptr,       # [B * N_TILES_M]
-    tile_class_ptr,    # [B * N_TILES_M]
+    a_ptr,
+    ag_mask_ptr,
+    tile_class_ptr,
     B: tl.constexpr,
     M: tl.constexpr,
     K: tl.constexpr,
@@ -54,7 +74,6 @@ def _prescan_bmm_kernel(
     ALL_ONES: tl.constexpr,
     THRESHOLD: tl.constexpr,
 ):
-    # pid encodes (batch_idx, tile_m_idx)
     pid = tl.program_id(0)
     batch_idx = pid // N_TILES_M
     tile_idx = pid % N_TILES_M
@@ -93,89 +112,85 @@ def _prescan_bmm_kernel(
             tl.store(tile_class_ptr + out_idx + off1, tl.full([1], TILE_SPARSE, dtype=tl.int32))
 
 
-# ---------------------------------------------------------------------------
-# Compute kernel
-# ---------------------------------------------------------------------------
+def _make_sparse_bmm_kernel(configs):
+    @triton.autotune(configs=configs, key=['M', 'N', 'K'])
+    @triton.jit
+    def _kernel(
+        a_ptr, b_ptr, c_ptr,
+        ag_mask_ptr, tile_class_ptr,
+        B_dim: tl.constexpr,
+        M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+        N_TILES_M: tl.constexpr,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        GROUP_SIZE_C: tl.constexpr, NUM_GROUPS: tl.constexpr,
+    ):
+        pid_bm = tl.program_id(0)
+        pid_n = tl.program_id(1)
 
-@triton.autotune(configs=_BMM_CONFIGS, key=['M', 'N', 'K'])
-@triton.jit
-def _sparse_bmm_kernel(
-    a_ptr, b_ptr, c_ptr,
-    ag_mask_ptr, tile_class_ptr,
-    B_dim: tl.constexpr,
-    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-    N_TILES_M: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_SIZE_C: tl.constexpr, NUM_GROUPS: tl.constexpr,
-):
-    # Grid: (B * N_TILES_M, N_TILES_N)
-    pid_bm = tl.program_id(0)
-    pid_n = tl.program_id(1)
+        batch_idx = pid_bm // N_TILES_M
+        tile_m = pid_bm % N_TILES_M
 
-    batch_idx = pid_bm // N_TILES_M
-    tile_m = pid_bm % N_TILES_M
+        offs_m = tile_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        m_mask = offs_m < M
+        n_mask = offs_n < N
 
-    offs_m = tile_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    m_mask = offs_m < M
-    n_mask = offs_n < N
+        a_batch = batch_idx * M * K
+        b_batch = batch_idx * K * N
+        c_batch = batch_idx * M * N
 
-    a_batch = batch_idx * M * K
-    b_batch = batch_idx * K * N
-    c_batch = batch_idx * M * N
+        meta_idx = batch_idx * N_TILES_M + tile_m
+        off1 = tl.arange(0, 1)
+        tile_cls = tl.load(tile_class_ptr + meta_idx + off1)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    meta_idx = batch_idx * N_TILES_M + tile_m
-    off1 = tl.arange(0, 1)
-    tile_cls = tl.load(tile_class_ptr + meta_idx + off1)
+        if tl.sum(tile_cls) == TILE_ZERO:
+            pass
+        elif tl.sum(tile_cls) == TILE_DENSEISH:
+            for k_start in range(0, K, BLOCK_K):
+                offs_k = k_start + tl.arange(0, BLOCK_K)
+                k_mask = offs_k < K
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+                a_addrs = a_batch + offs_m[:, None] * K + offs_k[None, :]
+                a_vals = tl.load(a_ptr + a_addrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float16)
 
-    if tl.sum(tile_cls) == TILE_ZERO:
-        pass
+                b_addrs = b_batch + offs_k[:, None] * N + offs_n[None, :]
+                b_vals = tl.load(b_ptr + b_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
 
-    elif tl.sum(tile_cls) == TILE_DENSEISH:
-        for k_start in range(0, K, BLOCK_K):
-            offs_k = k_start + tl.arange(0, BLOCK_K)
-            k_mask = offs_k < K
+                acc += tl.dot(a_vals, b_vals)
+        else:
+            ag = tl.load(ag_mask_ptr + meta_idx + off1)
+            for g in range(NUM_GROUPS):
+                g_active = (ag >> g) & 1
+                if tl.sum(g_active) != 0:
+                    g_base = g * GROUP_SIZE_C
+                    for k_off in range(0, GROUP_SIZE_C, BLOCK_K):
+                        offs_k = g_base + k_off + tl.arange(0, BLOCK_K)
+                        k_mask = offs_k < K
 
-            a_addrs = a_batch + offs_m[:, None] * K + offs_k[None, :]
-            a_vals = tl.load(a_ptr + a_addrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float16)
+                        a_addrs = a_batch + offs_m[:, None] * K + offs_k[None, :]
+                        a_vals = tl.load(a_ptr + a_addrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float16)
 
-            b_addrs = b_batch + offs_k[:, None] * N + offs_n[None, :]
-            b_vals = tl.load(b_ptr + b_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+                        b_addrs = b_batch + offs_k[:, None] * N + offs_n[None, :]
+                        b_vals = tl.load(b_ptr + b_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
 
-            acc += tl.dot(a_vals, b_vals)
+                        acc += tl.dot(a_vals, b_vals)
 
-    else:
-        ag = tl.load(ag_mask_ptr + meta_idx + off1)
-        for g in range(NUM_GROUPS):
-            g_active = (ag >> g) & 1
-            if tl.sum(g_active) != 0:
-                g_base = g * GROUP_SIZE_C
-                for k_off in range(0, GROUP_SIZE_C, BLOCK_K):
-                    offs_k = g_base + k_off + tl.arange(0, BLOCK_K)
-                    k_mask = offs_k < K
+        out_addrs = c_batch + offs_m[:, None] * N + offs_n[None, :]
+        out_mask = m_mask[:, None] & n_mask[None, :]
+        tl.store(c_ptr + out_addrs, acc, mask=out_mask)
 
-                    a_addrs = a_batch + offs_m[:, None] * K + offs_k[None, :]
-                    a_vals = tl.load(a_ptr + a_addrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float16)
-
-                    b_addrs = b_batch + offs_k[:, None] * N + offs_n[None, :]
-                    b_vals = tl.load(b_ptr + b_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
-
-                    acc += tl.dot(a_vals, b_vals)
-
-    out_addrs = c_batch + offs_m[:, None] * N + offs_n[None, :]
-    out_mask = m_mask[:, None] & n_mask[None, :]
-    tl.store(c_ptr + out_addrs, acc, mask=out_mask)
+    return _kernel
 
 
-# ---------------------------------------------------------------------------
-# Public entry
-# ---------------------------------------------------------------------------
+_sparse_bmm_kernel_bm16 = _make_sparse_bmm_kernel(_BMM_CONFIGS_BM16)
+_sparse_bmm_kernel_bm32 = _make_sparse_bmm_kernel(_BMM_CONFIGS_BM32)
+_sparse_bmm_kernel_bm64 = _make_sparse_bmm_kernel(_BMM_CONFIGS_BM64)
+
 
 def sparse_bmm_forward(
-    a: torch.Tensor,       # [B, M, K]
-    b: torch.Tensor,       # [B, K, N]
+    a: torch.Tensor,
+    b: torch.Tensor,
     threshold: float = PRESCAN_ACTIVITY_EPS,
     ag_mask_buf: torch.Tensor = None,
     tile_class_buf: torch.Tensor = None,
@@ -184,12 +199,7 @@ def sparse_bmm_forward(
     return_tile_stats: bool = False,
     fallback_ratio: float = FALLBACK_RATIO,
 ):
-    """
-    Sparse BMM: C[b] = A[b] @ B[b], where A is expected sparse.
-
-    Returns:
-        (C, ms) + optional (avg_active_ratio,) + optional (tile_stats,)
-    """
+    """Sparse BMM: C[b] = A[b] @ B[b], where A is expected sparse."""
     assert a.ndim == 3 and b.ndim == 3
     B_dim, M, K = a.shape
     B2, K2, N = b.shape
@@ -206,7 +216,6 @@ def sparse_bmm_forward(
             ret = ret + (stats,)
         return ret
 
-    # Small-problem fallback
     if M * K < 512 or B_dim * M * N < 4096:
         c = torch.bmm(a.float(), b.float())
         return _finalize(c, 0.0, 1.0 if return_avg_active_ratio else None, None)
@@ -215,13 +224,27 @@ def sparse_bmm_forward(
     NUM_GROUPS = triton.cdiv(K, GROUP_SIZE_C)
     ALL_ONES = (1 << NUM_GROUPS) - 1
 
-    # Tile sizes
-    BM = 32 if M >= 32 else 16
-    BN = 32 if N >= 32 else 16
+    if M >= 128:
+        BM = 64
+    elif M >= 32:
+        BM = 32
+    else:
+        BM = 16
     N_TILES_M = triton.cdiv(M, BM)
-    N_TILES_N = triton.cdiv(N, BN)
 
-    max_block_n = max(cfg.kwargs['BLOCK_N'] for cfg in _BMM_CONFIGS)
+    if BM == 16:
+        configs = _BMM_CONFIGS_BM16
+        kernel = _sparse_bmm_kernel_bm16
+    elif BM == 32:
+        configs = _BMM_CONFIGS_BM32
+        kernel = _sparse_bmm_kernel_bm32
+    elif BM == 64:
+        configs = _BMM_CONFIGS_BM64
+        kernel = _sparse_bmm_kernel_bm64
+    else:
+        raise ValueError(f"unsupported BM={BM}")
+
+    max_block_n = max(cfg.kwargs['BLOCK_N'] for cfg in configs)
     if GROUP_SIZE_C * max_block_n > TRITON_MAX_TENSOR_NUMEL:
         c = torch.bmm(a.float(), b.float())
         stats = {
@@ -232,7 +255,7 @@ def sparse_bmm_forward(
         ratio = 1.0 if return_avg_active_ratio else None
         return _finalize(c, 0.0, ratio, stats)
 
-    max_block_k = max(cfg.kwargs['BLOCK_K'] for cfg in _BMM_CONFIGS)
+    max_block_k = max(cfg.kwargs['BLOCK_K'] for cfg in configs)
     est_smem_bytes = ((BM * max_block_k) + (max_block_k * max_block_n) + (BM * max_block_n)) * 4
     if est_smem_bytes > 160_000:
         c = torch.bmm(a.float(), b.float())
@@ -247,13 +270,11 @@ def sparse_bmm_forward(
     TOTAL_META = B_dim * N_TILES_M
     a_f16 = a.half().contiguous()
 
-    # Allocate metadata
     if ag_mask_buf is None or ag_mask_buf.numel() < TOTAL_META:
         ag_mask_buf = torch.empty(TOTAL_META, dtype=torch.int32, device=device)
     if tile_class_buf is None or tile_class_buf.numel() < TOTAL_META:
         tile_class_buf = torch.empty(TOTAL_META, dtype=torch.int32, device=device)
 
-    # Prescan
     try:
         _prescan_bmm_kernel[(TOTAL_META,)](
             a_f16, ag_mask_buf, tile_class_buf,
@@ -272,7 +293,6 @@ def sparse_bmm_forward(
         ratio = 1.0 if return_avg_active_ratio else None
         return _finalize(c, 0.0, ratio, stats)
 
-    # Ratio check
     avg_ratio = None
     if need_stats:
         pc = popcount_buf(ag_mask_buf, TOTAL_META)
@@ -285,8 +305,6 @@ def sparse_bmm_forward(
         return _finalize(c, 0.0, avg_ratio, stats)
 
     b_f16 = b.half().contiguous()
-
-    # Output
     c = torch.empty(B_dim, M, N, dtype=torch.float32, device=device)
 
     if return_ms:
@@ -294,9 +312,11 @@ def sparse_bmm_forward(
         end = torch.cuda.Event(enable_timing=True)
         start.record()
 
-    grid = (B_dim * N_TILES_M, N_TILES_N)
+    def _grid(meta):
+        return (B_dim * N_TILES_M, triton.cdiv(N, meta["BLOCK_N"]))
+
     try:
-        _sparse_bmm_kernel[grid](
+        kernel[_grid](
             a_f16, b_f16, c,
             ag_mask_buf, tile_class_buf,
             B_dim=B_dim, M=M, N=N, K=K,

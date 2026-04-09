@@ -1,41 +1,19 @@
 """
-SparseFlow Kernels/matmul.py — Sparse Matmul Triton kernel.
+SparseFlow Kernels/matmul.py - Sparse Matmul Triton kernel.
 
 Maturity: main_path (production-facing sparse kernel).
 
-Grouped-bitmask sparse matmul for [M, K] × [K, N] → [M, N].
+Grouped-bitmask sparse matmul for [M, K] x [K, N] -> [M, N].
 Uses the three-stage prescan pipeline from Kernels/linear.py (coarse
-classify → zero-candidate refine → group bitmask refine), which runs on
+classify -> zero-candidate refine -> group bitmask refine), which runs on
 A's row-tile geometry [M, K] and is geometrically identical to linear's
 input prescan.
 
-Round 6 cleanup
----------------
-  - Migrated prescan from the single-stage `Utils/sparse_helpers::
-    build_row_metadata` to the three-stage pipeline `_build_linear_metadata`
-    exported by Kernels/linear.py. The three-stage pipeline exposes
-    TILE_ZERO_CANDIDATE and TILE_UNCERTAIN intermediate classes, improving
-    tile classification accuracy without touching the compute kernel.
-    After the pipeline runs, the final tile_class buffer contains only
-    {TILE_ZERO, TILE_SPARSE, TILE_DENSEISH}, which is exactly what the
-    existing _sparse_matmul_kernel expects.
-  - Inlined `select_row_tile_sizes` (previously in sparse_helpers
-    DEPRECATED section). The 10-line helper is used only here.
-  - Fixed mojibake in comments.
-
-Pre-existing issue (NOT fixed in Round 6, noted for a future pass)
-------------------------------------------------------------------
-  The compute kernel is decorated with @triton.autotune over BLOCK_M and
-  BLOCK_N, while the grid is launched using a fixed BM from
-  `select_row_tile_sizes` and the prescan runs with the same fixed BM.
-  If autotune picks BLOCK_M ≠ BM, the grid launches `cdiv(M, BM)` programs
-  but each program scans `BLOCK_M` rows, producing a row-tile misalignment
-  with the prescan's classification buffer. Symptom would be silently
-  wrong output on shapes where autotune prefers a different BLOCK_M.
-  A proper fix either (a) restricts _MATMUL_CONFIGS to a single BLOCK_M
-  matching BM, or (b) makes the grid a lambda that reads meta["BLOCK_M"]
-  and recomputes prescan per-config. Both are semantic changes deferred
-  to a dedicated correctness pass.
+Change-log
+----------
+  - Round 7: fixed autotune/prescan BLOCK_M misalignment by per-BM kernel
+    specialization. The launch grid also uses meta["BLOCK_N"] so BLOCK_N
+    autotune remains aligned with the output-column program decomposition.
 """
 
 import sys
@@ -60,12 +38,8 @@ FALLBACK_RATIO = SPARSE_DENSE_RATIO_THRESHOLD
 TRITON_MAX_TENSOR_NUMEL = 131072
 
 
-# ---------------------------------------------------------------------------
-# Row-tile sizing (previously in Utils/sparse_helpers.select_row_tile_sizes)
-# ---------------------------------------------------------------------------
-
 def _select_row_tile_sizes(M: int, N: int):
-    """Pick (BLOCK_M, BLOCK_N) for a flat [M, N] output."""
+    """Pick (BLOCK_M, BLOCK_N hint) for a flat [M, N] output."""
     if M >= 128:
         bm = 64
     elif M >= 32:
@@ -82,90 +56,98 @@ def _select_row_tile_sizes(M: int, N: int):
     return bm, bn
 
 
-_MATMUL_CONFIGS = [
-    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4),
-    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=4),
-    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4),
-    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=8),
-]
+def _make_matmul_configs(block_m: int):
+    configs = []
+    for block_n in (16, 32, 64):
+        for block_k in (32, 64):
+            for num_warps in (4, 8):
+                for num_stages in (1, 2):
+                    if block_n == 16 and num_warps == 8:
+                        continue
+                    configs.append(
+                        triton.Config(
+                            {'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k},
+                            num_warps=num_warps,
+                            num_stages=num_stages,
+                        )
+                    )
+    return configs
 
 
-# ---------------------------------------------------------------------------
-# Triton kernel (unchanged from v24 — three-stage prescan produces the same
-# final tile_class set: {TILE_ZERO, TILE_SPARSE, TILE_DENSEISH})
-# ---------------------------------------------------------------------------
-
-@triton.autotune(configs=_MATMUL_CONFIGS, key=['M', 'N', 'K'])
-@triton.jit
-def _sparse_matmul_kernel(
-    a_ptr, b_ptr, c_ptr,
-    ag_mask_ptr, tile_class_ptr,
-    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_SIZE_C: tl.constexpr, NUM_GROUPS: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    m_mask = offs_m < M
-    n_mask = offs_n < N
-
-    # Tile classification from prescan (per M-tile)
-    off1 = tl.arange(0, 1)
-    tile_cls = tl.load(tile_class_ptr + pid_m + off1)
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    if tl.sum(tile_cls) == TILE_ZERO:
-        # All-zero tile in A → output is zero
-        pass
-
-    elif tl.sum(tile_cls) == TILE_DENSEISH:
-        # Dense path — iterate all K groups
-        for k_start in range(0, K, BLOCK_K):
-            offs_k = k_start + tl.arange(0, BLOCK_K)
-            k_mask = offs_k < K
-
-            a_addrs = offs_m[:, None] * K + offs_k[None, :]
-            a_vals = tl.load(a_ptr + a_addrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float16)
-
-            b_addrs = offs_k[:, None] * N + offs_n[None, :]
-            b_vals = tl.load(b_ptr + b_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
-
-            acc += tl.dot(a_vals, b_vals)
-
-    else:
-        # Sparse path — bitmask-gated groups
-        ag = tl.load(ag_mask_ptr + pid_m + off1)
-        for g in range(NUM_GROUPS):
-            g_active = (ag >> g) & 1
-            if tl.sum(g_active) != 0:
-                g_base = g * GROUP_SIZE_C
-                for k_off in range(0, GROUP_SIZE_C, BLOCK_K):
-                    offs_k = g_base + k_off + tl.arange(0, BLOCK_K)
-                    k_mask = offs_k < K
-
-                    a_addrs = offs_m[:, None] * K + offs_k[None, :]
-                    a_vals = tl.load(a_ptr + a_addrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float16)
-
-                    b_addrs = offs_k[:, None] * N + offs_n[None, :]
-                    b_vals = tl.load(b_ptr + b_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
-
-                    acc += tl.dot(a_vals, b_vals)
-
-    out_addrs = offs_m[:, None] * N + offs_n[None, :]
-    out_mask = m_mask[:, None] & n_mask[None, :]
-    tl.store(c_ptr + out_addrs, acc, mask=out_mask)
+_MATMUL_CONFIGS_BM16 = _make_matmul_configs(16)
+_MATMUL_CONFIGS_BM32 = _make_matmul_configs(32)
+_MATMUL_CONFIGS_BM64 = _make_matmul_configs(64)
 
 
-# ---------------------------------------------------------------------------
-# Public entry
-# ---------------------------------------------------------------------------
+def _make_sparse_matmul_kernel(configs):
+    @triton.autotune(configs=configs, key=['M', 'N', 'K'])
+    @triton.jit
+    def _kernel(
+        a_ptr, b_ptr, c_ptr,
+        ag_mask_ptr, tile_class_ptr,
+        M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        GROUP_SIZE_C: tl.constexpr, NUM_GROUPS: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        m_mask = offs_m < M
+        n_mask = offs_n < N
+
+        off1 = tl.arange(0, 1)
+        tile_cls = tl.load(tile_class_ptr + pid_m + off1)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        if tl.sum(tile_cls) == TILE_ZERO:
+            pass
+        elif tl.sum(tile_cls) == TILE_DENSEISH:
+            for k_start in range(0, K, BLOCK_K):
+                offs_k = k_start + tl.arange(0, BLOCK_K)
+                k_mask = offs_k < K
+
+                a_addrs = offs_m[:, None] * K + offs_k[None, :]
+                a_vals = tl.load(a_ptr + a_addrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float16)
+
+                b_addrs = offs_k[:, None] * N + offs_n[None, :]
+                b_vals = tl.load(b_ptr + b_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+
+                acc += tl.dot(a_vals, b_vals)
+        else:
+            ag = tl.load(ag_mask_ptr + pid_m + off1)
+            for g in range(NUM_GROUPS):
+                g_active = (ag >> g) & 1
+                if tl.sum(g_active) != 0:
+                    g_base = g * GROUP_SIZE_C
+                    for k_off in range(0, GROUP_SIZE_C, BLOCK_K):
+                        offs_k = g_base + k_off + tl.arange(0, BLOCK_K)
+                        k_mask = offs_k < K
+
+                        a_addrs = offs_m[:, None] * K + offs_k[None, :]
+                        a_vals = tl.load(a_ptr + a_addrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float16)
+
+                        b_addrs = offs_k[:, None] * N + offs_n[None, :]
+                        b_vals = tl.load(b_ptr + b_addrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float16)
+
+                        acc += tl.dot(a_vals, b_vals)
+
+        out_addrs = offs_m[:, None] * N + offs_n[None, :]
+        out_mask = m_mask[:, None] & n_mask[None, :]
+        tl.store(c_ptr + out_addrs, acc, mask=out_mask)
+
+    return _kernel
+
+
+_sparse_matmul_kernel_bm16 = _make_sparse_matmul_kernel(_MATMUL_CONFIGS_BM16)
+_sparse_matmul_kernel_bm32 = _make_sparse_matmul_kernel(_MATMUL_CONFIGS_BM32)
+_sparse_matmul_kernel_bm64 = _make_sparse_matmul_kernel(_MATMUL_CONFIGS_BM64)
+
 
 def sparse_matmul_forward(
-    a: torch.Tensor,       # [M, K]
-    b: torch.Tensor,       # [K, N]
+    a: torch.Tensor,
+    b: torch.Tensor,
     threshold: float = PRESCAN_ACTIVITY_EPS,
     ag_mask_buf: torch.Tensor = None,
     tile_class_buf: torch.Tensor = None,
@@ -174,11 +156,7 @@ def sparse_matmul_forward(
     return_tile_stats: bool = False,
     fallback_ratio: float = FALLBACK_RATIO,
 ):
-    """Sparse matmul: C = A @ B where A is expected to be sparse (SNN spikes).
-
-    Returns:
-        (C, ms) + optional (avg_active_ratio,) + optional (tile_stats,)
-    """
+    """Sparse matmul: C = A @ B where A is expected to be sparse."""
     assert a.ndim == 2 and b.ndim == 2, f"Expected 2D inputs, got {a.shape}, {b.shape}"
     M, K = a.shape
     K2, N = b.shape
@@ -195,21 +173,28 @@ def sparse_matmul_forward(
             ret = ret + (stats,)
         return ret
 
-    # Minimum size guard
     if M * K < 1024 or M * N < 1024:
         c = torch.mm(a.float(), b.float())
-        return _finalize(
-            c, 0.0,
-            1.0 if return_avg_active_ratio else None,
-            None,
-        )
+        return _finalize(c, 0.0, 1.0 if return_avg_active_ratio else None, None)
 
     GROUP_SIZE_C = choose_group_size(K)
     NUM_GROUPS = triton.cdiv(K, GROUP_SIZE_C)
-    BM, BN = _select_row_tile_sizes(M, N)
+    BM, _BN_HINT = _select_row_tile_sizes(M, N)
     N_TILES_M = triton.cdiv(M, BM)
 
-    max_block_n = max(cfg.kwargs['BLOCK_N'] for cfg in _MATMUL_CONFIGS)
+    if BM == 16:
+        configs = _MATMUL_CONFIGS_BM16
+        kernel = _sparse_matmul_kernel_bm16
+    elif BM == 32:
+        configs = _MATMUL_CONFIGS_BM32
+        kernel = _sparse_matmul_kernel_bm32
+    elif BM == 64:
+        configs = _MATMUL_CONFIGS_BM64
+        kernel = _sparse_matmul_kernel_bm64
+    else:
+        raise ValueError(f"unsupported BM={BM}")
+
+    max_block_n = max(cfg.kwargs['BLOCK_N'] for cfg in configs)
     if GROUP_SIZE_C * max_block_n > TRITON_MAX_TENSOR_NUMEL:
         c = torch.mm(a.float(), b.float())
         tile_stats = {
@@ -220,7 +205,7 @@ def sparse_matmul_forward(
         ratio = 1.0 if return_avg_active_ratio else None
         return _finalize(c, 0.0, ratio, tile_stats)
 
-    max_block_k = max(cfg.kwargs['BLOCK_K'] for cfg in _MATMUL_CONFIGS)
+    max_block_k = max(cfg.kwargs['BLOCK_K'] for cfg in configs)
     est_smem_bytes = ((BM * max_block_k) + (max_block_k * max_block_n) + (BM * max_block_n)) * 4
     if est_smem_bytes > 160_000:
         c = torch.mm(a.float(), b.float())
@@ -234,14 +219,11 @@ def sparse_matmul_forward(
 
     a_f16 = a.half().contiguous()
 
-    # Buffer allocation for prescan metadata
     if ag_mask_buf is None or ag_mask_buf.numel() < N_TILES_M:
         ag_mask_buf = torch.empty(N_TILES_M, dtype=torch.int32, device=device)
     if tile_class_buf is None or tile_class_buf.numel() < N_TILES_M:
         tile_class_buf = torch.empty(N_TILES_M, dtype=torch.int32, device=device)
 
-    # Three-stage prescan (shared with Kernels/linear.py).
-    # A's geometry [M, K] maps to linear's [N_val, C_IN].
     prescan_stats = {} if return_tile_stats else None
     try:
         _, _, stage1_dense_fallback, stage1_summary = _build_linear_metadata(
@@ -276,7 +258,6 @@ def sparse_matmul_forward(
         c = torch.mm(a.float(), b.float())
         return _finalize(c, 0.0, stage1_avg_ratio, None)
 
-    # Dense fallback check (sync-gated on need_stats)
     if need_stats:
         pc = popcount_buf(ag_mask_buf, N_TILES_M)
         avg_active = pc.float().mean().item()
@@ -294,19 +275,18 @@ def sparse_matmul_forward(
         return _finalize(c, 0.0, avg_ratio, tile_stats)
 
     b_f16 = b.half().contiguous()
-
-    # Allocate output
     c = torch.empty(M, N, dtype=torch.float32, device=device)
 
-    # Timing
     if return_ms:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
 
-    grid = (N_TILES_M, triton.cdiv(N, BN))
+    def _grid(meta):
+        return (N_TILES_M, triton.cdiv(N, meta["BLOCK_N"]))
+
     try:
-        _sparse_matmul_kernel[grid](
+        kernel[_grid](
             a_f16, b_f16, c,
             ag_mask_buf, tile_class_buf,
             M=M, N=N, K=K,

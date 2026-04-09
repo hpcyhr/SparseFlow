@@ -25,10 +25,17 @@ Changes from v24 (already in v25.0, retained):
 Supported patterns: 1x1/s1/p0, 1x1/s2/p0, 3x3/s1/p1, 3x3/s2/p1
 """
 
+# v26 notes:
+# - Added a fused prescan+compute persistent backend for 1x1/s1/p0 when
+#   statistics are not requested.
+# - v26.1 shares receptive-field prescan with conv1d/conv3d via
+#   Kernels/_prescan_common.py.
+
 import torch
 import triton
 import triton.language as tl
 from triton import autotune, Config
+from Kernels._prescan_common import _build_rf_prescan_metadata_impl
 from Utils.config import PRESCAN_ACTIVITY_EPS, SPARSE_DENSE_RATIO_THRESHOLD
 
 # ---------------------------------------------------------------------------
@@ -42,6 +49,8 @@ TILE_ZERO_CANDIDATE = 4
 
 FALLBACK_RATIO = SPARSE_DENSE_RATIO_THRESHOLD
 AUTO_LAUNCH_ALL_ACTIVE_TILE_RATIO = 0.75
+PERSISTENT_OVERSUB = 2
+USE_FUSED_1X1_PERSISTENT = True
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -521,99 +530,42 @@ def _build_two_stage_metadata(
     GROUP_SIZE_C = choose_group_size(C_IN)
     N_TILES = N * GH * GW
     NUM_GROUPS = triton.cdiv(C_IN, GROUP_SIZE_C)
-    ALL_ONES_MASK = (1 << NUM_GROUPS) - 1
     stage1_summary = None
+    x_nhwc = x_f16.permute(0, 2, 3, 1)
+    tile_class, ag_mask, debug_stats = _build_rf_prescan_metadata_impl(
+        x_channels_last=x_nhwc,
+        spatial_dims=(H_OUT, W_OUT),
+        kernel_dims=(kernel_size, kernel_size),
+        stride=stride,
+        padding=padding,
+        block_dims=(BH, BW),
+        group_size_c=GROUP_SIZE_C,
+        num_groups=NUM_GROUPS,
+        threshold=threshold,
+        return_debug_stats=(prescan_stats is not None or allow_stage1_dense_fallback),
+    )
 
-    # Receptive-field size for non-1x1 kernels. Shared across Stage 1, 2a, 2b.
-    if kernel_size != 1:
-        rf_h = (BH - 1) * stride + kernel_size
-        rf_w = (BW - 1) * stride + kernel_size
-        RF_SIZE = triton.next_power_of_2(max(rf_h * rf_w, 1))
+    tile_class_buf[:N_TILES].copy_(tile_class)
+    ag_mask_buf[:N_TILES].copy_(ag_mask)
 
-    # Stage 1
-    if kernel_size == 1:
-        BM = BH * BW
-        tile_coarse_classify_1x1_kernel[(N_TILES,)](
-            x_f16, tile_class_buf, ag_mask_buf,
-            N, C_IN, H_IN, W_IN, GH, GW,
-            BLOCK_H=BH, BLOCK_W=BW, BLOCK_M=BM,
-            THRESHOLD=threshold, GROUP_SIZE_C=GROUP_SIZE_C,
-            NUM_GROUPS=NUM_GROUPS, ALL_ONES_MASK=ALL_ONES_MASK,
-            UNCERTAIN_CLASS=TILE_UNCERTAIN, ZERO_CANDIDATE_CLASS=TILE_ZERO_CANDIDATE,
-        )
-    else:
-        tile_coarse_classify_kernel[(N_TILES,)](
-            x_f16, tile_class_buf, ag_mask_buf,
-            N, C_IN, H_IN, W_IN, GH, GW,
-            BLOCK_H=BH, BLOCK_W=BW,
-            KERNEL_SIZE=kernel_size, STRIDE=stride, PAD=padding,
-            RF_SIZE=RF_SIZE, THRESHOLD=threshold, GROUP_SIZE_C=GROUP_SIZE_C,
-            NUM_GROUPS=NUM_GROUPS, ALL_ONES_MASK=ALL_ONES_MASK,
-            UNCERTAIN_CLASS=TILE_UNCERTAIN, ZERO_CANDIDATE_CLASS=TILE_ZERO_CANDIDATE,
-        )
-
-    if prescan_stats is not None or allow_stage1_dense_fallback:
-        stage1_summary, stage1_avg_active_ratio = _summarize_stage1_metadata(
-            tile_class_buf, ag_mask_buf, N_TILES, NUM_GROUPS
-        )
+    if debug_stats is not None:
+        stage1_summary = {
+            "stage1_zero_candidate": int(debug_stats["stage1_zero_candidate"]),
+            "stage1_denseish": int(debug_stats["stage1_denseish"]),
+            "stage1_uncertain": int(debug_stats["stage1_uncertain"]),
+            "stage1_avg_active_group_ratio_lower_bound": float(
+                debug_stats["stage1_avg_active_group_ratio_lower_bound"]
+            ),
+        }
         if prescan_stats is not None:
-            prescan_stats.update(stage1_summary)
-        if allow_stage1_dense_fallback and stage1_avg_active_ratio > fallback_ratio:
+            prescan_stats.update(debug_stats)
+        if (
+            allow_stage1_dense_fallback
+            and float(debug_stats["stage1_avg_active_group_ratio_lower_bound"]) > fallback_ratio
+        ):
             if prescan_stats is not None:
                 prescan_stats["stage1_dense_fallback"] = 1
             return GROUP_SIZE_C, NUM_GROUPS, True, stage1_summary
-
-    # Stage 2a: zero-candidate refine
-    if kernel_size == 1:
-        BM = BH * BW
-        zero_candidate_refine_1x1_kernel[(N_TILES,)](
-            x_f16, tile_class_buf, ag_mask_buf,
-            N, C_IN, H_IN, W_IN, GH, GW,
-            BLOCK_H=BH, BLOCK_W=BW, BLOCK_M=BM,
-            GROUP_SIZE_C=GROUP_SIZE_C, NUM_GROUPS=NUM_GROUPS,
-            THRESHOLD=threshold, ALL_ONES_MASK=ALL_ONES_MASK,
-            ZERO_CANDIDATE_CLASS=TILE_ZERO_CANDIDATE,
-        )
-    else:
-        zero_candidate_refine_kernel[(N_TILES,)](
-            x_f16, tile_class_buf, ag_mask_buf,
-            N, C_IN, H_IN, W_IN, H_OUT, W_OUT, GH, GW,
-            BLOCK_H=BH, BLOCK_W=BW,
-            KERNEL_SIZE=kernel_size, STRIDE=stride, PAD=padding,
-            GROUP_SIZE_C=GROUP_SIZE_C, NUM_GROUPS=NUM_GROUPS,
-            RF_SIZE=RF_SIZE, THRESHOLD=threshold,
-            ALL_ONES_MASK=ALL_ONES_MASK, ZERO_CANDIDATE_CLASS=TILE_ZERO_CANDIDATE,
-        )
-
-    # Stage 2b: uncertain bitmask
-    if kernel_size == 1:
-        BM = BH * BW
-        group_bitmask_refine_1x1_kernel[(N_TILES,)](
-            x_f16, tile_class_buf, ag_mask_buf,
-            N, C_IN, H_IN, W_IN, GH, GW,
-            BLOCK_H=BH, BLOCK_W=BW, BLOCK_M=BM,
-            GROUP_SIZE_C=GROUP_SIZE_C, NUM_GROUPS=NUM_GROUPS,
-            THRESHOLD=threshold, ALL_ONES_MASK=ALL_ONES_MASK,
-            UNCERTAIN_CLASS=TILE_UNCERTAIN,
-        )
-    else:
-        group_bitmask_refine_kernel[(N_TILES,)](
-            x_f16, tile_class_buf, ag_mask_buf,
-            N, C_IN, H_IN, W_IN, H_OUT, W_OUT, GH, GW,
-            BLOCK_H=BH, BLOCK_W=BW,
-            KERNEL_SIZE=kernel_size, STRIDE=stride, PAD=padding,
-            GROUP_SIZE_C=GROUP_SIZE_C, NUM_GROUPS=NUM_GROUPS,
-            RF_SIZE=RF_SIZE, THRESHOLD=threshold,
-            ALL_ONES_MASK=ALL_ONES_MASK, UNCERTAIN_CLASS=TILE_UNCERTAIN,
-        )
-
-    if prescan_stats is not None:
-        tc = tile_class_buf[:N_TILES]
-        prescan_stats['final_zero'] = int((tc == TILE_ZERO).sum().item())
-        prescan_stats['final_sparse'] = int((tc == TILE_SPARSE).sum().item())
-        prescan_stats['final_denseish'] = int((tc == TILE_DENSEISH).sum().item())
-        prescan_stats['stage2_zero_refine_tiles'] = prescan_stats.get('stage1_zero_candidate', 0)
-        prescan_stats['stage2_uncertain_tiles'] = prescan_stats.get('stage1_uncertain', 0)
 
     return GROUP_SIZE_C, NUM_GROUPS, False, stage1_summary
 
@@ -771,6 +723,204 @@ def sparse_conv1x1_nhwc_kernel_8x16(
         acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
     oa = y_ptr + (n_idx * C_OUT + offs_n[None, :]) * HW_OUT + out_h[:, None] * W_OUT + out_w[:, None]
     tl.store(oa, acc, mask=m_mask[:, None] & n_mask[None, :])
+
+
+@triton.jit
+def _fused_prescan_compute_conv1x1_persistent(
+    x_nhwc_ptr, w_ptr, bias_ptr, y_ptr,
+    N_val, C_IN, C_OUT, H_IN, W_IN,
+    SPATIAL_TILES, N_COUT_TILES, TOTAL_WORK,
+    THRESHOLD,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_SIZE_C: tl.constexpr, NUM_GROUPS: tl.constexpr, NUM_SMS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    hw = H_IN * W_IN
+    hw_out = H_IN * W_IN
+    wc = W_IN * C_IN
+    all_ones_mask: tl.constexpr = (1 << NUM_GROUPS) - 1
+    linear = pid
+
+    while linear < TOTAL_WORK:
+        pid_cout = linear % N_COUT_TILES
+        tmp = linear // N_COUT_TILES
+        n_idx = tmp // SPATIAL_TILES
+        spatial_tile = tmp % SPATIAL_TILES
+
+        if n_idx < N_val:
+            offs_n = pid_cout * BLOCK_N + tl.arange(0, BLOCK_N)
+            n_mask = offs_n < C_OUT
+
+            offs_m = spatial_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+            m_mask = offs_m < hw
+            out_h = offs_m // W_IN
+            out_w = offs_m % W_IN
+            x_base = n_idx * H_IN * wc + out_h * wc + out_w * C_IN
+
+            ag_mask = tl.zeros([1], dtype=tl.int32)
+            for g in range(NUM_GROUPS):
+                cs = g * GROUP_SIZE_C
+                group_has_nz = tl.zeros([1], dtype=tl.int32)
+                for k_off in range(0, GROUP_SIZE_C, BLOCK_K):
+                    offs_k = cs + k_off + tl.arange(0, BLOCK_K)
+                    k_mask = offs_k < C_IN
+                    x_t = tl.load(
+                        x_nhwc_ptr + x_base[:, None] + offs_k[None, :],
+                        mask=m_mask[:, None] & k_mask[None, :],
+                        other=0.0,
+                    )
+                    chunk_active = (tl.max(tl.abs(x_t), axis=0) > THRESHOLD).to(tl.int32)
+                    group_has_nz = tl.maximum(
+                        group_has_nz,
+                        (tl.sum(chunk_active, axis=0) > 0).to(tl.int32),
+                    )
+                ag_mask = ag_mask + group_has_nz * (1 << g)
+
+            acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+            if tl.sum(ag_mask) != 0:
+                if tl.sum(ag_mask == all_ones_mask) > 0:
+                    for cin_base in range(0, NUM_GROUPS * GROUP_SIZE_C, BLOCK_K):
+                        offs_k = cin_base + tl.arange(0, BLOCK_K)
+                        k_mask = offs_k < C_IN
+                        x_t = tl.load(
+                            x_nhwc_ptr + x_base[:, None] + offs_k[None, :],
+                            mask=m_mask[:, None] & k_mask[None, :],
+                            other=0.0,
+                        ).to(tl.float16)
+                        w_t = tl.load(
+                            w_ptr + offs_n[None, :] * C_IN + offs_k[:, None],
+                            mask=k_mask[:, None] & n_mask[None, :],
+                            other=0.0,
+                        ).to(tl.float16)
+                        acc += tl.dot(x_t, w_t)
+                else:
+                    ag_bits = tl.sum(ag_mask)
+                    for g in range(NUM_GROUPS):
+                        g_active = (ag_bits >> g) & 1
+                        if g_active != 0:
+                            cs = g * GROUP_SIZE_C
+                            for k_off in range(0, GROUP_SIZE_C, BLOCK_K):
+                                offs_k = cs + k_off + tl.arange(0, BLOCK_K)
+                                k_mask = offs_k < C_IN
+                                x_t = tl.load(
+                                    x_nhwc_ptr + x_base[:, None] + offs_k[None, :],
+                                    mask=m_mask[:, None] & k_mask[None, :],
+                                    other=0.0,
+                                ).to(tl.float16)
+                                w_t = tl.load(
+                                    w_ptr + offs_n[None, :] * C_IN + offs_k[:, None],
+                                    mask=k_mask[:, None] & n_mask[None, :],
+                                    other=0.0,
+                                ).to(tl.float16)
+                                acc += tl.dot(x_t, w_t)
+
+            if HAS_BIAS:
+                acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
+
+            oa = y_ptr + (n_idx * C_OUT + offs_n[None, :]) * hw_out + out_h[:, None] * W_IN + out_w[:, None]
+            tl.store(oa, acc, mask=m_mask[:, None] & n_mask[None, :])
+
+        linear += NUM_SMS
+
+
+def _fused_1x1_persistent_path(
+    x_f16,
+    x_nhwc,
+    weight,
+    bias,
+    w_cl,
+    N,
+    C_IN,
+    C_OUT,
+    H_OUT,
+    W_OUT,
+    BH,
+    BW,
+    GROUP_SIZE_C,
+    DENSE_K,
+    threshold,
+    return_ms,
+):
+    device = x_f16.device
+    if x_nhwc is None:
+        x_nhwc = x_f16.permute(0, 2, 3, 1).contiguous()
+    if w_cl is not None:
+        w_cl_f16 = w_cl
+    else:
+        w_cl_f16 = weight.half().reshape(C_OUT, C_IN).contiguous()
+
+    block_m = BH * BW
+    block_n = 64 if C_OUT >= 64 else 32
+    block_k = 32 if DENSE_K >= 32 else 16
+    spatial_tiles = triton.cdiv(H_OUT * W_OUT, block_m)
+    n_cout_tiles = triton.cdiv(C_OUT, block_n)
+    total_work = int(N * spatial_tiles * n_cout_tiles)
+
+    if total_work <= 0:
+        y = torch.zeros(N, C_OUT, H_OUT, W_OUT, dtype=torch.float32, device=device)
+        if bias is not None:
+            y = y + bias.detach().float().view(1, -1, 1, 1)
+        return y, 0.0, {
+            "backend": "zero_tiles_only",
+            "reason": "empty_fused_1x1_work",
+            "total_tiles": int(N * spatial_tiles),
+            "launch_count": 0,
+            "launch_mode": "persistent",
+            "launch_mode_reason": "persistent_fused_1x1",
+        }
+
+    num_programs = max(
+        1,
+        int(torch.cuda.get_device_properties(device).multi_processor_count) * PERSISTENT_OVERSUB,
+    )
+    y = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=torch.float32, device=device)
+
+    sparse_ms = 0.0
+    if return_ms:
+        start_ev = torch.cuda.Event(enable_timing=True)
+        end_ev = torch.cuda.Event(enable_timing=True)
+        start_ev.record()
+
+    bias_ptr = bias if bias is not None else x_nhwc
+    _fused_prescan_compute_conv1x1_persistent[(num_programs,)](
+        x_nhwc,
+        w_cl_f16,
+        bias_ptr,
+        y,
+        N,
+        C_IN,
+        C_OUT,
+        H_OUT,
+        W_OUT,
+        spatial_tiles,
+        n_cout_tiles,
+        total_work,
+        float(threshold),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        GROUP_SIZE_C=GROUP_SIZE_C,
+        NUM_GROUPS=triton.cdiv(C_IN, GROUP_SIZE_C),
+        NUM_SMS=num_programs,
+        HAS_BIAS=(bias is not None),
+    )
+
+    if return_ms:
+        end_ev.record()
+        torch.cuda.synchronize(device)
+        sparse_ms = start_ev.elapsed_time(end_ev)
+
+    backend_meta = {
+        "backend": "sparse_triton",
+        "reason": "fused_1x1_persistent_v26",
+        "total_tiles": int(N * spatial_tiles),
+        "launch_count": int(total_work),
+        "launch_mode": "persistent",
+        "launch_mode_reason": "persistent_fused_1x1",
+        "persistent_programs": int(num_programs),
+    }
+    return y, sparse_ms, backend_meta
 
 
 # ---- 3x3 / s1, 8x8 ----
@@ -1198,6 +1348,35 @@ def sparse_conv2d_forward(
     N_TILES = N * GH * GW
 
     x_f16 = x if (x.dtype == torch.float16 and x.is_contiguous()) else x.half().contiguous()
+
+    if (
+        kernel_size == 1
+        and stride == 1
+        and padding == 0
+        and groups == 1
+        and dilation == 1
+        and USE_FUSED_1X1_PERSISTENT
+        and not need_stats
+    ):
+        y, sparse_ms, backend_meta = _fused_1x1_persistent_path(
+            x_f16=x_f16,
+            x_nhwc=x_nhwc,
+            weight=weight,
+            bias=bias,
+            w_cl=w_cl,
+            N=N,
+            C_IN=C_IN,
+            C_OUT=C_OUT,
+            H_OUT=H_OUT,
+            W_OUT=W_OUT,
+            BH=BH,
+            BW=BW,
+            GROUP_SIZE_C=GROUP_SIZE_C,
+            DENSE_K=DENSE_K,
+            threshold=threshold,
+            return_ms=return_ms,
+        )
+        return _finalize_return(y, sparse_ms, None, None, backend_meta)
 
     if ag_mask_buf is None or ag_mask_buf.numel() < N_TILES:
         ag_mask_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
