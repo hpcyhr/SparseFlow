@@ -1863,6 +1863,9 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
     )
 
     total_targets = len(targets)
+    hy_sparse = hy_summary[1]
+    hy_static = hy_summary[2]
+    hy_dense = max(total_targets - hy_sparse - hy_static, 0)
 
     route_counts = {
         "static_zero_only": {
@@ -1883,10 +1886,12 @@ def run_core_all_ops_benchmark(args, model_baseline, loader, device, gpu_id):
         },
         "hybrid": {
             "total": total_targets,
-            "sparse": hy_summary[1],
+            "sparse": hy_sparse,
             "fused": 0,
-            "static_zero": hy_summary[2],
-            "dense_keep": hy_summary[3],
+            "static_zero": hy_static,
+            # hy_summary is computed only over `hybrid_targets`, so its dense_keep
+            # count does not include untouched layers outside that subset.
+            "dense_keep": hy_dense,
         },
     }
     print("\n  Replacement summary:")

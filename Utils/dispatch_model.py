@@ -1029,8 +1029,11 @@ def _make_pool_decision(
     always prefer the sparse kernel backend — the sparse pool kernels have
     a cheap tile-zero fast path and degrade gracefully to dense on tiles
     with activity. There is no hysteresis and no per-layer calibration.
+    Current policy: dispatch pool layers to dense by default unless an explicit
+    sparse-pool benchmark justifies enabling them.
 
-    Only the currently supported sparse-pool semantics are marked sparse:
+    Only the currently supported sparse-pool semantics are even eligible for
+    sparse replacement:
       - `ceil_mode=False` for both MaxPool2d and AvgPool2d
       - `return_indices=False` for MaxPool2d
     Unsupported pool variants are forced to dense so reports match runtime.
@@ -1081,10 +1084,10 @@ def _make_pool_decision(
 
     return DispatchDecision(
         layer_name=layer_name,
-        backend="sparse",
-        reason=f"pool_shortcut_{op_type}",
-        reason_code="pool_shortcut",
-        fallback_reason="",
+        backend="dense",
+        reason=f"pool_default_dense_{op_type}",
+        reason_code="pool_default_dense",
+        fallback_reason="pool_default_dense",
         meta_source="shortcut",
         diag_source="shortcut",
         support_status="supported",
@@ -1093,11 +1096,11 @@ def _make_pool_decision(
         confidence=1.0,
         agr=0.0,
         tzr=0.0,
-        R_l=1.0,
+        R_l=0.0,
         agr_nz=0.0,
-        score_sparse=float('inf'),
+        score_sparse=0.0,
         denseish_ratio=0.0,
-        sparse_tile_ratio=1.0,
+        sparse_tile_ratio=0.0,
     )
 
 
