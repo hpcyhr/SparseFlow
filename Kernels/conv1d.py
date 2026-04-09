@@ -1,34 +1,18 @@
 """
 SparseFlow Kernels/conv1d.py - v2 unified Triton sparse Conv1d.
 
-Replaces the previous host-loop reference implementation with a real
-two-stage Triton kernel that follows the canonical SparseFlow method:
+Two-stage Triton kernel following the canonical SparseFlow method:
+  Stage 1: prescan kernel produces per-tile (tile_class, ag_mask) metadata.
+  Stage 2: compute kernel branches per tile on tile_class.
 
-  Stage 1: prescan kernel produces per-tile (tile_class, ag_mask) metadata
-           by scanning the receptive field along C_in groups.
-  Stage 2: compute kernel branches per tile on tile_class:
-             ZERO     -> bias-only output
-             DENSEISH -> flat dense reduction over all C_in
-             SPARSE   -> grouped bitmask iteration with `if g_active != 0`
-                         to actually skip the load + tl.dot of inactive groups.
+Changes from v2.0:
+  [A.1]  Legacy compat kwargs removed.
+  [B.4]  bias_ptr placeholder is fp32 device tensor.
+  [C.3]  Output tensor pre-filled with bias so TILE_ZERO tiles are correct.
+  [C.7]  Single popcount + single GPU->CPU sync in need_stats path.
+  [B.3]  Zero-tile early-return runs regardless of need_stats.
 
-Layouts:
-  - Input  x is permuted to NLC (channels-last) for coalesced loads.
-  - Weight w is materialized as [C_out, KS, C_in] (k-then-channel) for
-    contiguous reduction-dim access.
-  - Output y is written to NCL (PyTorch standard).
-
-Supported sparse-path configurations:
-  - groups == 1
-  - dilation == 1
-  - kernel_size in {1, 3}
-  - stride in {1, 2}
-  - padding consistent with kernel_size and stride
-
-Anything outside this set falls back to F.conv1d with backend_meta
-explicitly tagged.
-
-Maturity: main_path (production-facing sparse kernel).
+Maturity: main_path.
 """
 
 from __future__ import annotations
@@ -58,12 +42,7 @@ from Utils.sparse_helpers import (
 FALLBACK_RATIO = SPARSE_DENSE_RATIO_THRESHOLD
 
 
-# ===========================================================================
-# Tile sizing
-# ===========================================================================
-
 def _select_block_l(l_out: int) -> int:
-    """Pick BLOCK_L (output L pixels per tile).  Must be >= 16 for tl.dot."""
     if l_out >= 256:
         return 64
     if l_out >= 64:
@@ -87,32 +66,21 @@ def _is_supported_sparse_pattern(kernel_size, stride, padding, dilation, groups)
 
 @triton.jit
 def _prescan_conv1d_kernel(
-    x_nlc_ptr,           # [N, L_IN, C_IN] fp16 channels-last
-    ag_mask_ptr,         # [N * GL] int32  per-tile bitmask
-    tile_class_ptr,      # [N * GL] int32  per-tile class
+    x_nlc_ptr, ag_mask_ptr, tile_class_ptr,
     N_val,
-    C_IN: tl.constexpr,
-    L_IN: tl.constexpr,
-    L_OUT: tl.constexpr,
-    KS: tl.constexpr,
-    STRIDE: tl.constexpr,
-    PADDING: tl.constexpr,
-    GL: tl.constexpr,
-    BLOCK_L: tl.constexpr,
-    GROUP_SIZE_C: tl.constexpr,
-    NUM_GROUPS: tl.constexpr,
-    ALL_ONES: tl.constexpr,
-    THRESHOLD: tl.constexpr,
+    C_IN: tl.constexpr, L_IN: tl.constexpr, L_OUT: tl.constexpr,
+    KS: tl.constexpr, STRIDE: tl.constexpr, PADDING: tl.constexpr,
+    GL: tl.constexpr, BLOCK_L: tl.constexpr,
+    GROUP_SIZE_C: tl.constexpr, NUM_GROUPS: tl.constexpr,
+    ALL_ONES: tl.constexpr, THRESHOLD: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     pid_l = tl.program_id(1)
-
     if pid_n >= N_val:
         return
 
     out_l = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
     l_mask = out_l < L_OUT
-
     n_offset = pid_n * L_IN * C_IN
     off1 = tl.arange(0, 1)
 
@@ -133,7 +101,6 @@ def _prescan_conv1d_kernel(
             addrs = n_offset + safe_l[:, None] * C_IN + offs_c[None, :]
             m = l_ok[:, None] & c_mask[None, :]
             vals = tl.load(x_nlc_ptr + addrs, mask=m, other=0.0)
-
             elem_nz = (tl.abs(vals) > THRESHOLD).to(tl.int32)
             group_nz_acc = group_nz_acc + tl.sum(elem_nz)
 
@@ -167,29 +134,16 @@ _CONV1D_CONFIGS = [
 @autotune(configs=_CONV1D_CONFIGS, key=["C_IN", "C_OUT", "L_OUT", "BLOCK_L", "KS", "STRIDE"])
 @triton.jit
 def _sparse_conv1d_kernel(
-    x_nlc_ptr,           # [N, L_IN, C_IN]
-    w_kc_ptr,            # [C_OUT, KS * C_IN] (k-then-channel flat)
-    bias_ptr,
-    y_ptr,               # [N, C_OUT, L_OUT]
-    ag_mask_ptr,
-    tile_class_ptr,
-    active_tile_ids_ptr,
+    x_nlc_ptr, w_kc_ptr, bias_ptr, y_ptr,
+    ag_mask_ptr, tile_class_ptr, active_tile_ids_ptr,
     N_val,
-    C_IN: tl.constexpr,
-    C_OUT: tl.constexpr,
-    L_IN: tl.constexpr,
-    L_OUT: tl.constexpr,
-    KS: tl.constexpr,
-    STRIDE: tl.constexpr,
-    PADDING: tl.constexpr,
-    GL: tl.constexpr,
-    BLOCK_L: tl.constexpr,
-    GROUP_SIZE_C: tl.constexpr,
-    NUM_GROUPS: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    USE_TILE_IDS: tl.constexpr,
-    BLOCK_N_OUT: tl.constexpr,
-    DENSE_K: tl.constexpr,
+    C_IN: tl.constexpr, C_OUT: tl.constexpr,
+    L_IN: tl.constexpr, L_OUT: tl.constexpr,
+    KS: tl.constexpr, STRIDE: tl.constexpr, PADDING: tl.constexpr,
+    GL: tl.constexpr, BLOCK_L: tl.constexpr,
+    GROUP_SIZE_C: tl.constexpr, NUM_GROUPS: tl.constexpr,
+    HAS_BIAS: tl.constexpr, USE_TILE_IDS: tl.constexpr,
+    BLOCK_N_OUT: tl.constexpr, DENSE_K: tl.constexpr,
 ):
     pid_tile = tl.program_id(0)
     pid_n_out = tl.program_id(1)
@@ -201,13 +155,16 @@ def _sparse_conv1d_kernel(
 
     n_idx = tile_id // GL
     l_tile = tile_id % GL
-
     if n_idx >= N_val:
         return
 
     off1 = tl.arange(0, 1)
     tc_t = tl.load(tile_class_ptr + tile_id + off1)
     tile_cls = tl.sum(tc_t)
+
+    # ZERO tile: y was pre-filled with bias on host, nothing to do.
+    if tile_cls == TILE_ZERO:
+        return
 
     out_l = l_tile * BLOCK_L + tl.arange(0, BLOCK_L)
     l_mask = out_l < L_OUT
@@ -216,83 +173,53 @@ def _sparse_conv1d_kernel(
     n_out_mask = offs_n_out < C_OUT
 
     acc = tl.zeros([BLOCK_L, BLOCK_N_OUT], dtype=tl.float32)
-
     n_base = n_idx * L_IN * C_IN
     KC = KS * C_IN
 
-    if tile_cls == TILE_ZERO:
-        # bias-only output
-        pass
-
-    elif tile_cls == TILE_DENSEISH:
+    if tile_cls == TILE_DENSEISH:
         for k in tl.static_range(KS):
             in_l = out_l * STRIDE + k - PADDING
             l_ok = l_mask & (in_l >= 0) & (in_l < L_IN)
             safe_l = tl.minimum(tl.maximum(in_l, 0), L_IN - 1)
-
-            x_row_base = n_base + safe_l * C_IN  # [BLOCK_L]
+            x_row_base = n_base + safe_l * C_IN
             w_k_base = k * C_IN
 
             for cin_base in range(0, C_IN, DENSE_K):
                 offs_k = cin_base + tl.arange(0, DENSE_K)
                 k_mask = offs_k < C_IN
-
                 x_addrs = x_row_base[:, None] + offs_k[None, :]
-                x_t = tl.load(
-                    x_nlc_ptr + x_addrs,
-                    mask=l_ok[:, None] & k_mask[None, :],
-                    other=0.0,
-                ).to(tl.float16)
-
+                x_t = tl.load(x_nlc_ptr + x_addrs,
+                              mask=l_ok[:, None] & k_mask[None, :], other=0.0).to(tl.float16)
                 w_addrs = offs_n_out[None, :] * KC + w_k_base + offs_k[:, None]
-                w_t = tl.load(
-                    w_kc_ptr + w_addrs,
-                    mask=k_mask[:, None] & n_out_mask[None, :],
-                    other=0.0,
-                ).to(tl.float16)
-
+                w_t = tl.load(w_kc_ptr + w_addrs,
+                              mask=k_mask[:, None] & n_out_mask[None, :], other=0.0).to(tl.float16)
                 acc += tl.dot(x_t, w_t)
-
     else:
-        # SPARSE path: bitmask-gated grouped reduction
         ag_t = tl.load(ag_mask_ptr + tile_id + off1)
         ag = tl.sum(ag_t)
-
         for k in tl.static_range(KS):
             in_l = out_l * STRIDE + k - PADDING
             l_ok = l_mask & (in_l >= 0) & (in_l < L_IN)
             safe_l = tl.minimum(tl.maximum(in_l, 0), L_IN - 1)
-
-            x_row_base = n_base + safe_l * C_IN  # [BLOCK_L]
+            x_row_base = n_base + safe_l * C_IN
             w_k_base = k * C_IN
-
             for g in range(NUM_GROUPS):
                 g_active = (ag >> g) & 1
                 if g_active != 0:
                     cs = g * GROUP_SIZE_C
                     offs_k = cs + tl.arange(0, GROUP_SIZE_C)
                     k_mask = offs_k < C_IN
-
                     x_addrs = x_row_base[:, None] + offs_k[None, :]
-                    x_t = tl.load(
-                        x_nlc_ptr + x_addrs,
-                        mask=l_ok[:, None] & k_mask[None, :],
-                        other=0.0,
-                    ).to(tl.float16)
-
+                    x_t = tl.load(x_nlc_ptr + x_addrs,
+                                  mask=l_ok[:, None] & k_mask[None, :], other=0.0).to(tl.float16)
                     w_addrs = offs_n_out[None, :] * KC + w_k_base + offs_k[:, None]
-                    w_t = tl.load(
-                        w_kc_ptr + w_addrs,
-                        mask=k_mask[:, None] & n_out_mask[None, :],
-                        other=0.0,
-                    ).to(tl.float16)
-
+                    w_t = tl.load(w_kc_ptr + w_addrs,
+                                  mask=k_mask[:, None] & n_out_mask[None, :], other=0.0).to(tl.float16)
                     acc += tl.dot(x_t, w_t)
 
     if HAS_BIAS:
         acc += tl.load(bias_ptr + offs_n_out, mask=n_out_mask, other=0.0)[None, :]
 
-    # Write to NCL output: y[n, c_out, l]
     out_addrs = (
         n_idx * C_OUT * L_OUT
         + offs_n_out[None, :] * L_OUT
@@ -302,22 +229,7 @@ def _sparse_conv1d_kernel(
     tl.store(y_ptr + out_addrs, acc, mask=out_mask)
 
 
-# ===========================================================================
-# Helpers
-# ===========================================================================
-
-def _check_dense_fallback(ag_mask_buf, total_tiles, num_groups, fallback_ratio):
-    """Same convention as conv2d._check_dense_fallback (uses .item(), syncs)."""
-    if num_groups == 0 or total_tiles == 0:
-        return False, 0.0
-    pc = popcount_buf(ag_mask_buf, total_tiles)
-    avg_active = pc.float().mean().item()
-    avg_ratio = avg_active / float(num_groups)
-    return avg_active > float(fallback_ratio) * float(num_groups), avg_ratio
-
-
 def _build_active_tile_ids(tile_class_buf, total_tiles):
-    """Compact non-zero tile ids.  Calls torch.nonzero() (syncs)."""
     nz = torch.nonzero(tile_class_buf[:total_tiles] != TILE_ZERO, as_tuple=False)
     if nz.numel() == 0:
         return None, 0
@@ -339,21 +251,7 @@ def sparse_conv1d_forward(
     return_backend_meta=False,
     active_tile_ids_buf=None,
     launch_all_tiles=False,
-    # Legacy compat (kept for unified call surface)
-    block_size=None, counts_buf=None, tile_cin_buf=None,
-    group_flags_buf=None, ag_count_buf=None, ag_list_buf=None,
-    tile_alive_buf=None,
 ):
-    """
-    Two-stage Triton sparse Conv1d forward.
-
-    Returns:
-        y                                                 always
-        ms                              if return_ms       (else 0.0)
-        avg_active_ratio                if return_avg_active_ratio
-        tile_stats                      if return_tile_stats
-        backend_meta                    if return_backend_meta
-    """
     # ---- normalize args ----
     if isinstance(kernel_size, (tuple, list)):
         kernel_size = int(kernel_size[0])
@@ -378,28 +276,26 @@ def sparse_conv1d_forward(
     HAS_BIAS = bias is not None
 
     L_OUT = (L_IN + 2 * padding - dilation * (KS - 1) - 1) // stride + 1
-
     need_stats = return_tile_stats or return_avg_active_ratio
 
-    def _finalize(y, ms, avg_active_ratio_val=None, tile_stats_val=None, backend_meta_val=None):
+    def _finalize(y, ms, avg=None, ts=None, bm=None):
         ret = (y, ms)
         if return_avg_active_ratio:
-            ret = ret + (avg_active_ratio_val,)
+            ret = ret + (avg,)
         if return_tile_stats:
-            ret = ret + (tile_stats_val,)
+            ret = ret + (ts,)
         if return_backend_meta:
-            ret = ret + (backend_meta_val,)
+            ret = ret + (bm,)
         return ret
 
-    def _dense_fallback(reason: str, avg_ratio_val=None, tile_stats_val=None):
+    def _dense_fallback(reason, avg_ratio_val=None, tile_stats_val=None):
         ms = 0.0
         if return_ms:
             se = torch.cuda.Event(enable_timing=True)
             ee = torch.cuda.Event(enable_timing=True)
             se.record()
         y = Fn.conv1d(
-            x.float(),
-            weight.float(),
+            x.float(), weight.float(),
             bias.float() if bias is not None else None,
             stride=stride, padding=padding, dilation=dilation, groups=groups,
         ).float()
@@ -408,12 +304,9 @@ def sparse_conv1d_forward(
             torch.cuda.synchronize(device)
             ms = se.elapsed_time(ee)
         backend_meta = {
-            "backend": "dense_fallback",
-            "reason": reason,
+            "backend": "dense_fallback", "reason": reason,
             "kernel_type": f"1d_k{KS}_s{stride}",
-            "total_tiles": -1,
-            "launch_count": -1,
-            "launch_mode": "dense",
+            "total_tiles": -1, "launch_count": -1, "launch_mode": "dense",
         }
         if avg_ratio_val is None and return_avg_active_ratio:
             avg_ratio_val = 1.0
@@ -427,7 +320,6 @@ def sparse_conv1d_forward(
     if L_OUT <= 0:
         return _dense_fallback("nonpositive_l_out")
 
-    # ---- choose tiling and grouping ----
     BLOCK_L = _select_block_l(L_OUT)
     GROUP_SIZE_C = choose_group_size(C_IN)
     NUM_GROUPS = (C_IN + GROUP_SIZE_C - 1) // GROUP_SIZE_C
@@ -436,12 +328,10 @@ def sparse_conv1d_forward(
 
     if NUM_GROUPS > 32:
         return _dense_fallback(f"num_groups_exceeds_uint32({NUM_GROUPS})")
-
     ALL_ONES = (1 << NUM_GROUPS) - 1
 
     # ---- prepare buffers ----
-    x_nlc = x.permute(0, 2, 1).contiguous().to(torch.float16)  # [N, L_IN, C_IN]
-    # Weight: [C_out, C_in, KS] -> [C_out, KS, C_in] -> flatten last two
+    x_nlc = x.permute(0, 2, 1).contiguous().to(torch.float16)
     w_kc = weight.permute(0, 2, 1).contiguous().to(torch.float16).view(C_OUT, KS * C_IN)
 
     if ag_mask_buf is None or ag_mask_buf.numel() < N_TILES:
@@ -449,9 +339,10 @@ def sparse_conv1d_forward(
     if tile_class_buf is None or tile_class_buf.numel() < N_TILES:
         tile_class_buf = torch.empty(N_TILES, dtype=torch.int32, device=device)
 
-    bias_arg = bias.to(torch.float32) if bias is not None else torch.empty(0, device=device)
+    # [B.4] fp32 placeholder for bias pointer
+    bias_arg = (bias.to(torch.float32) if bias is not None
+                else torch.empty(1, dtype=torch.float32, device=device))
 
-    # ---- timing setup ----
     sparse_ms = 0.0
     if return_ms:
         start_evt = torch.cuda.Event(enable_timing=True)
@@ -459,50 +350,32 @@ def sparse_conv1d_forward(
         start_evt.record()
 
     # ---- Stage 1: prescan ----
-    prescan_grid = (N, GL)
-    _prescan_conv1d_kernel[prescan_grid](
-        x_nlc,
-        ag_mask_buf,
-        tile_class_buf,
-        N,
-        C_IN=C_IN,
-        L_IN=L_IN,
-        L_OUT=L_OUT,
-        KS=KS,
-        STRIDE=stride,
-        PADDING=padding,
-        GL=GL,
-        BLOCK_L=BLOCK_L,
-        GROUP_SIZE_C=GROUP_SIZE_C,
-        NUM_GROUPS=NUM_GROUPS,
-        ALL_ONES=ALL_ONES,
-        THRESHOLD=float(threshold),
+    _prescan_conv1d_kernel[(N, GL)](
+        x_nlc, ag_mask_buf, tile_class_buf, N,
+        C_IN=C_IN, L_IN=L_IN, L_OUT=L_OUT,
+        KS=KS, STRIDE=stride, PADDING=padding,
+        GL=GL, BLOCK_L=BLOCK_L,
+        GROUP_SIZE_C=GROUP_SIZE_C, NUM_GROUPS=NUM_GROUPS,
+        ALL_ONES=ALL_ONES, THRESHOLD=float(threshold),
     )
 
-    # ---- optional stats / dense fallback / active-tile compaction ----
     avg_active_ratio = None
     tile_stats = None
-    active_ids = None
-    active_count = N_TILES
-    use_tile_ids = False
 
-    if need_stats or not launch_all_tiles:
-        # popcount-based active group ratio (sync)
-        pc = popcount_buf(ag_mask_buf, N_TILES)
-        active_g_total = float(pc.sum().item())
-        avg_active_ratio = active_g_total / max(float(N_TILES * NUM_GROUPS), 1.0)
-
-        # tile-class histogram (sync)
-        tc_host = tile_class_buf[:N_TILES].cpu()
-        zt = int((tc_host == TILE_ZERO).sum().item())
-        sp_t = int((tc_host == TILE_SPARSE).sum().item())
-        dt = int((tc_host == TILE_DENSEISH).sum().item())
+    # [C.7] single popcount + single host sync
+    if need_stats:
+        tc = tile_class_buf[:N_TILES]
+        zt_t = (tc == TILE_ZERO).sum()
+        sp_t = (tc == TILE_SPARSE).sum()
+        dt_t = (tc == TILE_DENSEISH).sum()
+        pc_sum_t = popcount_buf(ag_mask_buf, N_TILES).sum()
+        stats_host = torch.stack([zt_t.long(), sp_t.long(), dt_t.long(), pc_sum_t.long()]).cpu()
+        zt, sp_ct, dt, pc_sum = [int(v) for v in stats_host.tolist()]
+        avg_active_ratio = float(pc_sum) / max(float(N_TILES * NUM_GROUPS), 1.0)
 
         if return_tile_stats:
             tile_stats = {
-                "zero_tiles": zt,
-                "sparse_tiles": sp_t,
-                "denseish_tiles": dt,
+                "zero_tiles": zt, "sparse_tiles": sp_ct, "denseish_tiles": dt,
                 "total_tiles": int(N_TILES),
                 "prescan_mode": "triton_grouped_conv1d_v2",
                 "block_l": int(BLOCK_L),
@@ -523,74 +396,57 @@ def sparse_conv1d_forward(
                 tile_stats_val=tile_stats,
             )
 
-        if not launch_all_tiles:
-            ids, n_active = _build_active_tile_ids(tile_class_buf, N_TILES)
-            if n_active == 0:
-                # all-zero output: bias broadcast (or zeros)
-                y = torch.zeros((N, C_OUT, L_OUT), device=device, dtype=torch.float32)
-                if HAS_BIAS:
-                    y += bias.float().view(1, C_OUT, 1)
-                if return_ms:
-                    end_evt.record()
-                    torch.cuda.synchronize(device)
-                    sparse_ms = start_evt.elapsed_time(end_evt)
-                backend_meta = {
-                    "backend": "all_zero_after_metadata",
-                    "reason": "no_active_tiles",
-                    "kernel_type": f"1d_k{KS}_s{stride}",
-                    "total_tiles": int(N_TILES),
-                    "launch_count": 0,
-                    "launch_mode": "active_only",
-                    "active_tiles": 0,
-                }
-                return _finalize(y, sparse_ms, avg_active_ratio, tile_stats, backend_meta)
+    # [B.3] active-tile compaction runs regardless of need_stats
+    active_ids = None
+    active_count = N_TILES
+    use_tile_ids = False
 
-            if active_tile_ids_buf is None or active_tile_ids_buf.numel() < n_active:
-                active_tile_ids_buf = torch.empty(n_active, dtype=torch.int32, device=device)
-            active_tile_ids_buf[:n_active].copy_(ids)
-            active_ids = active_tile_ids_buf
-            active_count = n_active
-            use_tile_ids = True
+    if not launch_all_tiles:
+        ids, n_active = _build_active_tile_ids(tile_class_buf, N_TILES)
+        if n_active == 0:
+            y = torch.zeros((N, C_OUT, L_OUT), device=device, dtype=torch.float32)
+            if HAS_BIAS:
+                y += bias.float().view(1, C_OUT, 1)
+            if return_ms:
+                end_evt.record()
+                torch.cuda.synchronize(device)
+                sparse_ms = start_evt.elapsed_time(end_evt)
+            backend_meta = {
+                "backend": "all_zero_after_metadata",
+                "reason": "no_active_tiles",
+                "kernel_type": f"1d_k{KS}_s{stride}",
+                "total_tiles": int(N_TILES), "launch_count": 0,
+                "launch_mode": "active_only", "active_tiles": 0,
+            }
+            return _finalize(y, sparse_ms, avg_active_ratio, tile_stats, backend_meta)
+
+        if active_tile_ids_buf is None or active_tile_ids_buf.numel() < n_active:
+            active_tile_ids_buf = torch.empty(n_active, dtype=torch.int32, device=device)
+        active_tile_ids_buf[:n_active].copy_(ids)
+        active_ids = active_tile_ids_buf
+        active_count = n_active
+        use_tile_ids = True
 
     # ---- Stage 2: compute ----
+    # [C.3] Pre-fill bias so TILE_ZERO tiles (early-return in kernel) are correct.
     y = torch.empty((N, C_OUT, L_OUT), device=device, dtype=torch.float32)
-    if HAS_BIAS and not need_stats:
-        # When we skipped stats, ZERO tiles still need bias.  Pre-fill so the
-        # zero-class branch (which writes nothing) leaves bias in place.
-        y.copy_(bias.float().view(1, C_OUT, 1).expand(N, C_OUT, L_OUT))
-    elif HAS_BIAS:
+    if HAS_BIAS:
         y.copy_(bias.float().view(1, C_OUT, 1).expand(N, C_OUT, L_OUT))
     else:
         y.zero_()
 
-    # The compute kernel writes acc + bias for non-zero tiles, overwriting
-    # the bias prefill -- so the prefill is only kept on TILE_ZERO tiles.
     if active_ids is None:
         active_ids = torch.empty(0, dtype=torch.int32, device=device)
 
     grid = lambda META: (active_count, triton.cdiv(C_OUT, META["BLOCK_N_OUT"]))
     _sparse_conv1d_kernel[grid](
-        x_nlc,
-        w_kc,
-        bias_arg,
-        y,
-        ag_mask_buf,
-        tile_class_buf,
-        active_ids,
-        N,
-        C_IN=C_IN,
-        C_OUT=C_OUT,
-        L_IN=L_IN,
-        L_OUT=L_OUT,
-        KS=KS,
-        STRIDE=stride,
-        PADDING=padding,
-        GL=GL,
-        BLOCK_L=BLOCK_L,
-        GROUP_SIZE_C=GROUP_SIZE_C,
-        NUM_GROUPS=NUM_GROUPS,
-        HAS_BIAS=HAS_BIAS,
-        USE_TILE_IDS=use_tile_ids,
+        x_nlc, w_kc, bias_arg, y,
+        ag_mask_buf, tile_class_buf, active_ids, N,
+        C_IN=C_IN, C_OUT=C_OUT, L_IN=L_IN, L_OUT=L_OUT,
+        KS=KS, STRIDE=stride, PADDING=padding,
+        GL=GL, BLOCK_L=BLOCK_L,
+        GROUP_SIZE_C=GROUP_SIZE_C, NUM_GROUPS=NUM_GROUPS,
+        HAS_BIAS=HAS_BIAS, USE_TILE_IDS=use_tile_ids,
     )
 
     if return_ms:
