@@ -1021,7 +1021,7 @@ def _make_pool_decision(
     op_type: str,
     pool_module: Optional[Any] = None,
 ) -> DispatchDecision:
-    """DispatchDecision for MaxPool2d / AvgPool2d layers (Round 5.5b).
+    """DispatchDecision for pool layers when sparse pool replacement is off.
 
     Pool operators have zero MACs, so the MAC-centric EGD cost model
     (`S_l = R_l × I_l` with I_l = MACs / N_tiles) is undefined for them.
@@ -1085,12 +1085,12 @@ def _make_pool_decision(
     return DispatchDecision(
         layer_name=layer_name,
         backend="dense",
-        reason=f"pool_default_dense_{op_type}",
-        reason_code="pool_default_dense",
-        fallback_reason="pool_default_dense",
+        reason=f"pool_replacement_disabled_{op_type}",
+        reason_code="pool_replacement_disabled",
+        fallback_reason="pool_replacement_disabled",
         meta_source="shortcut",
         diag_source="shortcut",
-        support_status="supported",
+        support_status="unsupported_op",
         score_family="pool",
         tile_source="unknown",
         confidence=1.0,

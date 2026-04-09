@@ -25,16 +25,11 @@ Round 5.5a cleanup (no semantic changes):
     `attention_linear`) is preserved — those 5 variants still have distinct
     meaning inside `SparseAttention.from_dense(variant=...)`.
 
-Round 5.5b (additive — Pool2d integration):
-  - Added `maxpool2d` / `avgpool2d` branches in `_create_sparse_module`
-    that call `SparseMaxPool2d.from_dense(...)` / `SparseAvgPool2d.from_dense(...)`.
-    Pool modules are parameterless so the `.to(mod.weight.device)` tail
-    used for conv branches is omitted.
-  - `_score_family_from_op` now returns `"pool"` for pool op_types, matching
-    the `self.score_family = "pool"` field that both pool Ops hardcode
-    internally.
-  - `_log_replacement` emits a dedicated pool format showing kernel / stride
-    / input HxW.
+Round 8 cleanup (pool replacement disabled):
+  - MaxPool2d / AvgPool2d are no longer replaced by SparseFlow at the
+    framework level.
+  - If a stale or manually-constructed pool target reaches `replace()`, it
+    is kept on the original dense module and reported as unsupported.
 
 Round 7 (breaking cleanup — back-compat shims removed):
   - Dropped the `enable_fused_conv_lif` kwarg from `replace()`. Callers
@@ -59,8 +54,6 @@ if _PROJECT_ROOT not in sys.path:
 from Core.analyzer import ReplacementTarget, display_block_info
 from Ops.sparse_conv2d import SparseConv2d
 from Ops.sparse_attention_block import SparseAttentionBlock
-from Ops.sparse_maxpool2d import SparseMaxPool2d
-from Ops.sparse_avgpool2d import SparseAvgPool2d
 from Ops.static_zero_conv2d import StaticZeroConv2d
 from Ops.static_zero_linear import StaticZeroLinear
 
@@ -79,6 +72,11 @@ _ATTENTION_OP_TYPES = (
     "attention_qkmix",
     "attention_matmul",
     "attention_proj_linear",
+)
+
+_POOL_OP_TYPES = (
+    "maxpool2d",
+    "avgpool2d",
 )
 
 
@@ -196,6 +194,12 @@ class ModuleReplacer:
             module_name = target.conv_name
             op = target.op_type
 
+            if op in _POOL_OP_TYPES:
+                dense_keep_count += 1
+                if self.verbose:
+                    print(f"  [KEEP   ] {module_name} ({op}) -> DenseKeep (pool replacement disabled)")
+                continue
+
             # StaticZero shortcut
             can_use_static_zero = (
                 (not disable_static_zero)
@@ -296,34 +300,6 @@ class ModuleReplacer:
                 return_ms=common_return_ms,
             )
             return _apply_common(sparse).to(mod.weight.device)
-
-        # ---- maxpool2d ----
-        if op == "maxpool2d":
-            if not isinstance(mod, nn.MaxPool2d):
-                return None
-            if bool(getattr(mod, "return_indices", False)):
-                return None
-            if bool(getattr(mod, "ceil_mode", False)):
-                return None
-            sparse = SparseMaxPool2d.from_dense(
-                mod,
-                threshold=common_threshold,
-                return_ms=common_return_ms,
-            )
-            return _apply_common(sparse)
-
-        # ---- avgpool2d ----
-        if op == "avgpool2d":
-            if not isinstance(mod, nn.AvgPool2d):
-                return None
-            if bool(getattr(mod, "ceil_mode", False)):
-                return None
-            sparse = SparseAvgPool2d.from_dense(
-                mod,
-                threshold=common_threshold,
-                return_ms=common_return_ms,
-            )
-            return _apply_common(sparse)
 
         # ---- conv1d ----
         if op == "conv1d":

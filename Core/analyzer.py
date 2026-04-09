@@ -24,15 +24,13 @@ Round 4 cleanup (no semantic changes):
     `hasattr(t, "lif_name")` continues to work unchanged.
   - Removed fused op_type entries from `display_block_info`.
 
-Round 5.5b (additive — Pool2d integration):
-  - `nn.MaxPool2d` and `nn.AvgPool2d` were removed from the transparent
-    whitelist and are now detected as replaceable targets by the three
-    discovery paths (fx BFS, runtime-order hook trace, linear fallback).
-  - Added `_is_maxpool2d_node` / `_is_avgpool2d_node` predicates and
-    `_make_maxpool2d_target` / `_make_avgpool2d_target` factories; these
-    emit `op_type="maxpool2d"` / `"avgpool2d"`, matched by Core/replacer
-    and short-circuited by Utils/dispatch_model's pool branch.
-  - The other pool types (Adaptive*, 1d, 3d) remain transparent.
+Round 6 cleanup (pool replacement disabled):
+  - `nn.MaxPool2d` and `nn.AvgPool2d` are treated as transparent again and
+    are no longer emitted as replacement targets by any discovery path.
+  - This keeps pool layers on their native dense implementation and removes
+    them from SparseFlow's analyzer/replacer/dispatch optimization chain.
+  - The sparse pool operator implementations remain in the repository, but
+    the framework no longer routes models into them.
 """
 
 import sys
@@ -81,17 +79,15 @@ _TRANSPARENT_MODULES = (
     nn.Flatten,
     nn.AdaptiveAvgPool1d, nn.AdaptiveAvgPool2d, nn.AdaptiveAvgPool3d,
     nn.AdaptiveMaxPool1d, nn.AdaptiveMaxPool2d, nn.AdaptiveMaxPool3d,
-    nn.AvgPool1d, nn.AvgPool3d,
-    nn.MaxPool1d, nn.MaxPool3d,
+    nn.AvgPool1d, nn.AvgPool2d, nn.AvgPool3d,
+    nn.MaxPool1d, nn.MaxPool2d, nn.MaxPool3d,
     nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
     nn.ReLU, nn.ReLU6, nn.LeakyReLU, nn.GELU, nn.SiLU,
     nn.Sequential,
 )
-# NOTE (Round 5.5b): nn.MaxPool2d and nn.AvgPool2d were removed from this
-# whitelist and are now detected as replacement targets in their own right
-# by _is_maxpool2d_node / _is_avgpool2d_node below. The other pool types
-# (Adaptive*, 1d, 3d) remain transparent — only 2d pools have sparse
-# kernel backends (Kernels/maxpool2d.py, Kernels/avgpool2d.py).
+# Pool layers are intentionally transparent. SparseFlow currently optimizes
+# conv / linear / attention paths only; 2d pool replacement is disabled at
+# the framework level because it regressed benchmark latency.
 
 
 # =============================================================================
@@ -408,16 +404,6 @@ class NetworkAnalyzer:
                 if name not in visited:
                     found.append((name, "linear"))
                 continue
-            if _is_maxpool2d_node(node, modules_dict):
-                name = node.target
-                if name not in visited:
-                    found.append((name, "maxpool2d"))
-                continue
-            if _is_avgpool2d_node(node, modules_dict):
-                name = node.target
-                if name not in visited:
-                    found.append((name, "avgpool2d"))
-                continue
             if _is_attention_node(node, modules_dict):
                 name = node.target
                 if name not in visited:
@@ -454,10 +440,6 @@ class NetworkAnalyzer:
                 return "conv3d"
             if isinstance(mod, nn.Linear):
                 return "linear"
-            if isinstance(mod, nn.MaxPool2d):
-                return "maxpool2d"
-            if isinstance(mod, nn.AvgPool2d):
-                return "avgpool2d"
             if _is_attention_like_module(mod):
                 return "attention"
             return None
@@ -548,10 +530,6 @@ class NetworkAnalyzer:
                     target_type = "conv3d"
                 elif isinstance(next_module, nn.Linear):
                     target_type = "linear"
-                elif isinstance(next_module, nn.MaxPool2d):
-                    target_type = "maxpool2d"
-                elif isinstance(next_module, nn.AvgPool2d):
-                    target_type = "avgpool2d"
                 elif _is_attention_like_module(next_module):
                     target_type = "attention"
                 else:
@@ -592,10 +570,6 @@ class NetworkAnalyzer:
             return self._make_linear_target(module_name, module, spike_name)
         if target_type == "attention":
             return self._make_attention_target(module_name, module, spike_name, input_shapes)
-        if target_type == "maxpool2d":
-            return self._make_maxpool2d_target(module_name, module, spike_name, input_shapes)
-        if target_type == "avgpool2d":
-            return self._make_avgpool2d_target(module_name, module, spike_name, input_shapes)
         return None
 
     def _make_conv2d_target(
@@ -755,25 +729,7 @@ class NetworkAnalyzer:
         spike_name: str,
         input_shapes: dict,
     ) -> Optional[ReplacementTarget]:
-        if not isinstance(module, nn.MaxPool2d):
-            return None
-        if bool(getattr(module, "return_indices", False)):
-            return None
-        if bool(getattr(module, "ceil_mode", False)):
-            return None
-        h, w = self._extract_hw(input_shapes.get(name))
-        # Very small feature maps: dispatch/launch overhead dominates.
-        if h > 0 and w > 0 and min(h, w) < 4:
-            return None
-        return ReplacementTarget(
-            conv_name=name,
-            conv_module=module,
-            spike_name=spike_name,
-            op_type="maxpool2d",
-            block_size=None,
-            input_h=h,
-            input_w=w,
-        )
+        return None
 
     def _make_avgpool2d_target(
         self,
@@ -782,22 +738,7 @@ class NetworkAnalyzer:
         spike_name: str,
         input_shapes: dict,
     ) -> Optional[ReplacementTarget]:
-        if not isinstance(module, nn.AvgPool2d):
-            return None
-        if bool(getattr(module, "ceil_mode", False)):
-            return None
-        h, w = self._extract_hw(input_shapes.get(name))
-        if h > 0 and w > 0 and min(h, w) < 4:
-            return None
-        return ReplacementTarget(
-            conv_name=name,
-            conv_module=module,
-            spike_name=spike_name,
-            op_type="avgpool2d",
-            block_size=None,
-            input_h=h,
-            input_w=w,
-        )
+        return None
 
     # ----------------------------------------------------------------
     # Shape extractors
