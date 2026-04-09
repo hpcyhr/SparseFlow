@@ -1016,7 +1016,11 @@ def _make_staticzero_decision(layer_name: str) -> DispatchDecision:
     )
 
 
-def _make_pool_decision(layer_name: str, op_type: str) -> DispatchDecision:
+def _make_pool_decision(
+    layer_name: str,
+    op_type: str,
+    pool_module: Optional[Any] = None,
+) -> DispatchDecision:
     """DispatchDecision for MaxPool2d / AvgPool2d layers (Round 5.5b).
 
     Pool operators have zero MACs, so the MAC-centric EGD cost model
@@ -1026,10 +1030,55 @@ def _make_pool_decision(layer_name: str, op_type: str) -> DispatchDecision:
     a cheap tile-zero fast path and degrade gracefully to dense on tiles
     with activity. There is no hysteresis and no per-layer calibration.
 
-    This short-circuit fires after the `staticzero` check in
-    `dispatch_all_layers`, so an exact-zero pool input still falls through
-    to StaticZero (which is cheaper than sparse pool compute).
+    Only the currently supported sparse-pool semantics are marked sparse:
+      - `ceil_mode=False` for both MaxPool2d and AvgPool2d
+      - `return_indices=False` for MaxPool2d
+    Unsupported pool variants are forced to dense so reports match runtime.
     """
+    if pool_module is not None:
+        if bool(getattr(pool_module, "ceil_mode", False)):
+            return DispatchDecision(
+                layer_name=layer_name,
+                backend="dense",
+                reason=f"unsupported_pool_ceil_mode_{op_type}",
+                reason_code="unsupported_pool_ceil_mode",
+                fallback_reason="unsupported_pool_ceil_mode",
+                meta_source="shortcut",
+                diag_source="shortcut",
+                support_status="unsupported_op",
+                score_family="pool",
+                tile_source="unknown",
+                confidence=1.0,
+                agr=0.0,
+                tzr=0.0,
+                R_l=0.0,
+                agr_nz=0.0,
+                score_sparse=0.0,
+                denseish_ratio=0.0,
+                sparse_tile_ratio=0.0,
+            )
+        if op_type == "maxpool2d" and bool(getattr(pool_module, "return_indices", False)):
+            return DispatchDecision(
+                layer_name=layer_name,
+                backend="dense",
+                reason="unsupported_pool_return_indices_maxpool2d",
+                reason_code="unsupported_pool_return_indices",
+                fallback_reason="unsupported_pool_return_indices",
+                meta_source="shortcut",
+                diag_source="shortcut",
+                support_status="unsupported_op",
+                score_family="pool",
+                tile_source="unknown",
+                confidence=1.0,
+                agr=0.0,
+                tzr=0.0,
+                R_l=0.0,
+                agr_nz=0.0,
+                score_sparse=0.0,
+                denseish_ratio=0.0,
+                sparse_tile_ratio=0.0,
+            )
+
     return DispatchDecision(
         layer_name=layer_name,
         backend="sparse",
@@ -1081,13 +1130,16 @@ def dispatch_all_layers(
         if not name:
             continue
 
-        if name in zero_layers:
-            decisions[name] = _make_staticzero_decision(name)
-            continue
-
         op_type = str(_target_get(t, "op_type", ""))
         if op_type in _POOL_OPS:
-            decisions[name] = _make_pool_decision(name, op_type)
+            pool_module = _target_get(t, "module")
+            if pool_module is None:
+                pool_module = _target_get(t, "conv_module")
+            decisions[name] = _make_pool_decision(name, op_type, pool_module)
+            continue
+
+        if name in zero_layers:
+            decisions[name] = _make_staticzero_decision(name)
             continue
 
         diag = group_sparsity_data.get(name, {})

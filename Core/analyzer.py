@@ -757,6 +757,10 @@ class NetworkAnalyzer:
     ) -> Optional[ReplacementTarget]:
         if not isinstance(module, nn.MaxPool2d):
             return None
+        if bool(getattr(module, "return_indices", False)):
+            return None
+        if bool(getattr(module, "ceil_mode", False)):
+            return None
         h, w = self._extract_hw(input_shapes.get(name))
         # Very small feature maps: dispatch/launch overhead dominates.
         if h > 0 and w > 0 and min(h, w) < 4:
@@ -779,6 +783,8 @@ class NetworkAnalyzer:
         input_shapes: dict,
     ) -> Optional[ReplacementTarget]:
         if not isinstance(module, nn.AvgPool2d):
+            return None
+        if bool(getattr(module, "ceil_mode", False)):
             return None
         h, w = self._extract_hw(input_shapes.get(name))
         if h > 0 and w > 0 and min(h, w) < 4:

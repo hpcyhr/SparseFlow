@@ -96,6 +96,8 @@ class SparseMaxPool2d(nn.Module):
         return_ms: bool = False,
         **kwargs,
     ):
+        if bool(getattr(pool, "return_indices", False)):
+            raise ValueError("SparseMaxPool2d does not support return_indices=True")
         stride = pool.stride if getattr(pool, "stride", None) is not None else pool.kernel_size
         return cls(
             kernel_size=pool.kernel_size,

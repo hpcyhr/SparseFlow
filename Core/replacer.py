@@ -58,7 +58,7 @@ if _PROJECT_ROOT not in sys.path:
 
 from Core.analyzer import ReplacementTarget, display_block_info
 from Ops.sparse_conv2d import SparseConv2d
-from Ops.sparse_attention import SparseAttention
+from Ops.sparse_attention_block import SparseAttentionBlock
 from Ops.sparse_maxpool2d import SparseMaxPool2d
 from Ops.sparse_avgpool2d import SparseAvgPool2d
 from Ops.static_zero_conv2d import StaticZeroConv2d
@@ -269,6 +269,8 @@ class ModuleReplacer:
         common_profile_runtime = bool(sparse_kwargs.get("profile_runtime", False))
 
         def _apply_common(sparse):
+            if hasattr(sparse, "return_ms"):
+                sparse.return_ms = common_return_ms
             if hasattr(sparse, "collect_diag"):
                 sparse.collect_diag = common_collect_diag
             if hasattr(sparse, "profile_runtime"):
@@ -299,6 +301,10 @@ class ModuleReplacer:
         if op == "maxpool2d":
             if not isinstance(mod, nn.MaxPool2d):
                 return None
+            if bool(getattr(mod, "return_indices", False)):
+                return None
+            if bool(getattr(mod, "ceil_mode", False)):
+                return None
             sparse = SparseMaxPool2d.from_dense(
                 mod,
                 threshold=common_threshold,
@@ -309,6 +315,8 @@ class ModuleReplacer:
         # ---- avgpool2d ----
         if op == "avgpool2d":
             if not isinstance(mod, nn.AvgPool2d):
+                return None
+            if bool(getattr(mod, "ceil_mode", False)):
                 return None
             sparse = SparseAvgPool2d.from_dense(
                 mod,
@@ -360,12 +368,14 @@ class ModuleReplacer:
                 variant = "attention_qkav"
             elif op == "attention_proj_linear":
                 variant = "attention_linear"
-            sparse = SparseAttention.from_dense(
-                mod, variant=variant, threshold=common_threshold,
+            sparse = SparseAttentionBlock.from_dense(
+                mod,
+                variant=variant,
+                threshold=common_threshold,
+                return_ms=common_return_ms,
+                profile_runtime=common_profile_runtime,
             )
-            if hasattr(sparse, "collect_diag"):
-                sparse.collect_diag = common_collect_diag
-            return sparse
+            return _apply_common(sparse)
 
         # ---- matmul ----
         if op == "matmul":

@@ -246,11 +246,13 @@ class SparseConv2d(nn.Module):
     # Profiling helpers (only invoked when profile_runtime is True)
     # ----------------------------------------------------------------
     def _stamp(self):
-        torch.cuda.synchronize(self.weight.device)
+        if self.profile_runtime and self.weight.is_cuda:
+            torch.cuda.synchronize(self.weight.device)
         return time.perf_counter()
 
     def _elapsed_ms(self, t0):
-        torch.cuda.synchronize(self.weight.device)
+        if self.profile_runtime and self.weight.is_cuda:
+            torch.cuda.synchronize(self.weight.device)
         return (time.perf_counter() - t0) * 1000.0
 
     def _profile_add(self, key, val):
