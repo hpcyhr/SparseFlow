@@ -100,6 +100,10 @@ from Utils.config import (
 #   overhead. 500K is a mid-range estimate.
 #   Calibrate: profile prescan latency on representative layers, convert to
 #   MACs at GPU peak throughput, and set τ_3x3 to that value.
+#   Round 4 recalibration: lowered from 500K/1M to 100K/200K after
+#   max-pool prescan rewrite (Round 2) cut per-tile prescan cost ~5x.
+#   Original values reflected unfold-based prescan; new max-pool path
+#   costs ~50-100K MAC-equivalent per tile on A100.
 TAU_3x3 = DISPATCH_TAU_3X3
 
 # τ_1x1 (TAU_1x1)
@@ -127,6 +131,7 @@ R_MIN = DISPATCH_R_MIN
 # Margins are kept explicit for future stability tuning (default none).
 R_MARGIN = DISPATCH_R_MARGIN
 TAU_MARGIN = DISPATCH_TAU_MARGIN
+R_NEAR_ONE = 0.99
 
 
 # =============================================================================
@@ -918,6 +923,19 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
 
     I_l = macs / max(n_tiles, 1.0)
     S_l = R_l * I_l
+    # --- Round 4 debug: remove after diagnosis ---
+    if meta.layer_name in ("layer3.0.conv1", "layer2.0.conv2", "layer1.0.conv1"):
+        print(
+            f"[R4-DEBUG] {meta.layer_name}: "
+            f"meta.macs={meta.macs:.3e}, meta.batch_size={meta.batch_size}, "
+            f"meta.h_out={meta.h_out}, meta.w_out={meta.w_out}, "
+            f"meta.c_in={meta.c_in}, meta.c_out={meta.c_out}, "
+            f"meta.kernel_size={meta.kernel_size}, meta.groups={meta.groups}, "
+            f"n_tiles={n_tiles:.0f} (src={tile_source}), "
+            f"I_l={I_l:.3e}, R_l={R_l:.4f}, S_l={S_l:.3e}, "
+            f"macs_estimated={macs_estimated}"
+        )
+    # --- end Round 4 debug ---
     tau, tau_family = _select_tau(meta, diag)
     tau_gate = tau * (1.0 + TAU_MARGIN)
     r_gate = R_MIN + R_MARGIN
@@ -940,6 +958,21 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
         reason_suffix += "|R_mismatch_check"
 
     # ---- decision gates ----
+    if R_l >= R_NEAR_ONE:
+        dec.backend = "sparse"
+        dec.reason_code = "R_near_one"
+        dec.reason = f"R={R_l:.4f}>={R_NEAR_ONE}{reason_suffix}"
+        dec.fallback_reason = ""
+        dec.R_l = R_l
+        dec.I_l = I_l
+        dec.S_l = S_l
+        dec.agr_nz = agr_nz
+        dec.n_tiles = n_tiles
+        dec.tau = tau
+        dec.score_sparse = S_l / tau if tau > 0 else 0.0
+        dec.confidence = max(dec.confidence, 0.95)
+        return dec
+
     if r_worst >= 0 and r_worst < r_gate:
         dec.backend = "dense"
         dec.reason_code = "R_guard_worst"
