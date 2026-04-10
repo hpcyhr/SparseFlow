@@ -634,9 +634,11 @@ def _conv_meta_from_target(
         meta_source = "fallback"
 
     h_out, w_out = infer_conv_output_hw(h_in, w_in, ks, st, pad, dil)
+    # Keep conv MACs unset at extraction time: analyzer sample inputs may use
+    # batch=1, while sparse diagnostics report real batched tile counts. The
+    # decision path estimates MACs from diag total_tile_count so I_l stays
+    # dimensionally aligned.
     macs = 0.0
-    if c_in > 0 and c_out > 0 and h_out > 0 and w_out > 0:
-        macs = estimate_conv_macs(batch_size, h_out, w_out, c_out, c_in, ks, groups)
 
     if op_hint in ("depthwise_conv2d", "grouped_conv2d"):
         op_type = op_hint
@@ -923,15 +925,6 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
         return dec
 
     I_l = macs / max(n_tiles, 1.0)
-    if meta.layer_name == "layer3.0.conv1":
-        print(
-            f"[DEBUG] {meta.layer_name}: meta.macs={meta.macs:.3e} "
-            f"meta.batch_size={meta.batch_size} "
-            f"meta.h_out={meta.h_out} meta.w_out={meta.w_out} "
-            f"meta.c_in={meta.c_in} meta.c_out={meta.c_out} "
-            f"n_tiles={n_tiles} (source={tile_source}) "
-            f"I_l={I_l:.3e}"
-        )
     S_l = R_l * I_l
     tau, tau_family = _select_tau(meta, diag)
     tau_gate = tau * (1.0 + TAU_MARGIN)
