@@ -42,8 +42,8 @@ SPARSE_DENSE_RATIO_THRESHOLD = 0.85
 # Dispatch model thresholds (execution-grounded, empirically calibrated)
 # -----------------------------------------------------------------------------
 
-DISPATCH_TAU_3X3 = 100_000
-DISPATCH_TAU_1X1 = 200_000
+DISPATCH_TAU_3X3 = 500_000
+DISPATCH_TAU_1X1 = 1_000_000
 DISPATCH_TAU_LINEAR = 800_000
 DISPATCH_TAU_ATTN_LINEAR = 900_000
 DISPATCH_TAU_ATTN_MATMUL = 1_200_000

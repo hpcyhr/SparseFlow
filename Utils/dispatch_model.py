@@ -97,14 +97,9 @@ from Utils.config import (
 #   dispatch. Prescan reads ~C_in × BLOCK_M values per tile and performs
 #   per-group activity classification. For typical layers (C_in=64..256,
 #   BLOCK_M=16..64), this is ~200K..1M MAC-equivalent memory + compute
-#   overhead in the v25 unfold-based prescan baseline.
+#   overhead. 500K is a mid-range estimate.
 #   Calibrate: profile prescan latency on representative layers, convert to
 #   MACs at GPU peak throughput, and set τ_3x3 to that value.
-#   NOTE (Round 4 recalibration): tau values lowered from the v25 baseline
-#   of 500K (3x3) and 1M (1x1) to 100K and 200K respectively, after Round 2
-#   max_pool prescan rewrite and Round 3 buffer-copy elimination cut per-tile
-#   prescan overhead by ~5x. The original 500K reflected unfold-based prescan
-#   cost; the new max_pool path runs at ~50-100K MAC-equivalent per tile.
 TAU_3x3 = DISPATCH_TAU_3X3
 
 # τ_1x1 (TAU_1x1)
@@ -132,7 +127,6 @@ R_MIN = DISPATCH_R_MIN
 # Margins are kept explicit for future stability tuning (default none).
 R_MARGIN = DISPATCH_R_MARGIN
 TAU_MARGIN = DISPATCH_TAU_MARGIN
-R_NEAR_ONE_THRESHOLD = 0.99
 
 
 # =============================================================================
@@ -634,11 +628,9 @@ def _conv_meta_from_target(
         meta_source = "fallback"
 
     h_out, w_out = infer_conv_output_hw(h_in, w_in, ks, st, pad, dil)
-    # Keep conv MACs unset at extraction time: analyzer sample inputs may use
-    # batch=1, while sparse diagnostics report real batched tile counts. The
-    # decision path estimates MACs from diag total_tile_count so I_l stays
-    # dimensionally aligned.
     macs = 0.0
+    if c_in > 0 and c_out > 0 and h_out > 0 and w_out > 0:
+        macs = estimate_conv_macs(batch_size, h_out, w_out, c_out, c_in, ks, groups)
 
     if op_hint in ("depthwise_conv2d", "grouped_conv2d"):
         op_type = op_hint
@@ -948,17 +940,6 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
         reason_suffix += "|R_mismatch_check"
 
     # ---- decision gates ----
-    # R_l near 1 short-circuit: when >=99% of dense work is provably skipped,
-    # sparse beats dense unconditionally regardless of S_l vs tau. This catches
-    # stochastic-zero layers that the staticzero re-validation pass dropped to
-    # dispatch but are functionally always-zero.
-    if R_l >= R_NEAR_ONE_THRESHOLD:
-        dec.backend = "sparse"
-        dec.reason_code = "R_near_one_shortcut"
-        dec.reason = f"R={R_l:.4f}>={R_NEAR_ONE_THRESHOLD}|sparse_unconditional{reason_suffix}"
-        dec.fallback_reason = ""
-        return dec
-
     if r_worst >= 0 and r_worst < r_gate:
         dec.backend = "dense"
         dec.reason_code = "R_guard_worst"
