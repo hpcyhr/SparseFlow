@@ -153,7 +153,9 @@ def _build_rf_prescan_metadata_impl(
     stage1_denseish = rough_mask == all_ones_mask
     stage1_uncertain = ~(stage1_zero_candidate | stage1_denseish)
 
-    any_nonzero = (tile_view.abs() > float(threshold)).any(dim=(1, 2))
+    any_nonzero = (
+        tile_view.abs() > float(threshold)
+    ).reshape(n_tiles, -1).any(dim=1)
     exact_zero = stage1_zero_candidate & (~any_nonzero)
     stage3_needed = stage1_uncertain | (stage1_zero_candidate & any_nonzero)
 
