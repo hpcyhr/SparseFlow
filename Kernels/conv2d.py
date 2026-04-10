@@ -543,10 +543,9 @@ def _build_two_stage_metadata(
         num_groups=NUM_GROUPS,
         threshold=threshold,
         return_debug_stats=(prescan_stats is not None or allow_stage1_dense_fallback),
+        tile_class_out=tile_class_buf,
+        ag_mask_out=ag_mask_buf,
     )
-
-    tile_class_buf[:N_TILES].copy_(tile_class)
-    ag_mask_buf[:N_TILES].copy_(ag_mask)
 
     if debug_stats is not None:
         stage1_summary = {

@@ -299,9 +299,9 @@ def sparse_conv1d_forward(
         group_size_c=GROUP_SIZE_C,
         num_groups=NUM_GROUPS,
         threshold=float(threshold),
+        tile_class_out=tile_class_buf,
+        ag_mask_out=ag_mask_buf,
     )
-    tile_class_buf[:N_TILES].copy_(tile_class)
-    ag_mask_buf[:N_TILES].copy_(ag_mask)
 
     avg_active_ratio = None
     tile_stats = None
