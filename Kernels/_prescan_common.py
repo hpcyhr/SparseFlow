@@ -1,28 +1,23 @@
 """
 SparseFlow internal shared receptive-field prescan helpers.
 
-This module centralizes the PyTorch vectorized three-stage prescan used by
-Conv1d / Conv2d / Conv3d sparse kernels. It is intentionally internal-only.
+This module centralizes the PyTorch vectorized prescan used by Conv1d /
+Conv2d / Conv3d sparse kernels. The implementation intentionally uses
+group-wise channel reduction plus max_pool*d instead of unfold-based receptive
+field materialization.
 """
 
 from __future__ import annotations
 
-import math
 from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
-from Utils.sparse_helpers import (
-    TILE_DENSEISH,
-    TILE_SPARSE,
-    TILE_UNCERTAIN,
-    TILE_ZERO,
-    TILE_ZERO_CANDIDATE,
-)
+from Utils.sparse_helpers import TILE_DENSEISH, TILE_SPARSE, TILE_ZERO
 
 
-def _normalize_tuple(value, ndim: int) -> Tuple[int, ...]:
+def _tuple(value, ndim: int) -> Tuple[int, ...]:
     if isinstance(value, int):
         return (int(value),) * ndim
     if len(value) != ndim:
@@ -30,85 +25,177 @@ def _normalize_tuple(value, ndim: int) -> Tuple[int, ...]:
     return tuple(int(v) for v in value)
 
 
-def _pack_group_mask(group_active: torch.Tensor) -> torch.Tensor:
-    num_groups = int(group_active.shape[-1])
-    bit_weights = (1 << torch.arange(num_groups, device=group_active.device, dtype=torch.int32))
-    return (group_active.to(torch.int32) * bit_weights).sum(dim=-1).to(torch.int32)
-
-
-def _extract_rf_windows(
+def _groupwise_amax_last_dim(
     x_channels_last: torch.Tensor,
+    group_size_c: int,
+    num_groups: int,
+) -> torch.Tensor:
+    c_in = int(x_channels_last.shape[-1])
+    c_padded = int(num_groups) * int(group_size_c)
+    if c_in < c_padded:
+        x_channels_last = F.pad(x_channels_last, (0, c_padded - c_in))
+    elif c_in > c_padded:
+        raise ValueError(f"C_in={c_in} exceeds num_groups*group_size_c={c_padded}")
+
+    grouped_shape = tuple(x_channels_last.shape[:-1]) + (int(num_groups), int(group_size_c))
+    return x_channels_last.abs().reshape(grouped_shape).amax(dim=-1)
+
+
+def _pack_group_active(group_active_last: torch.Tensor) -> torch.Tensor:
+    num_groups = int(group_active_last.shape[-1])
+    bit_weights = torch.bitwise_left_shift(
+        torch.ones(num_groups, device=group_active_last.device, dtype=torch.int32),
+        torch.arange(num_groups, device=group_active_last.device, dtype=torch.int32),
+    )
+    return (group_active_last.to(torch.int32) * bit_weights).sum(dim=-1).to(torch.int32).reshape(-1)
+
+
+def _classify_tiles(
+    group_active_last: torch.Tensor,
+    return_debug_stats: bool,
+):
+    # group_active_last shape: [N, *tile_grid, num_groups]
+    ag_mask = _pack_group_active(group_active_last)
+    any_active = group_active_last.any(dim=-1).reshape(-1)
+    all_active = group_active_last.all(dim=-1).reshape(-1)
+
+    tile_class = torch.full_like(ag_mask, TILE_SPARSE, dtype=torch.int32)
+    tile_class = torch.where(~any_active, torch.full_like(tile_class, TILE_ZERO), tile_class)
+    tile_class = torch.where(all_active, torch.full_like(tile_class, TILE_DENSEISH), tile_class)
+
+    debug_stats: Optional[Dict[str, float]] = None
+    if return_debug_stats:
+        n_tiles = int(ag_mask.numel())
+        zero_tiles = int((tile_class == TILE_ZERO).sum().item())
+        denseish_tiles = int((tile_class == TILE_DENSEISH).sum().item())
+        sparse_tiles = int((tile_class == TILE_SPARSE).sum().item())
+        debug_stats = {
+            "stage1_zero_candidate": zero_tiles,
+            "stage1_denseish": denseish_tiles,
+            "stage1_uncertain": sparse_tiles,
+            "stage1_avg_active_group_ratio_lower_bound": float(group_active_last.float().mean().item()),
+            "final_zero": zero_tiles,
+            "final_sparse": sparse_tiles,
+            "final_denseish": denseish_tiles,
+            "stage2_zero_refine_tiles": 0,
+            "stage2_uncertain_tiles": 0,
+            "total_tiles": n_tiles,
+        }
+
+    return tile_class.contiguous(), ag_mask.contiguous(), debug_stats
+
+
+def _can_skip_rf_pool(kernel_dims: Tuple[int, ...], stride: Tuple[int, ...], padding: Tuple[int, ...]) -> bool:
+    return all(k == 1 for k in kernel_dims) and all(s == 1 for s in stride) and all(p == 0 for p in padding)
+
+
+def _prescan_1d_impl(
+    x_channels_last: torch.Tensor,
+    spatial_dims: Tuple[int, ...],
     kernel_dims: Tuple[int, ...],
     stride: Tuple[int, ...],
     padding: Tuple[int, ...],
-) -> Tuple[torch.Tensor, Tuple[int, ...]]:
-    spatial_ndim = len(kernel_dims)
-    x_channels_first = x_channels_last.movedim(-1, 1).contiguous()
-
-    if any(padding):
-        pad_args = []
-        for pad in reversed(padding):
-            pad_args.extend([pad, pad])
-        x_channels_first = F.pad(x_channels_first, tuple(pad_args))
-
-    unfolded = x_channels_first
-    for dim, (kernel_size, step) in enumerate(zip(kernel_dims, stride), start=2):
-        unfolded = unfolded.unfold(dim, kernel_size, step)
-
-    out_dims = tuple(int(unfolded.shape[dim]) for dim in range(2, 2 + spatial_ndim))
-    permute_order = (
-        [0]
-        + list(range(2, 2 + spatial_ndim))
-        + list(range(2 + spatial_ndim, 2 + 2 * spatial_ndim))
-        + [1]
-    )
-    patches = unfolded.permute(permute_order).contiguous()
-    return patches, out_dims
-
-
-def _tile_rf_windows(
-    patches: torch.Tensor,
-    spatial_dims: Tuple[int, ...],
     block_dims: Tuple[int, ...],
-) -> Tuple[torch.Tensor, Tuple[int, ...]]:
-    spatial_ndim = len(spatial_dims)
-    kernel_dims = tuple(int(patches.shape[1 + spatial_ndim + i]) for i in range(spatial_ndim))
-    padded_spatial = tuple(
-        int(math.ceil(float(spatial) / float(block)) * block)
-        for spatial, block in zip(spatial_dims, block_dims)
+    group_size_c: int,
+    num_groups: int,
+    threshold: float,
+    return_debug_stats: bool,
+):
+    group_max = _groupwise_amax_last_dim(x_channels_last, group_size_c, num_groups)
+    group_max_ncl = group_max.permute(0, 2, 1).contiguous()
+    if _can_skip_rf_pool(kernel_dims, stride, padding):
+        rf_max = group_max_ncl
+    else:
+        rf_max = F.max_pool1d(
+            group_max_ncl,
+            kernel_size=kernel_dims[0],
+            stride=stride[0],
+            padding=padding[0],
+        )
+    if int(rf_max.shape[-1]) != int(spatial_dims[0]):
+        raise ValueError(f"Output spatial mismatch: expected {spatial_dims}, got {(int(rf_max.shape[-1]),)}")
+    tile_max = F.max_pool1d(
+        rf_max,
+        kernel_size=block_dims[0],
+        stride=block_dims[0],
+        ceil_mode=True,
     )
-    grid_dims = tuple(padded // block for padded, block in zip(padded_spatial, block_dims))
+    group_active_last = (tile_max > float(threshold)).permute(0, 2, 1)
+    return _classify_tiles(group_active_last, return_debug_stats)
 
-    padded_shape = (int(patches.shape[0]),) + padded_spatial + kernel_dims + (int(patches.shape[-1]),)
-    padded = patches.new_zeros(padded_shape)
-    valid_index = (
-        (slice(None),)
-        + tuple(slice(0, spatial) for spatial in spatial_dims)
-        + tuple(slice(None) for _ in kernel_dims)
-        + (slice(None),)
+
+def _prescan_2d_impl(
+    x_channels_last: torch.Tensor,
+    spatial_dims: Tuple[int, ...],
+    kernel_dims: Tuple[int, ...],
+    stride: Tuple[int, ...],
+    padding: Tuple[int, ...],
+    block_dims: Tuple[int, ...],
+    group_size_c: int,
+    num_groups: int,
+    threshold: float,
+    return_debug_stats: bool,
+):
+    group_max = _groupwise_amax_last_dim(x_channels_last, group_size_c, num_groups)
+    group_max_nchw = group_max.permute(0, 3, 1, 2).contiguous()
+    if _can_skip_rf_pool(kernel_dims, stride, padding):
+        rf_max = group_max_nchw
+    else:
+        rf_max = F.max_pool2d(
+            group_max_nchw,
+            kernel_size=kernel_dims,
+            stride=stride,
+            padding=padding,
+        )
+    if tuple(int(v) for v in rf_max.shape[-2:]) != tuple(int(v) for v in spatial_dims):
+        raise ValueError(
+            f"Output spatial mismatch: expected {tuple(spatial_dims)}, got {tuple(int(v) for v in rf_max.shape[-2:])}"
+        )
+    tile_max = F.max_pool2d(
+        rf_max,
+        kernel_size=block_dims,
+        stride=block_dims,
+        ceil_mode=True,
     )
-    padded[valid_index] = patches
+    group_active_last = (tile_max > float(threshold)).permute(0, 2, 3, 1)
+    return _classify_tiles(group_active_last, return_debug_stats)
 
-    reshape_dims = [int(patches.shape[0])]
-    for padded_spatial_dim, block_dim in zip(padded_spatial, block_dims):
-        reshape_dims.extend([padded_spatial_dim // block_dim, block_dim])
-    reshape_dims.extend(kernel_dims)
-    reshape_dims.append(int(patches.shape[-1]))
-    tiled = padded.reshape(*reshape_dims)
 
-    permute_order = (
-        [0]
-        + [1 + 2 * i for i in range(spatial_ndim)]
-        + [2 + 2 * i for i in range(spatial_ndim)]
-        + list(range(1 + 2 * spatial_ndim, 1 + 3 * spatial_ndim))
-        + [1 + 3 * spatial_ndim]
+def _prescan_3d_impl(
+    x_channels_last: torch.Tensor,
+    spatial_dims: Tuple[int, ...],
+    kernel_dims: Tuple[int, ...],
+    stride: Tuple[int, ...],
+    padding: Tuple[int, ...],
+    block_dims: Tuple[int, ...],
+    group_size_c: int,
+    num_groups: int,
+    threshold: float,
+    return_debug_stats: bool,
+):
+    group_max = _groupwise_amax_last_dim(x_channels_last, group_size_c, num_groups)
+    group_max_ncdhw = group_max.permute(0, 4, 1, 2, 3).contiguous()
+    if _can_skip_rf_pool(kernel_dims, stride, padding):
+        rf_max = group_max_ncdhw
+    else:
+        rf_max = F.max_pool3d(
+            group_max_ncdhw,
+            kernel_size=kernel_dims,
+            stride=stride,
+            padding=padding,
+        )
+    if tuple(int(v) for v in rf_max.shape[-3:]) != tuple(int(v) for v in spatial_dims):
+        raise ValueError(
+            f"Output spatial mismatch: expected {tuple(spatial_dims)}, got {tuple(int(v) for v in rf_max.shape[-3:])}"
+        )
+    tile_max = F.max_pool3d(
+        rf_max,
+        kernel_size=block_dims,
+        stride=block_dims,
+        ceil_mode=True,
     )
-    tiled = tiled.permute(permute_order).contiguous()
-
-    rf_elems = int(math.prod(block_dims) * math.prod(kernel_dims))
-    tile_shape = (int(patches.shape[0]),) + grid_dims
-    tile_flat = tiled.reshape(*tile_shape, rf_elems, int(patches.shape[-1]))
-    return tile_flat, grid_dims
+    group_active_last = (tile_max > float(threshold)).permute(0, 2, 3, 4, 1)
+    return _classify_tiles(group_active_last, return_debug_stats)
 
 
 def _build_rf_prescan_metadata_impl(
@@ -129,80 +216,28 @@ def _build_rf_prescan_metadata_impl(
             f"Expected channels-last tensor with {spatial_ndim + 2} dims, got {tuple(x_channels_last.shape)}"
         )
 
-    stride_t = _normalize_tuple(stride, spatial_ndim)
-    padding_t = _normalize_tuple(padding, spatial_ndim)
+    spatial_dims = _tuple(spatial_dims, spatial_ndim)
+    kernel_dims = _tuple(kernel_dims, spatial_ndim)
+    stride = _tuple(stride, spatial_ndim)
+    padding = _tuple(padding, spatial_ndim)
+    block_dims = _tuple(block_dims, spatial_ndim)
 
-    patches, out_dims = _extract_rf_windows(x_channels_last, kernel_dims, stride_t, padding_t)
-    if tuple(int(v) for v in out_dims) != tuple(int(v) for v in spatial_dims):
-        raise ValueError(
-            f"Output spatial mismatch: expected {tuple(spatial_dims)}, got {tuple(out_dims)}"
+    if spatial_ndim == 1:
+        return _prescan_1d_impl(
+            x_channels_last, spatial_dims, kernel_dims, stride, padding,
+            block_dims, group_size_c, num_groups, threshold, return_debug_stats,
         )
-
-    tile_flat, grid_dims = _tile_rf_windows(patches, tuple(int(v) for v in spatial_dims), block_dims)
-    c_in = int(tile_flat.shape[-1])
-    n_tiles = int(tile_flat.numel() // (tile_flat.shape[-2] * tile_flat.shape[-1]))
-    tile_view = tile_flat.reshape(n_tiles, int(tile_flat.shape[-2]), c_in)
-
-    rep_idx = torch.arange(num_groups, device=tile_flat.device, dtype=torch.long) * int(group_size_c)
-    rep_vals = tile_view.index_select(-1, rep_idx)
-    rep_group_active = (rep_vals.abs() > float(threshold)).any(dim=1)
-    rough_mask = _pack_group_mask(rep_group_active)
-    all_ones_mask = (1 << num_groups) - 1
-
-    stage1_zero_candidate = rough_mask == 0
-    stage1_denseish = rough_mask == all_ones_mask
-    stage1_uncertain = ~(stage1_zero_candidate | stage1_denseish)
-
-    any_nonzero = (
-        tile_view.abs() > float(threshold)
-    ).reshape(n_tiles, -1).any(dim=1)
-    exact_zero = stage1_zero_candidate & (~any_nonzero)
-    stage3_needed = stage1_uncertain | (stage1_zero_candidate & any_nonzero)
-
-    padded_c = num_groups * int(group_size_c)
-    if padded_c != c_in:
-        tile_view_padded = tile_view.new_zeros((n_tiles, int(tile_view.shape[1]), padded_c))
-        tile_view_padded[..., :c_in] = tile_view
-    else:
-        tile_view_padded = tile_view
-    group_view = tile_view_padded.reshape(n_tiles, int(tile_view.shape[1]), num_groups, int(group_size_c))
-    exact_group_active = (group_view.abs() > float(threshold)).any(dim=-1).any(dim=1)
-    exact_mask = _pack_group_mask(exact_group_active)
-
-    ag_mask = torch.where(stage3_needed, exact_mask, rough_mask.clone())
-    ag_mask = torch.where(exact_zero, torch.zeros_like(ag_mask), ag_mask).to(torch.int32)
-
-    tile_class = torch.full_like(ag_mask, fill_value=TILE_SPARSE, dtype=torch.int32)
-    tile_class = torch.where(exact_zero, torch.full_like(tile_class, TILE_ZERO), tile_class)
-    tile_class = torch.where(stage1_denseish, torch.full_like(tile_class, TILE_DENSEISH), tile_class)
-    tile_class = torch.where(ag_mask == 0, torch.full_like(tile_class, TILE_ZERO), tile_class)
-    tile_class = torch.where(
-        (ag_mask == all_ones_mask) & (~exact_zero),
-        torch.full_like(tile_class, TILE_DENSEISH),
-        tile_class,
-    )
-    tile_class = torch.where(
-        (tile_class != TILE_ZERO) & (tile_class != TILE_DENSEISH),
-        torch.full_like(tile_class, TILE_SPARSE),
-        tile_class,
-    )
-
-    debug_stats: Optional[Dict[str, float]] = None
-    if return_debug_stats:
-        stage1_active_count = int(rep_group_active.to(torch.int32).sum().item())
-        debug_stats = {
-            "stage1_zero_candidate": int(stage1_zero_candidate.to(torch.int32).sum().item()),
-            "stage1_denseish": int(stage1_denseish.to(torch.int32).sum().item()),
-            "stage1_uncertain": int(stage1_uncertain.to(torch.int32).sum().item()),
-            "stage1_avg_active_group_ratio_lower_bound": float(stage1_active_count) / max(float(n_tiles * num_groups), 1.0),
-            "final_zero": int((tile_class == TILE_ZERO).to(torch.int32).sum().item()),
-            "final_sparse": int((tile_class == TILE_SPARSE).to(torch.int32).sum().item()),
-            "final_denseish": int((tile_class == TILE_DENSEISH).to(torch.int32).sum().item()),
-            "stage2_zero_refine_tiles": int(stage1_zero_candidate.to(torch.int32).sum().item()),
-            "stage2_uncertain_tiles": int(stage3_needed.to(torch.int32).sum().item()),
-        }
-
-    return tile_class.contiguous(), ag_mask.contiguous(), debug_stats
+    if spatial_ndim == 2:
+        return _prescan_2d_impl(
+            x_channels_last, spatial_dims, kernel_dims, stride, padding,
+            block_dims, group_size_c, num_groups, threshold, return_debug_stats,
+        )
+    if spatial_ndim == 3:
+        return _prescan_3d_impl(
+            x_channels_last, spatial_dims, kernel_dims, stride, padding,
+            block_dims, group_size_c, num_groups, threshold, return_debug_stats,
+        )
+    raise ValueError(f"Unsupported spatial_ndim={spatial_ndim}")
 
 
 def build_rf_prescan_metadata(
