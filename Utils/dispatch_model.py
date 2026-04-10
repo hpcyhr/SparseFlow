@@ -921,21 +921,18 @@ def make_dispatch_decision(diag: Dict[str, Any], meta: ConvMeta) -> DispatchDeci
         dec.meta_source = "fallback" if dec.meta_source == "measured" else dec.meta_source
         return dec
 
-    I_l = macs / max(n_tiles, 1.0)
-    S_l = R_l * I_l
-    # --- Round 4 debug: remove after diagnosis ---
-    if meta.layer_name in ("layer3.0.conv1", "layer2.0.conv2", "layer1.0.conv1"):
-        print(
-            f"[R4-DEBUG] {meta.layer_name}: "
-            f"meta.macs={meta.macs:.3e}, meta.batch_size={meta.batch_size}, "
-            f"meta.h_out={meta.h_out}, meta.w_out={meta.w_out}, "
-            f"meta.c_in={meta.c_in}, meta.c_out={meta.c_out}, "
-            f"meta.kernel_size={meta.kernel_size}, meta.groups={meta.groups}, "
-            f"n_tiles={n_tiles:.0f} (src={tile_source}), "
-            f"I_l={I_l:.3e}, R_l={R_l:.4f}, S_l={S_l:.3e}, "
-            f"macs_estimated={macs_estimated}"
+    # Normalize to per-image quantities to ensure I_l dimension consistency.
+    # n_tiles from diag is batched; conv MACs from meta may be per-image.
+    batch_for_tiles = max(int(meta.batch_size), 1)
+    if op_type in ("conv", "depthwise_conv2d", "grouped_conv2d") and batch_for_tiles <= 1 and n_tiles > 0:
+        n_spatial_est = max(
+            math.ceil((meta.h_out * meta.w_out) / max(float(diag.get("block_m", 64)), 1.0)),
+            1.0,
         )
-    # --- end Round 4 debug ---
+        batch_for_tiles = max(int(round(n_tiles / n_spatial_est)), 1)
+    n_tiles_per_image = max(n_tiles / batch_for_tiles, 1.0)
+    I_l = macs / n_tiles_per_image
+    S_l = R_l * I_l
     tau, tau_family = _select_tau(meta, diag)
     tau_gate = tau * (1.0 + TAU_MARGIN)
     r_gate = R_MIN + R_MARGIN
