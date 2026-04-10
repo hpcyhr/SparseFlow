@@ -20,4 +20,5 @@ python bench_4test.py \
   --layer_profile_batches 20 \
   --data_root /home/yhr/SparseFlow/data/imagenet_val_flat \
   --v_threshold 0.5 \
-  --replace_all_ops
+  --replace_all_ops \
+  --inference_mode

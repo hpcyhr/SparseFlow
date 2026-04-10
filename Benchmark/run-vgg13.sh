@@ -11,15 +11,10 @@ python bench_4test.py \
 --seed 42 \
 --spike_mode normalized_bernoulli \
 --replace_all_ops \
---layer_profile \
---layer_profile_warmup 10 \
---layer_profile_batches 157 \
---warmup 10 \
---verify_batches 157 \
---sparsity_batches 157 \
 --data_root /home/yhr/SparseFlow/data/imagenet_val_flat \
+--inference_mode \
 --v_threshold 1.0 \
---out_json vgg13-t8-b32-1.0.json > run1.0.log 2>&1 &
+--out_json vgg13-t8-b32-1.0.json &
 
 # 任务2：GPU1 → v=0.75
 python bench_4test.py \
@@ -32,15 +27,10 @@ python bench_4test.py \
 --seed 42 \
 --spike_mode normalized_bernoulli \
 --replace_all_ops \
---layer_profile \
---layer_profile_warmup 10 \
---layer_profile_batches 157 \
---warmup 10 \
---verify_batches 157 \
---sparsity_batches 157 \
 --data_root /home/yhr/SparseFlow/data/imagenet_val_flat \
+--inference_mode \
 --v_threshold 0.75 \
---out_json vgg13-t8-b32-0.75.json > run0.75.log 2>&1 &
+--out_json vgg13-t8-b32-0.75.json &
 
 # 任务3：GPU2 → v=0.5
 python bench_4test.py \
@@ -53,15 +43,10 @@ python bench_4test.py \
 --seed 42 \
 --spike_mode normalized_bernoulli \
 --replace_all_ops \
---layer_profile \
---layer_profile_warmup 10 \
---layer_profile_batches 157 \
---warmup 10 \
---verify_batches 157 \
---sparsity_batches 157 \
 --data_root /home/yhr/SparseFlow/data/imagenet_val_flat \
+--inference_mode \
 --v_threshold 0.5 \
---out_json vgg13-t8-b32-0.5.json > run0.5.log 2>&1 &
+--out_json vgg13-t8-b32-0.5.json &
 
 # 任务4：GPU3 → v=0.25
 python bench_4test.py \
@@ -74,15 +59,12 @@ python bench_4test.py \
 --seed 42 \
 --spike_mode normalized_bernoulli \
 --replace_all_ops \
---layer_profile \
---layer_profile_warmup 10 \
---layer_profile_batches 157 \
---warmup 10 \
---verify_batches 157 \
---sparsity_batches 157 \
 --data_root /home/yhr/SparseFlow/data/imagenet_val_flat \
+--inference_mode \
 --v_threshold 0.25 \
---out_json vgg13-t8-b32-0.25.json > run0.25.log 2>&1 &
+--out_json vgg13-t8-b32-0.25.json &
 
 echo "4个任务已全部后台启动！"
 echo "查看运行状态：watch -n 1 nvidia-smi"
+
+
