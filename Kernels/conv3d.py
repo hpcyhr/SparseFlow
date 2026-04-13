@@ -283,6 +283,7 @@ def sparse_conv3d_forward(
     C_OUT = int(weight.shape[0])
     device = x.device
     HAS_BIAS = bias is not None
+    out_dtype = x.dtype
 
     D_OUT = (D_IN + 2 * padding - dilation * (KD - 1) - 1) // stride + 1
     H_OUT = (H_IN + 2 * padding - dilation * (KH - 1) - 1) // stride + 1
@@ -418,9 +419,9 @@ def sparse_conv3d_forward(
     if not launch_all_tiles:
         ids, n_active = _build_active_tile_ids(tile_class_buf, N_TILES)
         if n_active == 0:
-            y = torch.zeros((N, C_OUT, D_OUT, H_OUT, W_OUT), device=device, dtype=torch.float32)
+            y = torch.zeros((N, C_OUT, D_OUT, H_OUT, W_OUT), device=device, dtype=out_dtype)
             if HAS_BIAS:
-                y += bias.float().view(1, C_OUT, 1, 1, 1)
+                y += bias.to(y.dtype).view(1, C_OUT, 1, 1, 1)
             if return_ms:
                 end_evt.record()
                 torch.cuda.synchronize(device)
@@ -447,16 +448,16 @@ def sparse_conv3d_forward(
         .to(torch.float16)
         .view(C_OUT, KD * KH * KW * C_IN)
     )
-    bias_arg = (
-        bias.to(torch.float32) if bias is not None
-        else torch.empty(1, dtype=torch.float32, device=device)
-    )
 
     # ---- Stage 2: compute ----
     # [C.3] Pre-fill bias so TILE_ZERO tiles (early-return in kernel) are correct.
-    y = torch.empty((N, C_OUT, D_OUT, H_OUT, W_OUT), device=device, dtype=torch.float32)
+    y = torch.empty((N, C_OUT, D_OUT, H_OUT, W_OUT), device=device, dtype=out_dtype)
+    bias_arg = (
+        bias.detach().to(y.dtype) if bias is not None
+        else torch.empty(1, dtype=y.dtype, device=device)
+    )
     if HAS_BIAS:
-        y.copy_(bias.float().view(1, C_OUT, 1, 1, 1).expand(N, C_OUT, D_OUT, H_OUT, W_OUT))
+        y.copy_(bias.to(y.dtype).view(1, C_OUT, 1, 1, 1).expand(N, C_OUT, D_OUT, H_OUT, W_OUT))
     else:
         y.zero_()
 

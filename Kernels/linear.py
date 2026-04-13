@@ -478,6 +478,7 @@ def sparse_linear_forward(
     N, C_IN = x.shape
     C_OUT = weight.shape[0]
     device = x.device
+    out_dtype = x.dtype
 
     need_stats = return_avg_active_ratio or return_tile_stats
 
@@ -526,7 +527,7 @@ def sparse_linear_forward(
         return _finalize_return(y, dense_ms, avg_active_ratio_val, tile_stats_val, bm)
 
     def _zero_tiles_output(reason, tile_stats_val=None, backend_meta_extra=None):
-        y = torch.zeros(N, C_OUT, dtype=torch.float16, device=device)
+        y = torch.zeros(N, C_OUT, dtype=out_dtype, device=device)
         if bias is not None:
             y = y + bias.detach().to(y.dtype).view(1, -1)
         bm = {"backend": "zero_tiles_only", "reason": reason}
@@ -539,7 +540,7 @@ def sparse_linear_forward(
         return _dense_fallback(reason="expected_2d_input")
 
     if C_IN <= 0 or C_OUT <= 0 or N <= 0:
-        y = torch.zeros(max(N, 0), max(C_OUT, 0), dtype=torch.float16, device=device)
+        y = torch.zeros(max(N, 0), max(C_OUT, 0), dtype=out_dtype, device=device)
         bm = {"backend": "zero_tiles_only", "reason": "empty_shape", "total_tiles": 0}
         return _finalize_return(y, 0.0, 0.0, None, bm)
 
@@ -717,8 +718,11 @@ def sparse_linear_forward(
             active_tiles_for_meta = int(active_tile_count)
 
     w_t_f16 = w_t if w_t is not None else weight.half().t().contiguous()
-    bias_arg = bias.detach().float() if bias is not None else torch.empty(1, dtype=torch.float32, device=device)
-    y = torch.empty(N, C_OUT, dtype=torch.float16, device=device)
+    y = torch.empty(N, C_OUT, dtype=out_dtype, device=device)
+    bias_arg = (
+        bias.detach().to(y.dtype) if bias is not None
+        else torch.empty(1, dtype=y.dtype, device=device)
+    )
 
     sparse_ms = 0.0
     if return_ms:

@@ -347,6 +347,7 @@ def sparse_fused_conv_lif_forward(
     N, C_IN, H, W = x.shape
     C_OUT = weight.shape[0]
     device = x.device
+    spike_dtype = x.dtype
 
     stride = 1
     padding = 1 if kernel_size == 3 else 0
@@ -430,10 +431,13 @@ def sparse_fused_conv_lif_forward(
         w_cl_f16 = weight.half().permute(0, 2, 3, 1).contiguous()
 
     has_bias = bias is not None
-    bias_f32 = bias.float().contiguous() if has_bias else torch.empty(1, device=device)
-    v_prev_f32 = v_prev.float().contiguous()
-    spike_out = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=torch.float16, device=device)
+    spike_out = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=spike_dtype, device=device)
     v_next = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=torch.float32, device=device)
+    v_prev_f32 = v_prev.float().contiguous()
+    bias_arg = (
+        bias.detach().to(spike_out.dtype).contiguous() if has_bias
+        else torch.empty(1, dtype=spike_out.dtype, device=device)
+    )
 
     sparse_ms = 0.0
     if return_ms:
@@ -453,7 +457,7 @@ def sparse_fused_conv_lif_forward(
     kernel[_grid](
         x_f16,
         w_cl_f16,
-        bias_f32,
+        bias_arg,
         ag_mask_buf,
         v_prev_f32,
         spike_out,

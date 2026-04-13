@@ -432,7 +432,7 @@ class SparseConv2d(nn.Module):
         k, s, p, d = self.kernel_size[0], self.stride[0], self.padding[0], self.dilation[0]
         H_OUT = (H_IN + 2 * p - d * (k - 1) - 1) // s + 1
         W_OUT = (W_IN + 2 * p - d * (k - 1) - 1) // s + 1
-        y = torch.zeros(N, self.out_channels, H_OUT, W_OUT, dtype=torch.float16, device=x.device)
+        y = torch.zeros(N, self.out_channels, H_OUT, W_OUT, dtype=x.dtype, device=x.device)
         if self.bias is not None:
             y = y + self.bias.detach().to(y.dtype).view(1, -1, 1, 1)
         return y

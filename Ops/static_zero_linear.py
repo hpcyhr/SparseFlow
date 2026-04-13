@@ -37,9 +37,9 @@ class StaticZeroLinear(nn.Module):
         self._forward_count += 1
 
         out_shape = (*x.shape[:-1], self.out_features)
-        y = torch.zeros(out_shape, dtype=torch.float32, device=x.device)
+        y = torch.zeros(out_shape, dtype=x.dtype, device=x.device)
         if self.bias_buf is not None:
-            b = self.bias_buf.to(device=x.device, dtype=torch.float32)
+            b = self.bias_buf.to(device=x.device, dtype=x.dtype)
             view_shape = [1] * (y.dim() - 1) + [self.out_features]
             y = y + b.view(*view_shape)
         return y

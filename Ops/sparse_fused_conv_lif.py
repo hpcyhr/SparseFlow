@@ -191,7 +191,7 @@ class FusedSparseConvLIF(sj_base.MemoryModule):
     def _forward_multistep(self, x):
         T, B, C, H, W = x.shape
         out_h, out_w = self._conv_output_hw(H, W)
-        out = torch.empty(T, B, self.out_channels, out_h, out_w, dtype=torch.float32, device=x.device)
+        out = torch.empty(T, B, self.out_channels, out_h, out_w, dtype=x.dtype, device=x.device)
         for t in range(T):
             out[t] = self._forward_singlestep(x[t])
         return out

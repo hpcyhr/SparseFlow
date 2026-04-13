@@ -207,7 +207,7 @@ def sparse_grouped_conv2d_forward(
     tile_class_bufs = _normalize_group_list(tile_class_bufs, groups)
     active_tile_ids_bufs = _normalize_group_list(active_tile_ids_bufs, groups)
 
-    y = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=torch.float32, device=device)
+    y = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=x.dtype, device=device)
 
     total_tiles = 0
     launch_count = 0

@@ -190,13 +190,13 @@ class SparseConv3d(nn.Module):
 
     def _fallback(self, x: torch.Tensor) -> torch.Tensor:
         return F.conv3d(
-            x.float(),
-            self.weight.float(),
-            self.bias.float() if self.bias is not None else None,
+            x,
+            self.weight,
+            self.bias,
             self.stride,
             self.padding,
             groups=self.groups,
-        ).float()
+        )
 
     def extra_repr(self):
         return (

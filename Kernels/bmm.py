@@ -209,6 +209,7 @@ def sparse_bmm_forward(
     B2, K2, N = b.shape
     assert B_dim == B2 and K == K2
     device = a.device
+    out_dtype = a.dtype
 
     need_stats = return_avg_active_ratio or return_tile_stats
 
@@ -309,7 +310,7 @@ def sparse_bmm_forward(
         return _finalize(c, 0.0, avg_ratio, stats)
 
     b_f16 = b.half().contiguous()
-    c = torch.empty(B_dim, M, N, dtype=torch.float16, device=device)
+    c = torch.empty(B_dim, M, N, dtype=out_dtype, device=device)
 
     if return_ms:
         start = torch.cuda.Event(enable_timing=True)

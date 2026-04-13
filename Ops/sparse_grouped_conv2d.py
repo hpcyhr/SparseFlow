@@ -349,14 +349,14 @@ class SparseGroupedConv2d(nn.Module):
         self._last_sparse_ms = 0.0
         self._last_dense_ms = 0.0
         return F.conv2d(
-            x.float(),
-            self.weight.float(),
-            self.bias.float() if self.bias is not None else None,
+            x,
+            self.weight,
+            self.bias,
             self.stride,
             self.padding,
             self.dilation,
             self.groups,
-        ).float()
+        )
 
     def extra_repr(self) -> str:
         return (

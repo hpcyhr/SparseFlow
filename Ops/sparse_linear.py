@@ -355,7 +355,7 @@ class SparseLinear(nn.Module):
     def _zero_output_2d(self, x2d: torch.Tensor) -> torch.Tensor:
         y = torch.zeros(
             x2d.shape[0], self.out_features,
-            dtype=torch.float16, device=x2d.device
+            dtype=x2d.dtype, device=x2d.device
         )
         if self.bias is not None:
             y = y + self.bias.detach().to(y.dtype).view(1, -1)
@@ -821,8 +821,8 @@ class SparseLinear(nn.Module):
         if self.profile_runtime:
             t0 = self._stamp()
 
-        # match SparseConv2d: fallback uses float path
-        y = F.linear(x2d.float(), self.weight.float(), self.bias.float() if self.bias is not None else None).float()
+        # Tier 0: fallback returns input dtype to keep model graph consistent
+        y = F.linear(x2d, self.weight, self.bias)
         self._last_sparse_ms = 0.0
         self.backend_family = "dense_torch"
         self.diag_path = "dense_fallback"

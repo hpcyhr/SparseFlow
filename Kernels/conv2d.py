@@ -477,6 +477,7 @@ def _fused_1x1_persistent_path(
     DENSE_K,
     threshold,
     return_ms,
+    output_dtype,
 ):
     device = x_f16.device
     if x_nhwc is None:
@@ -494,7 +495,7 @@ def _fused_1x1_persistent_path(
     total_work = int(N * spatial_tiles * n_cout_tiles)
 
     if total_work <= 0:
-        y = torch.zeros(N, C_OUT, H_OUT, W_OUT, dtype=torch.float16, device=device)
+        y = torch.zeros(N, C_OUT, H_OUT, W_OUT, dtype=output_dtype, device=device)
         if bias is not None:
             y = y + bias.detach().to(y.dtype).view(1, -1, 1, 1)
         return y, 0.0, {
@@ -510,7 +511,7 @@ def _fused_1x1_persistent_path(
         1,
         int(torch.cuda.get_device_properties(device).multi_processor_count) * PERSISTENT_OVERSUB,
     )
-    y = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=torch.float16, device=device)
+    y = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=output_dtype, device=device)
 
     sparse_ms = 0.0
     if return_ms:
@@ -905,6 +906,7 @@ def sparse_conv2d_forward(
     N, C_IN, H_IN, W_IN = x.shape
     C_OUT = weight.shape[0]
     device = x.device
+    out_dtype = x.dtype
     if isinstance(stride, tuple): stride = stride[0]
     if isinstance(padding, tuple): padding = padding[0]
     if isinstance(dilation, tuple): dilation = dilation[0]
@@ -941,7 +943,7 @@ def sparse_conv2d_forward(
         return _finalize_return(y, dense_ms, avg_active_ratio_val, tile_stats_val, bm)
 
     def _zero_tiles_output(reason, tile_stats_val=None, backend_meta_extra=None):
-        y = torch.zeros(N, C_OUT, H_OUT, W_OUT, dtype=torch.float16, device=device)
+        y = torch.zeros(N, C_OUT, H_OUT, W_OUT, dtype=out_dtype, device=device)
         if bias is not None: y = y + bias.detach().to(y.dtype).view(1, -1, 1, 1)
         bm = {"backend": "zero_tiles_only", "reason": reason}
         if backend_meta_extra: bm.update(backend_meta_extra)
@@ -1006,6 +1008,7 @@ def sparse_conv2d_forward(
             DENSE_K=DENSE_K,
             threshold=threshold,
             return_ms=return_ms,
+            output_dtype=out_dtype,
         )
         return _finalize_return(y, sparse_ms, None, None, backend_meta)
 
@@ -1126,7 +1129,7 @@ def sparse_conv2d_forward(
             else weight.half().reshape(C_OUT, C_IN).contiguous()
         )
 
-    y = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=torch.float16, device=device)
+    y = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=out_dtype, device=device)
 
     if return_ms:
         start_ev = torch.cuda.Event(enable_timing=True)

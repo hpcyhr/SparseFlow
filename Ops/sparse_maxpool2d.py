@@ -276,13 +276,13 @@ class SparseMaxPool2d(nn.Module):
         self._last_sparse_ms = 0.0
         self._last_dense_ms = 0.0
         return F.max_pool2d(
-            x.float(),
+            x,
             kernel_size=self.kernel_size,
             stride=self.stride,
             padding=self.padding,
             dilation=self.dilation,
             ceil_mode=self.ceil_mode,
-        ).float()
+        )
 
     def get_diag(self) -> Dict[str, Any]:
         diag = dict(self._last_diag or {})

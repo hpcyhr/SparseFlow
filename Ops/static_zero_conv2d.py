@@ -125,14 +125,14 @@ class StaticZeroConv2d(nn.Module):
         """Produce exact zero-input convolution output.
 
         Supports 4D [N, C, H, W] and 5D [T, N, C, H, W] inputs.
-        Output dtype is float32 for consistency with SparseConv2d.
+        Output dtype matches input dtype (typically fp16) for consistency with SparseConv2d.
         """
         self._forward_count += 1
 
         if x.dim() == 4:
             B, _, H, W = x.shape
             H_out, W_out = self._output_hw(H, W)
-            tpl = self._get_template(x.device, torch.float32, H_out, W_out)
+            tpl = self._get_template(x.device, x.dtype, H_out, W_out)
             # Materialize to avoid shared-storage aliasing from expand().
             # Some backbones use in-place residual adds (e.g., out += identity),
             # which require a writable tensor with unique storage.
@@ -144,7 +144,7 @@ class StaticZeroConv2d(nn.Module):
         elif x.dim() == 5:
             T, B, _, H, W = x.shape
             H_out, W_out = self._output_hw(H, W)
-            tpl = self._get_template(x.device, torch.float32, H_out, W_out)
+            tpl = self._get_template(x.device, x.dtype, H_out, W_out)
             # Materialize to avoid shared-storage aliasing from expand().
             y4d = tpl.expand(T * B, -1, -1, -1).clone()
             y = y4d.reshape(T, B, self.out_channels, H_out, W_out)

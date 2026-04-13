@@ -166,6 +166,7 @@ def sparse_matmul_forward(
     K2, N = b.shape
     assert K == K2, f"K mismatch: {K} vs {K2}"
     device = a.device
+    out_dtype = a.dtype
 
     need_stats = return_avg_active_ratio or return_tile_stats
 
@@ -281,7 +282,7 @@ def sparse_matmul_forward(
         return _finalize(c, 0.0, avg_ratio, tile_stats)
 
     b_f16 = b.half().contiguous()
-    c = torch.empty(M, N, dtype=torch.float16, device=device)
+    c = torch.empty(M, N, dtype=out_dtype, device=device)
 
     if return_ms:
         start = torch.cuda.Event(enable_timing=True)

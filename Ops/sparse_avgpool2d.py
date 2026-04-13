@@ -281,14 +281,14 @@ class SparseAvgPool2d(nn.Module):
         self._last_sparse_ms = 0.0
         self._last_dense_ms = 0.0
         return F.avg_pool2d(
-            x.float(),
+            x,
             kernel_size=self.kernel_size,
             stride=self.stride,
             padding=self.padding,
             ceil_mode=self.ceil_mode,
             count_include_pad=self.count_include_pad,
             divisor_override=self.divisor_override,
-        ).float()
+        )
 
     def get_diag(self) -> Dict[str, Any]:
         diag = dict(self._last_diag or {})
