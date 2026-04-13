@@ -472,13 +472,14 @@ def sparse_linear_forward(
     return_backend_meta=False,
     active_tile_ids_buf=None,
     launch_all_tiles=False,
+    output_dtype=None,
 ):
     import torch.nn.functional as Fn
 
     N, C_IN = x.shape
     C_OUT = weight.shape[0]
     device = x.device
-    out_dtype = x.dtype
+    out_dtype = x.dtype if output_dtype is None else output_dtype
 
     need_stats = return_avg_active_ratio or return_tile_stats
 
@@ -515,6 +516,8 @@ def sparse_linear_forward(
             weight,
             bias,
         )
+        if y.dtype != out_dtype:
+            y = y.to(dtype=out_dtype)
 
         if return_ms:
             ee.record()

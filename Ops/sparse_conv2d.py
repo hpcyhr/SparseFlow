@@ -699,6 +699,7 @@ class SparseConv2d(nn.Module):
             x_nhwc=x_nhwc,
             active_tile_ids_buf=active_tile_ids_buf,
             launch_all_tiles=launch_all_tiles,
+            output_dtype=x.dtype,
         )
 
         # --- Unpack result ---

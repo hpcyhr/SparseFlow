@@ -900,13 +900,14 @@ def sparse_conv2d_forward(
     return_backend_meta=False,
     x_nhwc=None, active_tile_ids_buf=None,
     launch_all_tiles=False,
+    output_dtype=None,
 ):
     import torch.nn.functional as Fn
 
     N, C_IN, H_IN, W_IN = x.shape
     C_OUT = weight.shape[0]
     device = x.device
-    out_dtype = x.dtype
+    out_dtype = x.dtype if output_dtype is None else output_dtype
     if isinstance(stride, tuple): stride = stride[0]
     if isinstance(padding, tuple): padding = padding[0]
     if isinstance(dilation, tuple): dilation = dilation[0]
@@ -931,6 +932,8 @@ def sparse_conv2d_forward(
             x, weight, bias,
             stride=stride, padding=padding, dilation=dilation, groups=groups
         )
+        if y.dtype != out_dtype:
+            y = y.to(dtype=out_dtype)
 
         if return_ms:
             ee.record()

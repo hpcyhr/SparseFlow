@@ -610,6 +610,7 @@ class SparseLinear(nn.Module):
                 return_tile_stats=want_tiles,
                 return_backend_meta=True,
                 launch_all_tiles=launch_all_tiles,
+                output_dtype=x2d.dtype,
             )
         except Exception as err:
             # Robust fallback for Triton compile/autotune/runtime failures.
