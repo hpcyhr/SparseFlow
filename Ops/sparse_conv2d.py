@@ -39,6 +39,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from Utils.config import ENABLE_RUNTIME_FALLBACK_POLICY
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
@@ -314,7 +315,11 @@ class SparseConv2d(nn.Module):
         )
 
     def _needs_fused_1x1_calibration(self) -> bool:
-        return self._uses_sparse_1x1() and not self._fused_1x1_calibrated
+        return (
+            ENABLE_RUNTIME_FALLBACK_POLICY
+            and self._uses_sparse_1x1()
+            and not self._fused_1x1_calibrated
+        )
 
     def _record_runtime_dispatch(self, runtime_backend: str):
         expected = str(
@@ -427,9 +432,9 @@ class SparseConv2d(nn.Module):
         k, s, p, d = self.kernel_size[0], self.stride[0], self.padding[0], self.dilation[0]
         H_OUT = (H_IN + 2 * p - d * (k - 1) - 1) // s + 1
         W_OUT = (W_IN + 2 * p - d * (k - 1) - 1) // s + 1
-        y = torch.zeros(N, self.out_channels, H_OUT, W_OUT, dtype=torch.float32, device=x.device)
+        y = torch.zeros(N, self.out_channels, H_OUT, W_OUT, dtype=torch.float16, device=x.device)
         if self.bias is not None:
-            y = y + self.bias.detach().float().view(1, -1, 1, 1)
+            y = y + self.bias.detach().to(y.dtype).view(1, -1, 1, 1)
         return y
 
     def _zero_output_5d(self, x):
@@ -447,6 +452,8 @@ class SparseConv2d(nn.Module):
         When _inference_mode is True, always returns False — guarantees zero
         syncs during timed inference runs.
         """
+        if not ENABLE_RUNTIME_FALLBACK_POLICY:
+            return False
         if self._inference_mode:
             return False
         if self._warmup_left > 0:
@@ -455,6 +462,10 @@ class SparseConv2d(nn.Module):
 
     def _update_policy(self, avg_active_ratio):
         if avg_active_ratio is None:
+            return
+        if not ENABLE_RUNTIME_FALLBACK_POLICY:
+            # Tier 0 P5: policy disabled, EGD is single dispatch source.
+            self._last_avg_active_ratio = avg_active_ratio
             return
         self._last_avg_active_ratio = avg_active_ratio
         if self._uses_sparse_1x1():
@@ -513,7 +524,7 @@ class SparseConv2d(nn.Module):
             self._last_diag = {'sparse_path_executed': False}
 
         # Force-zero path (no sync — boolean flag)
-        if self._force_zero:
+        if ENABLE_RUNTIME_FALLBACK_POLICY and self._force_zero:
             y = self._zero_output_5d(x) if x.dim() == 5 else self._zero_output_4d(x)
             self._last_sparse_ms = 0.0
             self._record_runtime_dispatch("staticzero")
@@ -552,7 +563,7 @@ class SparseConv2d(nn.Module):
             t0 = self._stamp()
         need_ratio = (
             use_triton
-            and (not self._force_dense)
+            and (not ENABLE_RUNTIME_FALLBACK_POLICY or not self._force_dense)
             and (self._should_collect_ratio() or self._needs_fused_1x1_calibration())
         )
         if self.profile_runtime:
@@ -563,7 +574,7 @@ class SparseConv2d(nn.Module):
         self._forward_count += 1
 
         # Dispatch
-        if use_triton and not self._force_dense and self._supports_sparse():
+        if use_triton and (not ENABLE_RUNTIME_FALLBACK_POLICY or not self._force_dense) and self._supports_sparse():
             y4d, avg_active_ratio, backend_kind = self._triton_forward(x4d, need_ratio=need_ratio)
             if backend_kind == "dense_fallback":
                 path = "dense(fallback)"
@@ -602,7 +613,7 @@ class SparseConv2d(nn.Module):
             self._profile_add("policy_ms", ms)
             self._profile_set_last("last_policy_ms", self._profile.last_policy_ms + ms)
 
-        if self._force_zero and avg_active_ratio == 0.0:
+        if ENABLE_RUNTIME_FALLBACK_POLICY and self._force_zero and avg_active_ratio == 0.0:
             y4d = self._zero_output_4d(x4d)
             path = "zero(promoted)"
             self.fallback_reason = "zero_promoted"

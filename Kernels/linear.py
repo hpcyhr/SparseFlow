@@ -9,7 +9,11 @@ import triton
 import triton.language as tl
 from triton import autotune, Config
 from typing import Optional
-from Utils.config import PRESCAN_ACTIVITY_EPS, SPARSE_DENSE_RATIO_THRESHOLD
+from Utils.config import (
+    ENABLE_RUNTIME_FALLBACK_POLICY,
+    PRESCAN_ACTIVITY_EPS,
+    SPARSE_DENSE_RATIO_THRESHOLD,
+)
 from Utils.sparse_helpers import (
     TILE_ZERO,
     TILE_SPARSE,
@@ -506,10 +510,10 @@ def sparse_linear_forward(
             se.record()
 
         y = Fn.linear(
-            x.float(),
-            weight.float(),
-            bias.float() if bias is not None else None,
-        ).float()
+            x,
+            weight,
+            bias,
+        )
 
         if return_ms:
             ee.record()
@@ -522,9 +526,9 @@ def sparse_linear_forward(
         return _finalize_return(y, dense_ms, avg_active_ratio_val, tile_stats_val, bm)
 
     def _zero_tiles_output(reason, tile_stats_val=None, backend_meta_extra=None):
-        y = torch.zeros(N, C_OUT, dtype=torch.float32, device=device)
+        y = torch.zeros(N, C_OUT, dtype=torch.float16, device=device)
         if bias is not None:
-            y = y + bias.detach().float().view(1, -1)
+            y = y + bias.detach().to(y.dtype).view(1, -1)
         bm = {"backend": "zero_tiles_only", "reason": reason}
         if backend_meta_extra:
             bm.update(backend_meta_extra)
@@ -535,7 +539,7 @@ def sparse_linear_forward(
         return _dense_fallback(reason="expected_2d_input")
 
     if C_IN <= 0 or C_OUT <= 0 or N <= 0:
-        y = torch.zeros(max(N, 0), max(C_OUT, 0), dtype=torch.float32, device=device)
+        y = torch.zeros(max(N, 0), max(C_OUT, 0), dtype=torch.float16, device=device)
         bm = {"backend": "zero_tiles_only", "reason": "empty_shape", "total_tiles": 0}
         return _finalize_return(y, 0.0, 0.0, None, bm)
 
@@ -562,11 +566,13 @@ def sparse_linear_forward(
         ag_mask_buf,
         tile_class_buf,
         prescan_stats=prescan_stats,
-        allow_stage1_dense_fallback=(return_avg_active_ratio and not return_tile_stats),
+        allow_stage1_dense_fallback=(
+            ENABLE_RUNTIME_FALLBACK_POLICY and return_avg_active_ratio and not return_tile_stats
+        ),
         fallback_ratio=fallback_ratio,
     )
 
-    if stage1_dense_fallback:
+    if ENABLE_RUNTIME_FALLBACK_POLICY and stage1_dense_fallback:
         stage1_avg_active_ratio = 1.0
         if stage1_summary is not None:
             stage1_avg_active_ratio = float(
@@ -620,7 +626,9 @@ def sparse_linear_forward(
             if prescan_stats:
                 tile_stats.update(prescan_stats)
 
-        if _check_dense_fallback(ag_mask_buf, N_TILES, num_groups, fallback_ratio=fallback_ratio):
+        if ENABLE_RUNTIME_FALLBACK_POLICY and _check_dense_fallback(
+            ag_mask_buf, N_TILES, num_groups, fallback_ratio=fallback_ratio
+        ):
             return _dense_fallback(
                 reason="post_metadata_dense_fallback",
                 avg_active_ratio_val=avg_active_ratio,
@@ -710,7 +718,7 @@ def sparse_linear_forward(
 
     w_t_f16 = w_t if w_t is not None else weight.half().t().contiguous()
     bias_arg = bias.detach().float() if bias is not None else torch.empty(1, dtype=torch.float32, device=device)
-    y = torch.empty(N, C_OUT, dtype=torch.float32, device=device)
+    y = torch.empty(N, C_OUT, dtype=torch.float16, device=device)
 
     sparse_ms = 0.0
     if return_ms:

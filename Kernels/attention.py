@@ -56,8 +56,8 @@ def sparse_qk_forward(
     q_flat = q.reshape(B * num_heads, seq_len, head_dim)
     k_flat = k.reshape(B * num_heads, seq_len, head_dim)
 
-    # K^T: [B*H, head_dim, seq_len]
-    k_t = k_flat.transpose(1, 2).contiguous()
+    # Tier 0 P7: rely on sparse_bmm_forward to handle non-contiguous K^T via masked loads, avoid full copy.
+    k_t = k_flat.transpose(1, 2)
 
     # Sparse BMM: Q @ K^T 鈫?[B*H, seq_len, seq_len]
     result = sparse_bmm_forward(

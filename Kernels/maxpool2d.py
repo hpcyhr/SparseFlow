@@ -242,6 +242,18 @@ def sparse_maxpool2d_forward(
             ret = ret + (backend_meta_val,)
         return ret
 
+    # Tier 0 P6: pool is bandwidth-bound; PyTorch's cuDNN backend dominates the Triton sparse path in all regimes. Fall back unconditionally.
+    y = Fn.max_pool2d(
+        x,
+        kernel_size=(kh, kw),
+        stride=(sh, sw),
+        padding=(ph, pw),
+        dilation=(dh, dw),
+        ceil_mode=ceil_mode,
+    )
+    backend_meta = {"backend": "dense_pytorch_pool", "reason": "tier0_unconditional_dense_pool"}
+    return _finalize_return(y, 0.0, 1.0, None, backend_meta)
+
     def _dense_fallback(reason: str):
         dense_ms = 0.0
         if return_ms:

@@ -27,7 +27,11 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from Utils.config import PRESCAN_ACTIVITY_EPS, SPARSE_DENSE_RATIO_THRESHOLD
+from Utils.config import (
+    ENABLE_RUNTIME_FALLBACK_POLICY,
+    PRESCAN_ACTIVITY_EPS,
+    SPARSE_DENSE_RATIO_THRESHOLD,
+)
 from Utils.sparse_helpers import (
     TILE_ZERO, TILE_SPARSE, TILE_DENSEISH,
     choose_group_size, popcount_buf,
@@ -236,7 +240,9 @@ def sparse_matmul_forward(
             ag_mask_buf=ag_mask_buf,
             tile_class_buf=tile_class_buf,
             prescan_stats=prescan_stats,
-            allow_stage1_dense_fallback=(return_avg_active_ratio and not return_tile_stats),
+            allow_stage1_dense_fallback=(
+                ENABLE_RUNTIME_FALLBACK_POLICY and return_avg_active_ratio and not return_tile_stats
+            ),
             fallback_ratio=fallback_ratio,
         )
     except Exception:
@@ -249,7 +255,7 @@ def sparse_matmul_forward(
         ratio = 1.0 if return_avg_active_ratio else None
         return _finalize(c, 0.0, ratio, tile_stats)
 
-    if stage1_dense_fallback:
+    if ENABLE_RUNTIME_FALLBACK_POLICY and stage1_dense_fallback:
         stage1_avg_ratio = 1.0
         if stage1_summary is not None:
             stage1_avg_ratio = float(
@@ -265,7 +271,7 @@ def sparse_matmul_forward(
     else:
         avg_ratio = None
 
-    if avg_ratio is not None and avg_ratio > fallback_ratio:
+    if ENABLE_RUNTIME_FALLBACK_POLICY and avg_ratio is not None and avg_ratio > fallback_ratio:
         c = torch.mm(a.float(), b.float())
         tile_stats = {
             'total_tiles': N_TILES_M,
@@ -275,7 +281,7 @@ def sparse_matmul_forward(
         return _finalize(c, 0.0, avg_ratio, tile_stats)
 
     b_f16 = b.half().contiguous()
-    c = torch.empty(M, N, dtype=torch.float32, device=device)
+    c = torch.empty(M, N, dtype=torch.float16, device=device)
 
     if return_ms:
         start = torch.cuda.Event(enable_timing=True)

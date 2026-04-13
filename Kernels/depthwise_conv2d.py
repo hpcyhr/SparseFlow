@@ -70,14 +70,14 @@ def sparse_depthwise_conv2d_forward(
             se.record()
 
         y = F.conv2d(
-            x.float(),
-            weight.float(),
-            bias.float() if bias is not None else None,
+            x,
+            weight,
+            bias,
             stride=stride,
             padding=padding,
             dilation=dilation,
             groups=channels,
-        ).float()
+        )
 
         if return_ms:
             ee.record()

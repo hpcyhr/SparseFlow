@@ -30,7 +30,11 @@ from Utils.sparse_helpers import (
     TILE_ZERO, TILE_SPARSE, TILE_DENSEISH,
     choose_group_size, popcount_buf,
 )
-from Utils.config import PRESCAN_ACTIVITY_EPS, SPARSE_DENSE_RATIO_THRESHOLD
+from Utils.config import (
+    ENABLE_RUNTIME_FALLBACK_POLICY,
+    PRESCAN_ACTIVITY_EPS,
+    SPARSE_DENSE_RATIO_THRESHOLD,
+)
 
 FALLBACK_RATIO = SPARSE_DENSE_RATIO_THRESHOLD
 TRITON_MAX_TENSOR_NUMEL = 131072
@@ -299,13 +303,13 @@ def sparse_bmm_forward(
         avg_active = pc.float().mean().item()
         avg_ratio = avg_active / max(NUM_GROUPS, 1)
 
-    if avg_ratio is not None and avg_ratio > fallback_ratio:
+    if ENABLE_RUNTIME_FALLBACK_POLICY and avg_ratio is not None and avg_ratio > fallback_ratio:
         c = torch.bmm(a.float(), b.float())
         stats = {'total_tiles': TOTAL_META, 'fallback': True} if return_tile_stats else None
         return _finalize(c, 0.0, avg_ratio, stats)
 
     b_f16 = b.half().contiguous()
-    c = torch.empty(B_dim, M, N, dtype=torch.float32, device=device)
+    c = torch.empty(B_dim, M, N, dtype=torch.float16, device=device)
 
     if return_ms:
         start = torch.cuda.Event(enable_timing=True)

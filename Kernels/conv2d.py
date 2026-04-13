@@ -20,7 +20,8 @@ Changes from v24 (already in v25.0, retained):
   [P1] launch_all_tiles parameter for A/B tile launch comparison.
        Mode A (False): active-tile-ID launch via nonzero() (1 sync).
        Mode B (True):  launch all N_TILES, zero tiles early-return (0 sync).
-  All Triton JIT kernels unchanged from v24.
+  Active compute kernels unchanged from v24. Prescan metadata now comes from
+  the shared max-pool cascade in Kernels/_prescan_common.py.
 
 Supported patterns: 1x1/s1/p0, 1x1/s2/p0, 3x3/s1/p1, 3x3/s2/p1
 """
@@ -36,7 +37,11 @@ import triton
 import triton.language as tl
 from triton import autotune, Config
 from Kernels._prescan_common import _build_rf_prescan_metadata_impl
-from Utils.config import PRESCAN_ACTIVITY_EPS, SPARSE_DENSE_RATIO_THRESHOLD
+from Utils.config import (
+    ENABLE_RUNTIME_FALLBACK_POLICY,
+    PRESCAN_ACTIVITY_EPS,
+    SPARSE_DENSE_RATIO_THRESHOLD,
+)
 
 # ---------------------------------------------------------------------------
 # Tile classification constants
@@ -143,374 +148,6 @@ def _summarize_stage1_metadata(tile_class_buf, ag_mask_buf, N_TILES, NUM_GROUPS)
     avg_active_ratio = float(pc.sum().item()) / max(float(N_TILES * NUM_GROUPS), 1.0)
     summary["stage1_avg_active_group_ratio_lower_bound"] = avg_active_ratio
     return summary, avg_active_ratio
-
-
-# ===========================================================================
-# STAGE 1: Coarse 3-way classification (NCHW)
-# ===========================================================================
-
-@triton.jit
-def tile_coarse_classify_kernel(
-    x_ptr, tile_class_ptr, ag_mask_ptr,
-    N_val, C_IN, H_IN, W_IN, GH, GW,
-    BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr,
-    KERNEL_SIZE: tl.constexpr, STRIDE: tl.constexpr, PAD: tl.constexpr,
-    RF_SIZE: tl.constexpr, THRESHOLD: tl.constexpr,
-    GROUP_SIZE_C: tl.constexpr, NUM_GROUPS: tl.constexpr,
-    ALL_ONES_MASK: tl.constexpr,
-    UNCERTAIN_CLASS: tl.constexpr, ZERO_CANDIDATE_CLASS: tl.constexpr,
-):
-    tile_id = tl.program_id(0)
-    if tile_id >= N_val * GH * GW:
-        return
-    gw_idx = tile_id % GW
-    tmp = tile_id // GW
-    gh_idx = tmp % GH
-    n_idx = tmp // GH
-
-    rf_h_start = gh_idx * BLOCK_H * STRIDE - PAD
-    rf_w_start = gw_idx * BLOCK_W * STRIDE - PAD
-    RF_H: tl.constexpr = (BLOCK_H - 1) * STRIDE + KERNEL_SIZE
-    RF_W: tl.constexpr = (BLOCK_W - 1) * STRIDE + KERNEL_SIZE
-    flat_idx = tl.arange(0, RF_SIZE)
-    hh = rf_h_start + flat_idx // RF_W
-    ww = rf_w_start + flat_idx % RF_W
-    hw_mask = (flat_idx < RF_H * RF_W) & (hh >= 0) & (hh < H_IN) & (ww >= 0) & (ww < W_IN)
-    safe_h = tl.minimum(tl.maximum(hh, 0), H_IN - 1)
-    safe_w = tl.minimum(tl.maximum(ww, 0), W_IN - 1)
-    HW = H_IN * W_IN
-    off1 = tl.arange(0, 1)
-
-    rough_mask = tl.zeros([1], dtype=tl.int32)
-    for g in range(NUM_GROUPS):
-        c_rep = g * GROUP_SIZE_C
-        if c_rep < C_IN:
-            vals = tl.load(x_ptr + (n_idx * C_IN + c_rep) * HW + safe_h * W_IN + safe_w, mask=hw_mask, other=0.0)
-            is_active = (tl.max(tl.abs(vals), axis=0) > THRESHOLD).to(tl.int32)
-            rough_mask = rough_mask + is_active * (1 << g)
-
-    if tl.sum(rough_mask == ALL_ONES_MASK) > 0:
-        tl.store(tile_class_ptr + tile_id + off1, tl.full([1], 2, dtype=tl.int32))
-        tl.store(ag_mask_ptr + tile_id + off1, tl.full([1], ALL_ONES_MASK, dtype=tl.int32))
-    else:
-        if tl.sum(rough_mask) == 0:
-            tl.store(tile_class_ptr + tile_id + off1, tl.full([1], ZERO_CANDIDATE_CLASS, dtype=tl.int32))
-            tl.store(ag_mask_ptr + tile_id + off1, tl.zeros([1], dtype=tl.int32))
-        else:
-            tl.store(tile_class_ptr + tile_id + off1, tl.full([1], UNCERTAIN_CLASS, dtype=tl.int32))
-            tl.store(ag_mask_ptr + tile_id + off1, rough_mask)
-
-
-@triton.jit
-def tile_coarse_classify_1x1_kernel(
-    x_ptr, tile_class_ptr, ag_mask_ptr,
-    N_val, C_IN, H_IN, W_IN, GH, GW,
-    BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr, BLOCK_M: tl.constexpr,
-    THRESHOLD: tl.constexpr,
-    GROUP_SIZE_C: tl.constexpr, NUM_GROUPS: tl.constexpr,
-    ALL_ONES_MASK: tl.constexpr,
-    UNCERTAIN_CLASS: tl.constexpr, ZERO_CANDIDATE_CLASS: tl.constexpr,
-):
-    tile_id = tl.program_id(0)
-    if tile_id >= N_val * GH * GW:
-        return
-    gw_idx = tile_id % GW
-    tmp = tile_id // GW
-    gh_idx = tmp % GH
-    n_idx = tmp // GH
-    offs_m = tl.arange(0, BLOCK_M)
-    out_h = gh_idx * BLOCK_H + offs_m // BLOCK_W
-    out_w = gw_idx * BLOCK_W + offs_m % BLOCK_W
-    m_mask = (out_h < H_IN) & (out_w < W_IN)
-    HW = H_IN * W_IN
-    off1 = tl.arange(0, 1)
-
-    rough_mask = tl.zeros([1], dtype=tl.int32)
-    for g in range(NUM_GROUPS):
-        c_rep = g * GROUP_SIZE_C
-        if c_rep < C_IN:
-            vals = tl.load(x_ptr + (n_idx * C_IN + c_rep) * HW + out_h * W_IN + out_w, mask=m_mask, other=0.0)
-            is_active = (tl.max(tl.abs(vals), axis=0) > THRESHOLD).to(tl.int32)
-            rough_mask = rough_mask + is_active * (1 << g)
-
-    if tl.sum(rough_mask == ALL_ONES_MASK) > 0:
-        tl.store(tile_class_ptr + tile_id + off1, tl.full([1], 2, dtype=tl.int32))
-        tl.store(ag_mask_ptr + tile_id + off1, tl.full([1], ALL_ONES_MASK, dtype=tl.int32))
-    else:
-        if tl.sum(rough_mask) == 0:
-            tl.store(tile_class_ptr + tile_id + off1, tl.full([1], ZERO_CANDIDATE_CLASS, dtype=tl.int32))
-            tl.store(ag_mask_ptr + tile_id + off1, tl.zeros([1], dtype=tl.int32))
-        else:
-            tl.store(tile_class_ptr + tile_id + off1, tl.full([1], UNCERTAIN_CLASS, dtype=tl.int32))
-            tl.store(ag_mask_ptr + tile_id + off1, rough_mask)
-
-
-# ===========================================================================
-# STAGE 2a: Zero-candidate refinement
-# ===========================================================================
-
-@triton.jit
-def zero_candidate_refine_kernel(
-    x_ptr, tile_class_ptr, ag_mask_ptr,
-    N_val, C_IN, H_IN, W_IN, H_OUT, W_OUT, GH, GW,
-    BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr,
-    KERNEL_SIZE: tl.constexpr, STRIDE: tl.constexpr, PAD: tl.constexpr,
-    GROUP_SIZE_C: tl.constexpr, NUM_GROUPS: tl.constexpr,
-    RF_SIZE: tl.constexpr, THRESHOLD: tl.constexpr,
-    ALL_ONES_MASK: tl.constexpr, ZERO_CANDIDATE_CLASS: tl.constexpr,
-):
-    tile_id = tl.program_id(0)
-    if tile_id >= N_val * GH * GW:
-        return
-    off1 = tl.arange(0, 1)
-    tc = tl.load(tile_class_ptr + tile_id + off1)
-    if tl.sum(tc) != ZERO_CANDIDATE_CLASS:
-        return
-    gw_idx = tile_id % GW
-    tmp = tile_id // GW
-    gh_idx = tmp % GH
-    n_idx = tmp // GH
-    RF_H: tl.constexpr = (BLOCK_H - 1) * STRIDE + KERNEL_SIZE
-    RF_W: tl.constexpr = (BLOCK_W - 1) * STRIDE + KERNEL_SIZE
-    flat_idx = tl.arange(0, RF_SIZE)
-    hh = gh_idx * BLOCK_H * STRIDE - PAD + flat_idx // RF_W
-    ww = gw_idx * BLOCK_W * STRIDE - PAD + flat_idx % RF_W
-    hw_mask = (flat_idx < RF_H * RF_W) & (hh >= 0) & (hh < H_IN) & (ww >= 0) & (ww < W_IN)
-    safe_h = tl.minimum(tl.maximum(hh, 0), H_IN - 1)
-    safe_w = tl.minimum(tl.maximum(ww, 0), W_IN - 1)
-    HW = H_IN * W_IN
-
-    mask = tl.zeros([1], dtype=tl.int32)
-    found_nz = tl.zeros([1], dtype=tl.int32)
-    g_idx = tl.zeros([1], dtype=tl.int32)
-
-    while (tl.sum(g_idx) < NUM_GROUPS) & (tl.sum(found_nz) == 0):
-        g_val = tl.sum(g_idx)
-        group_max = tl.zeros([1], dtype=tl.float32)
-        # NOTE:
-        # c_off starts at 1 by design. Stage-1 coarse pass already inspected
-        # the representative channel (offset 0) for each group. Stage-2a only
-        # refines the remaining channels to avoid redundant reads.
-        for c_off in range(1, GROUP_SIZE_C):
-            c = g_val * GROUP_SIZE_C + c_off
-            if c < C_IN:
-                vals = tl.load(x_ptr + (n_idx * C_IN + c) * HW + safe_h * W_IN + safe_w,
-                               mask=hw_mask, other=0.0)
-                group_max = tl.maximum(group_max, tl.max(tl.abs(vals), axis=0))
-        is_active = (group_max > THRESHOLD).to(tl.int32)
-        mask = mask + is_active * (1 << g_val)
-        found_nz = found_nz + is_active
-        g_idx = g_idx + 1
-
-    if tl.sum(found_nz) == 0:
-        tl.store(tile_class_ptr + tile_id + off1, tl.zeros([1], dtype=tl.int32))
-        tl.store(ag_mask_ptr + tile_id + off1, tl.zeros([1], dtype=tl.int32))
-        return
-
-    while tl.sum(g_idx) < NUM_GROUPS:
-        g_val = tl.sum(g_idx)
-        group_max = tl.zeros([1], dtype=tl.float32)
-        # See note above: offset 0 is intentionally skipped in Stage-2a.
-        for c_off in range(1, GROUP_SIZE_C):
-            c = g_val * GROUP_SIZE_C + c_off
-            if c < C_IN:
-                vals = tl.load(x_ptr + (n_idx * C_IN + c) * HW + safe_h * W_IN + safe_w,
-                               mask=hw_mask, other=0.0)
-                group_max = tl.maximum(group_max, tl.max(tl.abs(vals), axis=0))
-        is_active = (group_max > THRESHOLD).to(tl.int32)
-        mask = mask + is_active * (1 << g_val)
-        if tl.sum(mask == ALL_ONES_MASK) > 0:
-            g_idx = tl.full([1], NUM_GROUPS, dtype=tl.int32)
-        else:
-            g_idx = g_idx + 1
-
-    tl.store(ag_mask_ptr + tile_id + off1, mask)
-    if tl.sum(mask == ALL_ONES_MASK) > 0:
-        tl.store(tile_class_ptr + tile_id + off1, tl.full([1], 2, dtype=tl.int32))
-    else:
-        tl.store(tile_class_ptr + tile_id + off1, tl.full([1], 1, dtype=tl.int32))
-
-
-@triton.jit
-def zero_candidate_refine_1x1_kernel(
-    x_ptr, tile_class_ptr, ag_mask_ptr,
-    N_val, C_IN, H_IN, W_IN, GH, GW,
-    BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr, BLOCK_M: tl.constexpr,
-    GROUP_SIZE_C: tl.constexpr, NUM_GROUPS: tl.constexpr,
-    THRESHOLD: tl.constexpr, ALL_ONES_MASK: tl.constexpr,
-    ZERO_CANDIDATE_CLASS: tl.constexpr,
-):
-    tile_id = tl.program_id(0)
-    if tile_id >= N_val * GH * GW:
-        return
-    off1 = tl.arange(0, 1)
-    tc = tl.load(tile_class_ptr + tile_id + off1)
-    if tl.sum(tc) != ZERO_CANDIDATE_CLASS:
-        return
-    gw_idx = tile_id % GW
-    tmp = tile_id // GW
-    gh_idx = tmp % GH
-    n_idx = tmp // GH
-    offs_m = tl.arange(0, BLOCK_M)
-    out_h = gh_idx * BLOCK_H + offs_m // BLOCK_W
-    out_w = gw_idx * BLOCK_W + offs_m % BLOCK_W
-    m_mask = (out_h < H_IN) & (out_w < W_IN)
-    HW = H_IN * W_IN
-
-    mask = tl.zeros([1], dtype=tl.int32)
-    found_nz = tl.zeros([1], dtype=tl.int32)
-    g_idx = tl.zeros([1], dtype=tl.int32)
-
-    while (tl.sum(g_idx) < NUM_GROUPS) & (tl.sum(found_nz) == 0):
-        g_val = tl.sum(g_idx)
-        group_max = tl.zeros([1], dtype=tl.float32)
-        # NOTE:
-        # c_off starts at 1 by design. Stage-1 coarse pass already inspected
-        # the representative channel (offset 0) for each group. Stage-2a only
-        # refines the remaining channels to avoid redundant reads.
-        for c_off in range(1, GROUP_SIZE_C):
-            c = g_val * GROUP_SIZE_C + c_off
-            if c < C_IN:
-                vals = tl.load(x_ptr + (n_idx * C_IN + c) * HW + out_h * W_IN + out_w, mask=m_mask, other=0.0)
-                group_max = tl.maximum(group_max, tl.max(tl.abs(vals), axis=0))
-        is_active = (group_max > THRESHOLD).to(tl.int32)
-        mask = mask + is_active * (1 << g_val)
-        found_nz = found_nz + is_active
-        g_idx = g_idx + 1
-
-    if tl.sum(found_nz) == 0:
-        tl.store(tile_class_ptr + tile_id + off1, tl.zeros([1], dtype=tl.int32))
-        tl.store(ag_mask_ptr + tile_id + off1, tl.zeros([1], dtype=tl.int32))
-        return
-
-    while tl.sum(g_idx) < NUM_GROUPS:
-        g_val = tl.sum(g_idx)
-        group_max = tl.zeros([1], dtype=tl.float32)
-        # See note above: offset 0 is intentionally skipped in Stage-2a.
-        for c_off in range(1, GROUP_SIZE_C):
-            c = g_val * GROUP_SIZE_C + c_off
-            if c < C_IN:
-                vals = tl.load(x_ptr + (n_idx * C_IN + c) * HW + out_h * W_IN + out_w, mask=m_mask, other=0.0)
-                group_max = tl.maximum(group_max, tl.max(tl.abs(vals), axis=0))
-        is_active = (group_max > THRESHOLD).to(tl.int32)
-        mask = mask + is_active * (1 << g_val)
-        if tl.sum(mask == ALL_ONES_MASK) > 0:
-            g_idx = tl.full([1], NUM_GROUPS, dtype=tl.int32)
-        else:
-            g_idx = g_idx + 1
-
-    tl.store(ag_mask_ptr + tile_id + off1, mask)
-    if tl.sum(mask == ALL_ONES_MASK) > 0:
-        tl.store(tile_class_ptr + tile_id + off1, tl.full([1], 2, dtype=tl.int32))
-    else:
-        tl.store(tile_class_ptr + tile_id + off1, tl.full([1], 1, dtype=tl.int32))
-
-
-# ===========================================================================
-# STAGE 2b: Exact bitmask for UNCERTAIN tiles
-# ===========================================================================
-
-@triton.jit
-def group_bitmask_refine_kernel(
-    x_ptr, tile_class_ptr, ag_mask_ptr,
-    N_val, C_IN, H_IN, W_IN, H_OUT, W_OUT, GH, GW,
-    BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr,
-    KERNEL_SIZE: tl.constexpr, STRIDE: tl.constexpr, PAD: tl.constexpr,
-    GROUP_SIZE_C: tl.constexpr, NUM_GROUPS: tl.constexpr,
-    RF_SIZE: tl.constexpr, THRESHOLD: tl.constexpr,
-    ALL_ONES_MASK: tl.constexpr, UNCERTAIN_CLASS: tl.constexpr,
-):
-    tile_id = tl.program_id(0)
-    if tile_id >= N_val * GH * GW:
-        return
-    off1 = tl.arange(0, 1)
-    tc = tl.load(tile_class_ptr + tile_id + off1)
-    if tl.sum(tc) != UNCERTAIN_CLASS:
-        return
-    gw_idx = tile_id % GW
-    tmp = tile_id // GW
-    gh_idx = tmp % GH
-    n_idx = tmp // GH
-    RF_H: tl.constexpr = (BLOCK_H - 1) * STRIDE + KERNEL_SIZE
-    RF_W: tl.constexpr = (BLOCK_W - 1) * STRIDE + KERNEL_SIZE
-    flat_idx = tl.arange(0, RF_SIZE)
-    hh = gh_idx * BLOCK_H * STRIDE - PAD + flat_idx // RF_W
-    ww = gw_idx * BLOCK_W * STRIDE - PAD + flat_idx % RF_W
-    hw_mask = (flat_idx < RF_H * RF_W) & (hh >= 0) & (hh < H_IN) & (ww >= 0) & (ww < W_IN)
-    safe_h = tl.minimum(tl.maximum(hh, 0), H_IN - 1)
-    safe_w = tl.minimum(tl.maximum(ww, 0), W_IN - 1)
-    HW = H_IN * W_IN
-
-    mask = tl.zeros([1], dtype=tl.int32)
-    g = tl.zeros([1], dtype=tl.int32)
-    while tl.sum(g) < NUM_GROUPS:
-        g_val = tl.sum(g)
-        group_max = tl.zeros([1], dtype=tl.float32)
-        for c_off in range(GROUP_SIZE_C):
-            c = g_val * GROUP_SIZE_C + c_off
-            if c < C_IN:
-                vals = tl.load(x_ptr + (n_idx * C_IN + c) * HW + safe_h * W_IN + safe_w, mask=hw_mask, other=0.0)
-                group_max = tl.maximum(group_max, tl.max(tl.abs(vals), axis=0))
-        mask = mask + (group_max > THRESHOLD).to(tl.int32) * (1 << g_val)
-        if tl.sum(mask == ALL_ONES_MASK) > 0:
-            g = tl.full([1], NUM_GROUPS, dtype=tl.int32)
-        else:
-            g = g + 1
-    tl.store(ag_mask_ptr + tile_id + off1, mask)
-    if tl.sum(mask) == 0:
-        tl.store(tile_class_ptr + tile_id + off1, tl.zeros([1], dtype=tl.int32))
-    else:
-        tl.store(tile_class_ptr + tile_id + off1,
-                 tl.full([1], 1, dtype=tl.int32) + (mask == ALL_ONES_MASK).to(tl.int32))
-
-
-@triton.jit
-def group_bitmask_refine_1x1_kernel(
-    x_ptr, tile_class_ptr, ag_mask_ptr,
-    N_val, C_IN, H_IN, W_IN, GH, GW,
-    BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr, BLOCK_M: tl.constexpr,
-    GROUP_SIZE_C: tl.constexpr, NUM_GROUPS: tl.constexpr,
-    THRESHOLD: tl.constexpr, ALL_ONES_MASK: tl.constexpr,
-    UNCERTAIN_CLASS: tl.constexpr,
-):
-    tile_id = tl.program_id(0)
-    if tile_id >= N_val * GH * GW:
-        return
-    off1 = tl.arange(0, 1)
-    tc = tl.load(tile_class_ptr + tile_id + off1)
-    if tl.sum(tc) != UNCERTAIN_CLASS:
-        return
-    gw_idx = tile_id % GW
-    tmp = tile_id // GW
-    gh_idx = tmp % GH
-    n_idx = tmp // GH
-    offs_m = tl.arange(0, BLOCK_M)
-    out_h = gh_idx * BLOCK_H + offs_m // BLOCK_W
-    out_w = gw_idx * BLOCK_W + offs_m % BLOCK_W
-    m_mask = (out_h < H_IN) & (out_w < W_IN)
-    HW = H_IN * W_IN
-
-    mask = tl.zeros([1], dtype=tl.int32)
-    g = tl.zeros([1], dtype=tl.int32)
-    while tl.sum(g) < NUM_GROUPS:
-        g_val = tl.sum(g)
-        group_max = tl.zeros([1], dtype=tl.float32)
-        for c_off in range(GROUP_SIZE_C):
-            c = g_val * GROUP_SIZE_C + c_off
-            if c < C_IN:
-                vals = tl.load(x_ptr + (n_idx * C_IN + c) * HW + out_h * W_IN + out_w, mask=m_mask, other=0.0)
-                group_max = tl.maximum(group_max, tl.max(tl.abs(vals), axis=0))
-        mask = mask + (group_max > THRESHOLD).to(tl.int32) * (1 << g_val)
-        if tl.sum(mask == ALL_ONES_MASK) > 0:
-            g = tl.full([1], NUM_GROUPS, dtype=tl.int32)
-        else:
-            g = g + 1
-    tl.store(ag_mask_ptr + tile_id + off1, mask)
-    if tl.sum(mask) == 0:
-        tl.store(tile_class_ptr + tile_id + off1, tl.zeros([1], dtype=tl.int32))
-    else:
-        tl.store(tile_class_ptr + tile_id + off1,
-                 tl.full([1], 1, dtype=tl.int32) + (mask == ALL_ONES_MASK).to(tl.int32))
 
 
 # ---------------------------------------------------------------------------
@@ -857,9 +494,9 @@ def _fused_1x1_persistent_path(
     total_work = int(N * spatial_tiles * n_cout_tiles)
 
     if total_work <= 0:
-        y = torch.zeros(N, C_OUT, H_OUT, W_OUT, dtype=torch.float32, device=device)
+        y = torch.zeros(N, C_OUT, H_OUT, W_OUT, dtype=torch.float16, device=device)
         if bias is not None:
-            y = y + bias.detach().float().view(1, -1, 1, 1)
+            y = y + bias.detach().to(y.dtype).view(1, -1, 1, 1)
         return y, 0.0, {
             "backend": "zero_tiles_only",
             "reason": "empty_fused_1x1_work",
@@ -873,7 +510,7 @@ def _fused_1x1_persistent_path(
         1,
         int(torch.cuda.get_device_properties(device).multi_processor_count) * PERSISTENT_OVERSUB,
     )
-    y = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=torch.float32, device=device)
+    y = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=torch.float16, device=device)
 
     sparse_ms = 0.0
     if return_ms:
@@ -1288,15 +925,10 @@ def sparse_conv2d_forward(
             ee = torch.cuda.Event(enable_timing=True)
             se.record()
 
-        # dtype-align for fallback path
-        x_dense = x.float()
-        w_dense = weight.float()
-        b_dense = bias.float() if bias is not None else None
-
         y = Fn.conv2d(
-            x_dense, w_dense, b_dense,
+            x, weight, bias,
             stride=stride, padding=padding, dilation=dilation, groups=groups
-        ).float()
+        )
 
         if return_ms:
             ee.record()
@@ -1309,8 +941,8 @@ def sparse_conv2d_forward(
         return _finalize_return(y, dense_ms, avg_active_ratio_val, tile_stats_val, bm)
 
     def _zero_tiles_output(reason, tile_stats_val=None, backend_meta_extra=None):
-        y = torch.zeros(N, C_OUT, H_OUT, W_OUT, dtype=torch.float32, device=device)
-        if bias is not None: y = y + bias.detach().float().view(1, -1, 1, 1)
+        y = torch.zeros(N, C_OUT, H_OUT, W_OUT, dtype=torch.float16, device=device)
+        if bias is not None: y = y + bias.detach().to(y.dtype).view(1, -1, 1, 1)
         bm = {"backend": "zero_tiles_only", "reason": reason}
         if backend_meta_extra: bm.update(backend_meta_extra)
         return _finalize_return(y, 0.0, 0.0, tile_stats_val, bm)
@@ -1390,11 +1022,13 @@ def sparse_conv2d_forward(
         BH, BW, GH, GW, kernel_size, stride, padding, threshold,
         ag_mask_buf, tile_class_buf,
         prescan_stats=prescan_stats,
-        allow_stage1_dense_fallback=(return_avg_active_ratio and not return_tile_stats),
+        allow_stage1_dense_fallback=(
+            ENABLE_RUNTIME_FALLBACK_POLICY and return_avg_active_ratio and not return_tile_stats
+        ),
         fallback_ratio=fallback_ratio,
     )
 
-    if stage1_dense_fallback:
+    if ENABLE_RUNTIME_FALLBACK_POLICY and stage1_dense_fallback:
         stage1_avg_active_ratio = 1.0
         if stage1_summary is not None:
             stage1_avg_active_ratio = float(
@@ -1441,7 +1075,9 @@ def sparse_conv2d_forward(
             }
             if prescan_stats: tile_stats_base.update(prescan_stats)
 
-        if _check_dense_fallback(ag_mask_buf, N_TILES, NUM_GROUPS, fallback_ratio=fallback_ratio):
+        if ENABLE_RUNTIME_FALLBACK_POLICY and _check_dense_fallback(
+            ag_mask_buf, N_TILES, NUM_GROUPS, fallback_ratio=fallback_ratio
+        ):
             return _dense_fallback(
                 reason="post_metadata_dense_fallback",
                 avg_active_ratio_val=avg_active_ratio,
@@ -1490,7 +1126,7 @@ def sparse_conv2d_forward(
             else weight.half().reshape(C_OUT, C_IN).contiguous()
         )
 
-    y = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=torch.float32, device=device)
+    y = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=torch.float16, device=device)
 
     if return_ms:
         start_ev = torch.cuda.Event(enable_timing=True)

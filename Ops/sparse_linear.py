@@ -12,7 +12,11 @@ if _PROJECT_ROOT not in sys.path:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from Utils.config import PRESCAN_ACTIVITY_EPS, SPARSE_DENSE_RATIO_THRESHOLD
+from Utils.config import (
+    ENABLE_RUNTIME_FALLBACK_POLICY,
+    PRESCAN_ACTIVITY_EPS,
+    SPARSE_DENSE_RATIO_THRESHOLD,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -351,16 +355,18 @@ class SparseLinear(nn.Module):
     def _zero_output_2d(self, x2d: torch.Tensor) -> torch.Tensor:
         y = torch.zeros(
             x2d.shape[0], self.out_features,
-            dtype=torch.float32, device=x2d.device
+            dtype=torch.float16, device=x2d.device
         )
         if self.bias is not None:
-            y = y + self.bias.detach().float().view(1, -1)
+            y = y + self.bias.detach().to(y.dtype).view(1, -1)
         return y
 
     # ------------------------------------------------------------------
     # policy helpers
     # ------------------------------------------------------------------
     def _should_collect_ratio(self) -> bool:
+        if not ENABLE_RUNTIME_FALLBACK_POLICY:
+            return False
         if self._inference_mode:
             return False
         if self._warmup_left > 0:
@@ -369,6 +375,10 @@ class SparseLinear(nn.Module):
 
     def _update_policy(self, avg_active_ratio: Optional[float]):
         if avg_active_ratio is None:
+            return
+        if not ENABLE_RUNTIME_FALLBACK_POLICY:
+            # Tier 0 P5: policy disabled, EGD is single dispatch source.
+            self._last_avg_active_ratio = avg_active_ratio
             return
 
         self._last_avg_active_ratio = avg_active_ratio
@@ -438,7 +448,7 @@ class SparseLinear(nn.Module):
             self._profile_add("reshape_ms", ms)
             self._profile_set_last("last_reshape_ms", ms)
 
-        if self._force_zero:
+        if ENABLE_RUNTIME_FALLBACK_POLICY and self._force_zero:
             y2d = self._zero_output_2d(x2d)
             self.backend_family = "exact_zero"
             self.diag_path = "zero_force"
@@ -474,7 +484,11 @@ class SparseLinear(nn.Module):
 
         if self.profile_runtime:
             t0 = self._stamp()
-        need_ratio = use_triton and self._should_collect_ratio() and (not self._force_dense)
+        need_ratio = (
+            use_triton
+            and self._should_collect_ratio()
+            and (not ENABLE_RUNTIME_FALLBACK_POLICY or not self._force_dense)
+        )
         if self.profile_runtime:
             ms = self._elapsed_ms(t0)
             self._profile_add("policy_ms", ms)
@@ -482,7 +496,7 @@ class SparseLinear(nn.Module):
 
         self._forward_count += 1
 
-        if use_triton and not self._force_dense and self._supports_sparse():
+        if use_triton and (not ENABLE_RUNTIME_FALLBACK_POLICY or not self._force_dense) and self._supports_sparse():
             y2d, avg_active_ratio, backend_kind = self._triton_forward(
                 x2d, need_ratio=need_ratio
             )
@@ -521,7 +535,7 @@ class SparseLinear(nn.Module):
             self._profile_add("policy_ms", ms)
             self._profile_set_last("last_policy_ms", self._profile.last_policy_ms + ms)
 
-        if self._force_zero and avg_active_ratio == 0.0:
+        if ENABLE_RUNTIME_FALLBACK_POLICY and self._force_zero and avg_active_ratio == 0.0:
             y2d = self._zero_output_2d(x2d)
             path = "zero(promoted)"
             self.backend_family = "exact_zero"

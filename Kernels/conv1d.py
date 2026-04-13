@@ -241,10 +241,10 @@ def sparse_conv1d_forward(
             ee = torch.cuda.Event(enable_timing=True)
             se.record()
         y = Fn.conv1d(
-            x.float(), weight.float(),
-            bias.float() if bias is not None else None,
+            x, weight,
+            bias,
             stride=stride, padding=padding, dilation=dilation, groups=groups,
-        ).float()
+        )
         if return_ms:
             ee.record()
             torch.cuda.synchronize(device)

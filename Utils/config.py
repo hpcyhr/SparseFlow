@@ -37,6 +37,11 @@ def staticzero_eps_for_mode(spike_mode: str) -> float:
 # Shared dense-fallback ratio threshold for sparse kernels and wrappers.
 SPARSE_DENSE_RATIO_THRESHOLD = 0.85
 
+# Tier 0 P5: when False, runtime EMA / inline fallback policies are bypassed,
+# letting sf_dispatch_decision (EGD) be the single source of dispatch truth.
+# Set to True only for legacy ablations or to reactivate the old behavior.
+ENABLE_RUNTIME_FALLBACK_POLICY = False
+
 
 # -----------------------------------------------------------------------------
 # Dispatch model thresholds (execution-grounded, empirically calibrated)

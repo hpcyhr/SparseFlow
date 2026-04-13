@@ -13,6 +13,7 @@ import warnings
 import triton
 import triton.language as tl
 from triton import autotune, Config
+from Utils.config import ENABLE_RUNTIME_FALLBACK_POLICY
 
 from Kernels.conv2d import (
     FALLBACK_RATIO,
@@ -126,10 +127,10 @@ def fused_bm_conv3x3_lif_8x8(
             acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
 
         vp = tl.load(v_prev_ptr + oa, mask=om, other=0.0)
-        vt = vp * DECAY + acc * RECIP_TAU
+        vt = vp * DECAY + acc * RECIP_TAU + V_RESET * RECIP_TAU
         sp = (vt >= V_TH).to(tl.float32)
         if HAS_V_RESET:
-            v_reset_tensor = vt * 0.0 + V_RESET
+            v_reset_tensor = tl.full([BLOCK_M, BLOCK_N], V_RESET, dtype=tl.float32)
             vn = tl.where(sp > 0.0, v_reset_tensor, vt)
         else:
             vn = vt - sp * V_TH
@@ -179,11 +180,11 @@ def fused_bm_conv3x3_lif_8x8(
 
     # LIF dynamics
     vp = tl.load(v_prev_ptr + oa, mask=om, other=0.0)
-    vt = vp * DECAY + acc * RECIP_TAU
+    vt = vp * DECAY + acc * RECIP_TAU + V_RESET * RECIP_TAU
     sp = (vt >= V_TH).to(tl.float32)
 
     if HAS_V_RESET:
-        v_reset_tensor = vt * 0.0 + V_RESET
+        v_reset_tensor = tl.full([BLOCK_M, BLOCK_N], V_RESET, dtype=tl.float32)
         vn = tl.where(sp > 0.0, v_reset_tensor, vt)
     else:
         vn = vt - sp * V_TH
@@ -254,10 +255,10 @@ def fused_bm_conv3x3_lif_8x16(
         if HAS_BIAS:
             acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
         vp = tl.load(v_prev_ptr + oa, mask=om, other=0.0)
-        vt = vp * DECAY + acc * RECIP_TAU
+        vt = vp * DECAY + acc * RECIP_TAU + V_RESET * RECIP_TAU
         sp = (vt >= V_TH).to(tl.float32)
         if HAS_V_RESET:
-            v_reset_tensor = vt * 0.0 + V_RESET
+            v_reset_tensor = tl.full([BLOCK_M, BLOCK_N], V_RESET, dtype=tl.float32)
             vn = tl.where(sp > 0.0, v_reset_tensor, vt)
         else:
             vn = vt - sp * V_TH
@@ -291,10 +292,10 @@ def fused_bm_conv3x3_lif_8x16(
         acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
 
     vp = tl.load(v_prev_ptr + oa, mask=om, other=0.0)
-    vt = vp * DECAY + acc * RECIP_TAU
+    vt = vp * DECAY + acc * RECIP_TAU + V_RESET * RECIP_TAU
     sp = (vt >= V_TH).to(tl.float32)
     if HAS_V_RESET:
-        v_reset_tensor = vt * 0.0 + V_RESET
+        v_reset_tensor = tl.full([BLOCK_M, BLOCK_N], V_RESET, dtype=tl.float32)
         vn = tl.where(sp > 0.0, v_reset_tensor, vt)
     else:
         vn = vt - sp * V_TH
@@ -362,13 +363,13 @@ def sparse_fused_conv_lif_forward(
 
     # 1x1 or unsupported → dense fallback with LIF
     if kernel_size != 3:
-        y = Fn.conv2d(x, weight, bias, stride=1, padding=0).float()
-        vp = v_prev.float()
+        y = Fn.conv2d(x, weight, bias, stride=1, padding=0)
+        vp = v_prev.to(dtype=y.dtype)
         if decay_input:
             vt = vp + (y - (vp - (0.0 if v_reset is None else float(v_reset)))) / float(tau)
         else:
             vt = vp - (vp - (0.0 if v_reset is None else float(v_reset))) / float(tau) + y
-        sp = (vt >= v_threshold).float()
+        sp = (vt >= v_threshold).to(dtype=vt.dtype)
         if v_reset is None:
             vn = vt - sp * v_threshold
         else:
@@ -401,16 +402,20 @@ def sparse_fused_conv_lif_forward(
         pc = (v & 0x3F).to(torch.int32)
         avg_active_ratio = pc.float().mean().item() / max(NUM_GROUPS, 1)
 
-    if (avg_active_ratio is not None and avg_active_ratio > fallback_ratio) or (
-        avg_active_ratio is None and _check_dense_fallback(ag_mask_buf, N_TILES, NUM_GROUPS, fallback_ratio)
+    if ENABLE_RUNTIME_FALLBACK_POLICY and (
+        (avg_active_ratio is not None and avg_active_ratio > fallback_ratio)
+        or (
+            avg_active_ratio is None
+            and _check_dense_fallback(ag_mask_buf, N_TILES, NUM_GROUPS, fallback_ratio)
+        )
     ):
-        y = Fn.conv2d(x, weight, bias, stride=1, padding=1).float()
-        vp = v_prev.float()
+        y = Fn.conv2d(x, weight, bias, stride=1, padding=1)
+        vp = v_prev.to(dtype=y.dtype)
         if decay_input:
             vt = vp + (y - (vp - (0.0 if v_reset is None else float(v_reset)))) / float(tau)
         else:
             vt = vp - (vp - (0.0 if v_reset is None else float(v_reset))) / float(tau) + y
-        sp = (vt >= v_threshold).float()
+        sp = (vt >= v_threshold).to(dtype=vt.dtype)
         if v_reset is None:
             vn = vt - sp * v_threshold
         else:
@@ -427,7 +432,7 @@ def sparse_fused_conv_lif_forward(
     has_bias = bias is not None
     bias_f32 = bias.float().contiguous() if has_bias else torch.empty(1, device=device)
     v_prev_f32 = v_prev.float().contiguous()
-    spike_out = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=torch.float32, device=device)
+    spike_out = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=torch.float16, device=device)
     v_next = torch.empty(N, C_OUT, H_OUT, W_OUT, dtype=torch.float32, device=device)
 
     sparse_ms = 0.0

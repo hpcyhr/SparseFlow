@@ -147,14 +147,14 @@ def sparse_grouped_conv2d_forward(
             se.record()
 
         y = Fn.conv2d(
-            x.float(),
-            weight.float(),
-            bias.float() if bias is not None else None,
+            x,
+            weight,
+            bias,
             stride=s,
             padding=p,
             dilation=d,
             groups=groups,
-        ).float()
+        )
 
         if return_ms:
             ee.record()
